@@ -6,6 +6,14 @@
 
 通用浏览器桥：让本地 Agent 通过安全通道接管你日常使用的 Chrome——列出/管理标签页、导航、读取页面、点击、输入、滚动、截图。
 
+## 给 AI Agent 的一句话接入指令
+
+把下面这句话直接复制给你的 AI Agent：
+
+```text
+请从 https://github.com/zqcccc/chrome-agent-bridge.git 克隆 Agent Browser Bridge，并阅读仓库中的 docs/AI-INTEGRATION.md、SECURITY.md 和 skills/agent-browser-bridge/SKILL.md，按照接入指南完成 macOS + Google Chrome 的本地配置。请在执行任何修改系统、Chrome 设置或网页不可逆操作前先向我说明并获得确认；不要输出或提交 ~/.chrome-agent-bridge/token。最后用 /status 和 agent/cli.mjs tabs 验证连接，并告诉我还需要我手动完成哪些步骤。
+```
+
 设计与 Codex（ChatGPT for Chrome）、Claude（Claude in Chrome）插件的做法一致：**装进你日常使用的 Chrome 里**，直接操作真实浏览器、真实登录态，而不是像 Playwright 那样另起一个无头浏览器。本项目的通道设计、页面感知与视觉指示器均参考了两家官方扩展的实现。
 
 ## 架构
