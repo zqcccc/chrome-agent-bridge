@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Agent Browser Bridge 设置</title>
+  <style>
+    body { font: 14px/1.6 -apple-system, "PingFang SC", sans-serif; max-width: 520px; margin: 40px auto; padding: 0 20px; color: #222; }
+    h1 { font-size: 18px; }
+    label { display: block; margin: 14px 0 4px; font-weight: 600; }
+    input { width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font: 13px monospace; box-sizing: border-box; }
+    .hint { color: #888; font-size: 12px; margin-top: 4px; }
+    .actions { margin-top: 20px; display: flex; gap: 10px; }
+    button { padding: 8px 18px; border: 1px solid #ddd; border-radius: 6px; background: #fff; cursor: pointer; font-size: 13px; }
+    button.primary { background: #2f54eb; border-color: #2f54eb; color: #fff; }
+    #msg { margin-top: 14px; font-size: 13px; color: #16a34a; display: none; }
+    #err { margin-top: 14px; font-size: 13px; color: #dc2626; display: none; }
+    .status-row { background: #f7f7f8; border-radius: 8px; padding: 10px 12px; margin-top: 18px; font-size: 13px; }
+    .status-row .lbl { color: #888; }
+  </style>
+</head>
+<body>
+  <h1>Agent Browser Bridge 设置</h1>
+
+  <div class="status-row">
+    <span class="lbl">连接状态：</span><span id="connState">未知</span><br>
+    <span class="lbl">扩展版本：</span><span id="extVersion">—</span>
+  </div>
+
+  <label>连接通道（Channel）</label>
+  <select id="channel" style="width:100%;padding:8px 10px;border:1px solid #ccc;border-radius:6px;font:13px sans-serif;box-sizing:border-box;">
+    <option value="auto">auto（优先 Native Messaging，失败回退 WebSocket）</option>
+    <option value="native">native（Native Messaging，需已安装本地 host）</option>
+    <option value="ws">ws（WebSocket 直连本地桥）</option>
+  </select>
+  <div class="hint">默认 auto：优先使用 Native Messaging（与 ChatGPT/Claude 插件相同），未注册 host 时自动回退 WebSocket。</div>
+
+  <label>Relay 地址（Host）</label>
+  <input id="host" placeholder="127.0.0.1">
+  <div class="hint">本地桥服务所在地址，通常保持 127.0.0.1</div>
+
+  <label>Relay 端口</label>
+  <input id="port" placeholder="8778">
+
+  <label>访问令牌（Token）</label>
+  <input id="token" placeholder="留空则使用默认令牌">
+  <div class="hint">启动 relay 时终端会打印 token，粘贴到这里；与本地桥保持一致。</div>
+
+  <div class="actions">
+    <button id="save" class="primary">保存并重连</button>
+    <button id="test">测试连接</button>
+  </div>
+
+  <div id="msg"></div>
+  <div id="err"></div>
+
+  <script src="options.js"></script>
+</body>
+</html>
