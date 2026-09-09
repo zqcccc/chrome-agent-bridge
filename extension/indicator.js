@@ -197,7 +197,7 @@
   });
 
   // 页面交互时自动隐藏光标（用户接管）
-  document.addEventListener("mousemove", () => {
+  document.addEventListener("mousemove", (event) => {
     if (cursor && !stopTimer) {
       // 用户动鼠标超过阈值才隐藏，避免与 agent 移动互相干扰
       if (Math.abs(event.clientX - currentX) > 24 || Math.abs(event.clientY - currentY) > 24) {

@@ -14,7 +14,10 @@ description: 用本地 Chrome 扩展 + 本地桥（Agent Browser Bridge）操作
 ## 前置条件（每个任务开始前必须检查）
 
 1. **扩展已加载**：chrome://extensions 里有 "Agent Browser Bridge"（已解压；ID 以你本机 `chrome://extensions` 中显示的为准），开关为 On。
-2. **host 存活**：`curl -s http://127.0.0.1:8778/status` 返回 `{"ok":true,...}`。host 可能因异常退出，挂了就从项目根目录执行：`cd /path/to/chrome-agent-bridge/relay && npm start`（后台运行）。
+2. **host 存活**：`curl -s http://127.0.0.1:8778/status` 返回 `{"ok":true,...}`。
+   - **推荐 Native 模式**：不要手动 `npm start`。注册 native host 后，Chrome 按需拉起 host 进程，该进程监听 8778，Agent 连 8778 即同一进程。Chrome 关闭时进程自动退出。`status` 返回 `mode:native`。
+   - **standalone WS 模式（二选一）**：`cd /path/to/chrome-agent-bridge/relay && npm start`，host 常驻 8778，扩展用 `ws://127.0.0.1:8778/agent` 连入。`status` 返回 `mode:standalone`。
+   - **两种模式不要同时运行**：standalone 占着 8778 时，native 拉起的进程会因端口占用退出，扩展 `auto` 通道会回退到 WS（不透明）。推荐只用 Native。
 3. **扩展已连上 host**：status 输出 `extConnected:true`。扩展 reload 或 Chrome 重启后几秒内自动重连。
 
 ## 快速开始（CLI）
@@ -65,9 +68,33 @@ HTTP 直调：`POST http://127.0.0.1:8778/rpc`，头 `Authorization: Bearer <tok
    输完检查发送/提交按钮是否从 disabled 变 enabled，再点它。
 6. **部分动态页面的截图**：CDP `page.screenshot` 可能卡住或无法得到期望结果；先激活标签页，必要时使用系统级截图方案。
 7. **激活标签后 tabId 不变**，但用户手动开/关标签会变——多步流程每步都重新 `tabs` 确认。
-8. **导航等待**：`page.navigate` 后页面要等 3~5s（或轮询 `document.readyState`）再操作，SPA 页面更久。
+8. **导航等待**：导航必须用 `page.navigate`（走 `chrome.tabs.update`），**禁止用 `page.evaluate` 改 `location.href`/`location.assign`/`history.go`**——后者会销毁执行上下文，导致 RPC 无法返回、Host 超时。`page.navigate` 后可调 `page.waitForUrl`/`page.waitForSelector`/`page.waitForReady` 按条件等待，不要用固定 sleep。
 9. **视觉指示器**：Agent 操作时页面会显示幽灵光标 + 点击涟漪 + 「停止 Agent」按钮（默认开启）。用户可随时点停止打断。
-10. **停止按钮实现**：background 的 dispatch() 在 page.* 方法（不含 page.indicator.*）且带 tabId 时自动先 indicatorCall 显示按钮；如需默认关闭改 background.js。
+10. **停止按钮实现**：background 的 dispatch() 只对真实交互操作（click/type/press/scroll/hover/focusEl/select/waitFor）显示停止按钮；只读/导航（navigate/info/evaluate/snapshot/waitLoad/waitForUrl/waitForSelector/waitForReady）不被 indicator 阻塞，indicator 失败也不影响主 RPC。如需默认关闭改 background.js 的 INTERACTIVE_METHODS。
+
+## 错误码（可诊断）
+
+桥接层返回结构化错误，包含 code/method/tabId/channel/elapsedMs：
+
+- `TIMEOUT` / `EXT_DISCONNECTED` / `SEND_FAILED`：扩展通道层。超时后会返回 method、tabId、channel、耗时，日志不含 token 与页面内容。
+- `TAB_BUSY`：同 tab 请求串行队列中前序请求占用（一般等待而非报错；若恢复窗口内，短时间等待后重试）。
+- `NAV_TIMEOUT`：导航/等待 URL/ready/selector 超时。
+- `PAGE_CONTEXT_TIMEOUT`：页面上下文已销毁/无法注入 content script（导航中、chrome://、上下文崩溃）。
+- `CONTENT_TIMEOUT`：content 调用（click/type 等）超时。
+- `EXT_DISCONNECTED` 在扩展 WS/Native 断连时让所有 pending 请求确定结局，不无限挂起。
+
+## 同 tab 串行与跨 tab 并行
+
+- 同一 tab 的 `page.*` / `tabs.get|activate|close|reload` / `session.*` 请求在 host 端**严格串行**（按 tabId 维护队列），避免 BOSS 重型 SPA 下 navigate/snapshot/evaluate 互相堆积导致超时。
+- 跨 tab 请求并行。
+- 单个请求超时不会让同 tab 后续所有请求雪崩：超时后该 tab 进入短恢复窗口（约 500ms），后续请求重试而非级联失败。
+
+## 增强等待 API（BOSS SPA，不依赖固定 sleep）
+
+- `page.waitForUrl` `{ tabId, match?/equals?, timeoutMs?, intervalMs? }`：等 URL 变化。
+- `page.waitForReady` `{ tabId, timeoutMs? }`：等 `document.readyState` 为 complete。
+- `page.waitForSelector` `{ tabId, selector, by?, timeoutMs?, intervalMs? }`：等选择器出现。
+- `page.waitLoad` `{ tabId, timeoutMs? }`：等加载完成（webNavigation + 轮询兑底）。
 
 ## 安全
 

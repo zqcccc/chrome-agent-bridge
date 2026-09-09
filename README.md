@@ -108,10 +108,11 @@ bash install-host.sh <你的扩展ID>
 
 注册后完全退出并重新打开 Chrome，或重新加载扩展。Native Messaging 与 ChatGPT/Claude 插件同款通道，无需 HTTP 端口暴露给扩展。
 
-> **两种运行模式（二选一）**
-> - **Native 模式（推荐）**：不启动 standalone host。Chrome 通过 Native Messaging 按需拉起 `host.js`，该进程自己监听 8778；Agent 连 8778 即是同一进程。Chrome 关闭连接时进程自动退出，无需常驻。
-> - **WS 模式**：手动启动 `npm start`（standalone host 常驻 8778），扩展通过 `ws://127.0.0.1:8778/agent` 连接。
-> - 注意：两种模式**不要同时运行**。standalone 占着 8778 时，native 拉起的进程会因端口占用自动退出，扩展 `auto` 通道会回退到 WS（已内置该逻辑）。
+> **两种运行模式（二选一，推荐 Native）**
+> - **Native 模式（推荐）**：不启动 standalone host。Chrome 通过 Native Messaging 按需拉起 `host.js`，该进程自己监听 8778；Agent 连 8778 即是同一进程。Chrome 关闭连接时进程自动退出，无需常驻。`/status` 返回 `mode:native`。
+> - **standalone WS 模式**：手动启动 `npm start`（host 常驻 8778），扩展通过 `ws://127.0.0.1:8778/agent` 连接。`/status` 返回 `mode:standalone`。
+> - **两种模式不要同时运行**：standalone 占着 8778 时，native 拉起的进程会因端口占用自动退出，扩展 `auto` 通道会回退到 WS（已内置该逻辑，但不透明）。推荐只用 Native。
+> - 不要把可靠性建立在“手动反复重启 host”上：Native 模式下 Chrome 关闭即退出、重连即拉起新进程；standalone 模式下进程异常会在 `/status` 体现为 `extConnected:false`。
 
 ### 4. 配置扩展连接
 
@@ -191,8 +192,11 @@ await bridge.rpc("page.screenshot");
 - **页面感知**：a11y 树（role 推断、可读名、敏感字段遮蔽为 `[value redacted]`）、元素清单、全文、完整 DOM
 - **页面操作**：click / type / press / scroll / hover / focus / select / waitFor
 - **截图**：CDP `Page.captureScreenshot`（支持整页）→ 兜底 `tabs.captureVisibleTab`
-- **导航等待**：`webNavigation.onCommitted` + 轮询兜底，默认 45s 超时
-- **视觉指示器**：幽灵光标 + 点击涟漪 + 停止按钮（页面内 `agent-bridge-cursor` / `agent-bridge-stop`），Agent 可远程开关
+- **导航等待**：`webNavigation.onCommitted` + 轮询兜底，默认 45s 超时；另提供 `page.waitForUrl`/`page.waitForReady`/`page.waitForSelector` 按条件等待（BOSS 重型 SPA 不依赖固定 sleep）
+- **导航安全**：导航必须用 `page.navigate`（`chrome.tabs.update`），**禁止用 `page.evaluate` 改 `location.href`**（会销毁执行上下文导致 RPC 无法返回）
+- **同 tab 串行**：同一 tab 的 `page.*`/`session.*` 请求在 host 端严格串行，跨 tab 并行；单个请求超时不级联
+- **错误码**：`TIMEOUT`/`EXT_DISCONNECTED`/`NAV_TIMEOUT`/`PAGE_CONTEXT_TIMEOUT`/`CONTENT_TIMEOUT`/`TAB_BUSY`，含 method/tabId/channel/耗时，日志不含 token 与页面内容
+- **视觉指示器**：幽灵光标 + 点击涟漪 + 停止按钮（页面内 `agent-bridge-cursor` / `agent-bridge-stop`），Agent 可远程开关；**只对真实交互操作（click/type/press/scroll/hover/focusEl/select/waitFor）显示**，只读/导航/evaluate/snapshot 不被阻塞，indicator 失败不影响主 RPC
 - **事件订阅**：页面事件实时推送（导航、点击、输入等）
 
 ## 安全
@@ -205,7 +209,10 @@ await bridge.rpc("page.screenshot");
 ## 测试
 
 ```bash
-cd relay && npm test     # 集成测试（鉴权、RPC 转发、错误传播、事件广播）
+cd relay && npm test               # 集成 + 单元 + send-chat helper
+node relay/test.js                 # 集成测试（鉴权、RPC 转发、错误传播、事件广播）
+node relay/test-unit.js            # 单元测试（frame parser、tab 队列、超时/pending 清理、WS error 不崩）
+node --test relay/test-verify.mjs  # send-chat 送达验证 helper（6 种情形）
 ```
 
 

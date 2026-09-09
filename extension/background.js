@@ -227,19 +227,29 @@ function handleHostEvent(event, payload) {
 
 function broadcastToTabs(msg) {
   chrome.tabs.query({}, (tabs) => {
-    for (const t of tabs) {
-      if (!t.id) continue;
-      try {
-        chrome.tabs.sendMessage(t.id, msg).catch ? chrome.tabs.sendMessage(t.id, msg) : void 0;
-      } catch (e) { /* noop */ }
+    if (!chrome.runtime.lastError) {
+      for (const t of tabs) {
+        if (!t.id) continue;
+        // 单次调用 + .catch：避免每个 tab 两次调用，且保护 promise rejection
+        try {
+          const p = chrome.tabs.sendMessage(t.id, msg);
+          if (p && typeof p.catch === "function") p.catch(() => {});
+        } catch (e) { /* noop */ }
+      }
     }
   });
 }
 
 // ---------- 命令分发 ----------
+// 护栏：只对真实交互操作（click/type/press/scroll/hover/focusEl/select/waitFor）
+// 显示「停止 Agent」按钮。只读/导航/evaluate/snapshot/waitLoad 不被 indicator 阻塞，
+// 避免给读操作和导航增加竞态。indicator 失败不得影响主 RPC。
+const INTERACTIVE_METHODS = new Set([
+  "page.click", "page.type", "page.press", "page.scroll",
+  "page.hover", "page.focusEl", "page.waitFor", "page.select",
+]);
 async function dispatch(method, params) {
-  // 护栏默认开启：任何页面操作都自动显示"停止 Agent"按钮，用户可随时打断
-  if (method.startsWith("page.") && !method.startsWith("page.indicator.") && params && params.tabId) {
+  if (INTERACTIVE_METHODS.has(method) && params && params.tabId) {
     try { await indicatorCall(params.tabId, { action: "showStop", label: "停止 Agent" }); } catch (e) { /* chrome:// 等受限页忽略 */ }
   }
   switch (method) {
@@ -466,6 +476,62 @@ function waitForLoad(tabId, timeoutMs = NAV_TIMEOUT_MS) {
   });
 }
 
+// ---------- 增强等待 API（BOSS 重型 SPA，不依赖固定 sleep） ----------
+// 等 URL 包含/匹配指定片段（SPA 跳转后 URL 变化）
+function waitForUrl(tabId, params) {
+  requireTabId(tabId);
+  const timeout = (params && params.timeoutMs) || 30000;
+  const interval = (params && params.intervalMs) || 300;
+  const match = params && params.match;            // 字符串 includes；字符串(解析成)正则 test
+  const equals = params && params.equals;          // 严格 ===
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = async () => {
+      try {
+        const t = await chrome.tabs.get(tabId);
+        const url = t.url || "";
+        let ok = false;
+        if (equals) ok = url === equals;
+        else if (match) ok = typeof match === "string" ? url.includes(match) : new RegExp(match).test(url);
+        else ok = true;
+        if (ok) return resolve({ ok: true, url, waitedMs: Date.now() - start });
+        if (Date.now() - start > timeout) return reject({ code: "NAV_TIMEOUT", message: `waitForUrl 超时(${timeout}ms): 期望 ${match || equals || "?"}, 实际 ${url}` });
+        setTimeout(tick, interval);
+      } catch (e) {
+        reject({ code: "TAB_GONE", message: "标签页不存在或已关闭" });
+      }
+    };
+    tick();
+  });
+}
+// 等 document.readyState 达到指定状态
+function waitForReady(tabId, timeoutMs) {
+  requireTabId(tabId);
+  const timeout = timeoutMs || 30000;
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = async () => {
+      try {
+        const t = await chrome.tabs.get(tabId);
+        if (t.status === "complete") return resolve({ ok: true, status: t.status, waitedMs: Date.now() - start });
+        if (Date.now() - start > timeout) return reject({ code: "NAV_TIMEOUT", message: `waitForReady 超时(${timeout}ms)` });
+        setTimeout(tick, 300);
+      } catch (e) {
+        reject({ code: "TAB_GONE", message: "标签页不存在或已关闭" });
+      }
+    };
+    tick();
+  });
+}
+// 等 selector 出现（用 contentCall 的 waitFor，统一超时）
+async function waitForSelector(tabId, params) {
+  requireTabId(tabId);
+  return contentCall(tabId, "waitFor", {
+    selector: params.selector, by: params.by || "css",
+    timeoutMs: params.timeoutMs || 30000, intervalMs: params.intervalMs || 300,
+  });
+}
+
 // ---------- Content Script 消息 ----------
 async function ensureInjected(tabId) {
   try {
@@ -474,22 +540,59 @@ async function ensureInjected(tabId) {
       throw { code: "UNSUPPORTED_URL", message: `该页面不支持注入（${t.url || "未知"}）` };
     }
   } catch (e) {
-    if (e.code === "UNSUPPORTED_URL") throw e;
+    if (e && e.code === "UNSUPPORTED_URL") throw e;
     throw { code: "TAB_GONE", message: "标签页不存在" };
   }
   try {
     await chrome.tabs.sendMessage(tabId, { type: "bridge.ping" });
   } catch (e) {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    } catch (e2) {
+      throw { code: "PAGE_CONTEXT_TIMEOUT", message: `注入 content script 失败: ${e2 && e2.message || e2}` };
+    }
     await new Promise((r) => setTimeout(r, 50));
-    await chrome.tabs.sendMessage(tabId, { type: "bridge.ping" });
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: "bridge.ping" });
+    } catch (e2) {
+      throw { code: "PAGE_CONTEXT_TIMEOUT", message: `content script 注入后仍无响应: ${e2 && e2.message || e2}` };
+    }
   }
 }
+
+// 内部超时：包裹 sendMessage，避免 BOSS SPA 上下文销毁后卡死
+function withTimeout(promise, timeoutMs, code, message) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      reject({ code, message });
+    }, timeoutMs);
+    Promise.resolve(promise).then(
+      (v) => { if (done) return; done = true; clearTimeout(timer); resolve(v); },
+      (e) => { if (done) return; done = true; clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
+const CONTENT_CALL_TIMEOUT_MS = 30000;
 
 async function contentCall(tabId, action, args) {
   requireTabId(tabId);
   await ensureInjected(tabId);
-  const resp = await chrome.tabs.sendMessage(tabId, { type: "bridge.action", action, args: args || {} });
+  let resp;
+  try {
+    resp = await withTimeout(
+      chrome.tabs.sendMessage(tabId, { type: "bridge.action", action, args: args || {} }),
+      CONTENT_CALL_TIMEOUT_MS,
+      "CONTENT_TIMEOUT",
+      `content 调用超时(${CONTENT_CALL_TIMEOUT_MS}ms): ${action}`
+    );
+  } catch (e) {
+    if (e && e.code === "CONTENT_TIMEOUT") throw e;
+    throw { code: "PAGE_CONTEXT_TIMEOUT", message: `content 通道异常: ${e && e.message || e}` };
+  }
   if (!resp) throw { code: "NO_RESPONSE", message: "content script 无响应" };
   if (resp.ok === false) {
     const err = new Error(resp.error && resp.error.message ? resp.error.message : "content 执行失败");
@@ -524,10 +627,14 @@ async function pageEvaluate(tabId, params) {
   requireTabId(tabId);
   if (!params || !params.expression) throw { code: "BAD_PARAMS", message: "缺少 expression" };
   await ensureInjected(tabId);
-  const resp = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: params.world === "ISOLATED" ? "ISOLATED" : "MAIN",
-    func: (expression, awaitPromise) => {
+  let resp;
+  try {
+    resp = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        // 默认 MAIN world；只在显式 ISOLATED 时切换。BOSS 读 DOM 用 ISOLATED 也安全可控。
+        world: params.world === "ISOLATED" ? "ISOLATED" : "MAIN",
+        func: (expression, awaitPromise) => {
       const wrap = (v) => {
         if (v === undefined) return { __type: "undefined" };
         if (v === null) return null;
@@ -561,8 +668,17 @@ async function pageEvaluate(tabId, params) {
         return { __type: "error", message: String(e && e.stack || e) };
       }
     },
-    args: [params.expression, !!params.awaitPromise],
-  });
+      args: [params.expression, !!params.awaitPromise],
+      }),
+      CONTENT_CALL_TIMEOUT_MS,
+      "PAGE_CONTEXT_TIMEOUT",
+      `page.evaluate 超时(${CONTENT_CALL_TIMEOUT_MS}ms): 页面可能已导航/上下文销毁`
+    );
+  } catch (e) {
+    if (e && (e.code === "PAGE_CONTEXT_TIMEOUT")) throw e;
+    // executeScript 在页面导航/上下文销毁时报 "Cannot access contents of the page"
+    throw { code: "PAGE_CONTEXT_TIMEOUT", message: `executeScript 失败: ${e && e.message || e}` };
+  }
   const out = resp && resp[0] && resp[0].result;
   if (out && out.__type === "error") throw { code: "EVAL_ERROR", message: out.message };
   return { result: out };

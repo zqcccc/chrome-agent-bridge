@@ -115,8 +115,27 @@ node agent/cli.mjs tabs
 2. 再调用 `tabs`，不要复用过期的 tab ID。
 3. 对目标标签页执行 `snapshot`，确认页面、标题和当前状态。
 4. 执行操作后再次读取页面状态验证结果。
-5. 操作会发送消息、投递、下单、删除或提交表单时，必须先向用户展示最终动作和目标，获得明确确认后再执行。
-6. 遇到登录、验证码、支付、二次确认或安全检查时停止并交给用户。
+5. **导航必须用 `page.navigate`**，禁止用 `page.evaluate` 改 `location.href`/`location.assign`/`history.go`（会销毁执行上下文，导致 RPC 无法返回、Host 超时）。
+6. BOSS 等重型 SPA 的等待用条件等待（`page.waitForUrl`/`page.waitForReady`/`page.waitForSelector`/`page.waitLoad`），不要用固定 sleep。
+7. 操作会发送消息、投递、下单、删除或提交表单时，必须先向用户展示最终动作和目标，获得明确确认后再执行。
+8. 遇到登录、验证码、支付、二次确认或安全检查时停止并交给用户。
+
+### 同 tab 串行 / 跨 tab 并行
+
+- 同一 tab 的 `page.*` / `session.*` 请求在 host 端严格串行（按 tabId 队列），避免重型 SPA 下请求互相堆积导致超时。Agent 无需关心排队，但应避免在同一 tab 上“发完一个不等就发下一个”的反模式——串行由 host 保证。
+- 跨 tab 请求并行。
+- 单个请求超时不会级联：超时后该 tab 进入短恢复窗口，后续请求重试而非全超时。
+
+### 错误码与诊断
+
+桥接层错误结构化返回，包含 `code`/`method`/`tabId`/`channel`/`elapsedMs`，日志不含 token 与页面内容：
+
+- `TIMEOUT`：扩展响应超时（返回 method/tabId/耗时）。
+- `EXT_DISCONNECTED`：扩展通道断开；断连时所有 pending 请求确定结局，不无限挂起。
+- `NAV_TIMEOUT`：导航或等待 URL/ready/selector 超时。
+- `PAGE_CONTEXT_TIMEOUT`：页面上下文销毁/无法注入 content（导航中、chrome://、上下文崩溃）。
+- `CONTENT_TIMEOUT`：content 调用（click/type 等）超时。
+- `TAB_BUSY`：同 tab 串行队列占用（一般等待而非报错）。
 
 可以使用客户端库：
 

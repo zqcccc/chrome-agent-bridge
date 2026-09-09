@@ -68,15 +68,26 @@ class WSConnection extends EventEmitter {
     this.socket = socket;
     this.buffer = Buffer.alloc(0);
     this.closed = false;
+    this._closeEmitted = false;
     socket.on("data", (chunk) => this._onData(chunk));
-    socket.on("close", () => {
-      this.closed = true;
-      this.emit("close");
-    });
+    // close 与 error 可能同时触发；保证只 emit 一次 close，且始终有 error handler
+    socket.on("close", () => this._finish());
     socket.on("error", (e) => {
-      this.closed = true;
-      this.emit("error", e);
+      // ECONNRESET / EPIPE 等：记录后走 close 路径，不抛 uncaughtException
+      this.emit("wserror", e);
+      this._finish();
     });
+  }
+
+  // 幂等：close 只 emit 一次。避免重复 reject / 重复广播。
+  _finish() {
+    if (this.closed) return;
+    this.closed = true;
+    try { this.socket.destroy(); } catch (e) { /* noop */ }
+    if (!this._closeEmitted) {
+      this._closeEmitted = true;
+      this.emit("close");
+    }
   }
 
   _onData(chunk) {
@@ -97,9 +108,8 @@ class WSConnection extends EventEmitter {
         this.emit("message", frame.payload.toString("utf8"));
         break;
       case 0x8: // close
-        this.closed = true;
         try { this.socket.end(encodeFrame(0x8, Buffer.from([0x03, 0xe8]))); } catch (e) { /* noop */ }
-        this.emit("close");
+        this._finish();
         break;
       case 0x9: // ping
         try { this.socket.write(encodeFrame(0xa, frame.payload)); } catch (e) { /* noop */ }
@@ -113,11 +123,17 @@ class WSConnection extends EventEmitter {
 
   sendText(text) {
     if (this.closed) return false;
+    const sock = this.socket;
+    // 已销毁/不可写时直接 finish，避免 afterWriteDispatched 的 EPIPE 走 uncaughtException
+    if (!sock || sock.destroyed || !sock.writable) { this._finish(); return false; }
     try {
-      this.socket.write(encodeFrame(0x1, text));
+      const ok = sock.write(encodeFrame(0x1, text), (err) => {
+        if (err) this._finish();
+      });
+      if (ok === false) { /* backpressure，无所谓 */ }
       return true;
     } catch (e) {
-      this.closed = true;
+      this._finish();
       return false;
     }
   }
@@ -128,8 +144,10 @@ class WSConnection extends EventEmitter {
 
   close() {
     if (this.closed) return;
-    this.closed = true;
-    try { this.socket.end(encodeFrame(0x8, Buffer.from([0x03, 0xe8]))); } catch (e) { /* noop */ }
+    if (this.socket && !this.socket.destroyed && this.socket.writable) {
+      try { this.socket.end(encodeFrame(0x8, Buffer.from([0x03, 0xe8]))); } catch (e) { /* noop */ }
+    }
+    this._finish();
   }
 }
 

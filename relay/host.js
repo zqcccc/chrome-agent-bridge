@@ -63,18 +63,95 @@ const TOKEN = ensureToken();
 let nativePort = null;   // { send, postMessage, onDisconnect }
 let extWs = null;        // WSConnection (扩展 ws 通道)
 let agentWss = [];       // Agent 的 ws 订阅连接
-const pending = new Map(); // requestId -> { resolve, reject, timer }
+const pending = new Map(); // requestId -> { resolve, reject, timer, method, tabId, startedAt, channel }
+
+// 同一 tab 的 page.* 请求严格串行队列；跨 tab 并行。
+// 目的：BOSS 重型 SPA 下同 tab 的 navigate/snapshot/evaluate 互相堆积导致 Host 超时。
+const tabQueues = new Map(); // tabId -> { running: bool, queue: [{run, method}] }
+const TAB_BUSY_RECOVERY_MS = 500; // tab 标记 unhealthy 后，下次请求先等恢复窗口（短，防雪崩但不长阻塞）
+const tabUnhealthy = new Map();    // tabId -> until timestamp
+
+// 这些 method 不绑定 tab（无需串行），其余 page.* / tabs.* / session.* 按 tabId 串行
+function tabIdOf(method, params) {
+  if (!params) return null;
+  // 显式 tabId 优先；tabs.create / tabs.active 没有 tabId 不串行
+  if (params.tabId !== undefined && params.tabId !== null) return String(params.tabId);
+  return null;
+}
+function isSerialMethod(method) {
+  return typeof method === "string" &&
+    (method.startsWith("page.") || method.startsWith("session.") ||
+     ["tabs.get", "tabs.activate", "tabs.close", "tabs.reload"].includes(method));
+}
 
 function nativeReady() { return !!(nativePort && nativePort.ready); }
 function extReady() { return nativeReady() || !!(extWs && !extWs.closed); }
+function currentChannel() {
+  if (nativeReady()) return "native";
+  if (extWs && !extWs.closed) return "ws";
+  return null;
+}
 
 function genRequestId() {
   return crypto.randomUUID();
 }
 
-// 向扩展发一个 RPC，返回 Promise
-// 扩展 MV3 service worker 会休眠导致 WS 短暂断开：未连接时先等待其重连（alarms 保活会唤醒）
+// 结构化诊断日志：不含 token / 页面内容
+function rpcLog(level, ctx) {
+  const line = [
+    `level=${level}`, `method=${ctx.method || "-"}`,
+    ctx.tabId != null ? `tab=${ctx.tabId}` : "tab=-",
+    `channel=${ctx.channel || "-"}`, `reqId=${ctx.reqId || "-"}`,
+    ctx.elapsedMs != null ? `elapsedMs=${ctx.elapsedMs}` : "",
+    ctx.code ? `code=${ctx.code}` : "",
+    ctx.note ? `note=${ctx.note}` : "",
+  ].filter(Boolean).join(" ");
+  log("rpc " + line);
+}
+
+// 向扩展发一个 RPC，返回 Promise。同一 tab 的串行方法排队串行执行。
 async function requestExtension(method, params, timeoutMs = 60000) {
+  const tabId = tabIdOf(method, params);
+  const serial = isSerialMethod(method) && tabId != null;
+
+  // tab unhealthy 恢复窗口：上次请求超时/断连后给一点恢复时间，避免雪崩
+  if (serial && tabId != null) {
+    const until = tabUnhealthy.get(tabId);
+    if (until && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, until - Date.now()));
+    } else if (until) {
+      tabUnhealthy.delete(tabId);
+    }
+  }
+
+  const exec = () => sendExtensionRequest(method, params, timeoutMs, tabId);
+  if (!serial) return exec();
+
+  // per-tab 串行队列
+  let q = tabQueues.get(tabId);
+  if (!q) { q = { running: false, queue: [] }; tabQueues.set(tabId, q); }
+  return new Promise((resolve, reject) => {
+    const run = () => exec().then(resolve, reject).finally(() => {
+      if (q.queue.length) {
+        const next = q.queue.shift();
+        next.run();
+      } else {
+        q.running = false;
+        // 空闲一段时间后清理队列结构，避免长期持有已关闭 tab
+        const cleanup = setTimeout(() => {
+          if (tabQueues.get(tabId) === q && !q.running && q.queue.length === 0) {
+            tabQueues.delete(tabId);
+          }
+        }, 60000);
+        if (cleanup.unref) cleanup.unref();
+      }
+    });
+    if (q.running) q.queue.push({ run });
+    else { q.running = true; run(); }
+  });
+}
+
+async function sendExtensionRequest(method, params, timeoutMs, tabId) {
   if (!extReady()) {
     const waited = await new Promise((resolve) => {
       const start = Date.now();
@@ -88,12 +165,20 @@ async function requestExtension(method, params, timeoutMs = 60000) {
     }
   }
   const requestId = genRequestId();
+  const channel = currentChannel();
+  const startedAt = Date.now();
+  rpcLog("info", { method, tabId, channel, reqId: requestId, note: "dispatch" });
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
+      const p = pending.get(requestId);
+      if (!p) return; // 已被 resolve/reject 处理
       pending.delete(requestId);
-      reject({ code: "TIMEOUT", message: `扩展响应超时(${timeoutMs}ms): ${method}` });
+      // 标记 tab unhealthy，阻止后续同 tab 请求立刻雪崩；给恢复窗口
+      if (tabId != null) tabUnhealthy.set(tabId, Date.now() + TAB_BUSY_RECOVERY_MS);
+      rpcLog("warn", { method, tabId, channel, reqId: requestId, elapsedMs: timeoutMs, code: "TIMEOUT" });
+      reject({ code: "TIMEOUT", message: `扩展响应超时(${timeoutMs}ms): ${method}`, method, tabId, channel, elapsedMs: timeoutMs });
     }, timeoutMs);
-    pending.set(requestId, { resolve, reject, timer, method });
+    pending.set(requestId, { resolve, reject, timer, method, tabId, channel, startedAt });
 
     try {
       if (nativeReady()) {
@@ -103,30 +188,45 @@ async function requestExtension(method, params, timeoutMs = 60000) {
       } else {
         clearTimeout(timer);
         pending.delete(requestId);
-        reject({ code: "EXT_DISCONNECTED", message: "扩展连接在请求发出前断开，请重试" });
+        rpcLog("warn", { method, tabId, channel, reqId: requestId, code: "EXT_DISCONNECTED", note: "pre-send" });
+        reject({ code: "EXT_DISCONNECTED", message: "扩展连接在请求发出前断开，请重试", method, tabId, channel });
       }
     } catch (e) {
       clearTimeout(timer);
       pending.delete(requestId);
-      reject({ code: "SEND_FAILED", message: String(e) });
+      rpcLog("warn", { method, tabId, channel, reqId: requestId, code: "SEND_FAILED" });
+      reject({ code: "SEND_FAILED", message: String(e), method, tabId, channel });
     }
   });
 }
 
 function resolvePending(requestId, payload) {
   const p = pending.get(requestId);
-  if (!p) return;
+  if (!p) return; // 可能是已超时的 stale 响应，直接丢弃，不再 resolve（避免覆盖 reject）
   clearTimeout(p.timer);
   pending.delete(requestId);
+  rpcLog("info", { method: p.method, tabId: p.tabId, channel: p.channel, reqId: requestId, elapsedMs: Date.now() - p.startedAt, note: "resolved" });
   p.resolve(payload);
 }
 
 function rejectPending(requestId, error) {
   const p = pending.get(requestId);
-  if (!p) return;
+  if (!p) return; // stale 响应，丢弃
   clearTimeout(p.timer);
   pending.delete(requestId);
-  p.reject({ code: (error && error.code) || "EXT_ERROR", message: (error && error.message) || String(error) });
+  rpcLog("warn", { method: p.method, tabId: p.tabId, channel: p.channel, reqId: requestId, elapsedMs: Date.now() - p.startedAt, code: (error && error.code) || "EXT_ERROR" });
+  p.reject({ code: (error && error.code) || "EXT_ERROR", message: (error && error.message) || String(error), method: p.method, tabId: p.tabId, channel: p.channel });
+}
+
+// 通道断开：所有 pending 标记失败，避免无限挂起
+function failAllPending(code, message) {
+  for (const [id, p] of pending) {
+    clearTimeout(p.timer);
+    pending.delete(id);
+    if (p.tabId != null) tabUnhealthy.set(p.tabId, Date.now() + TAB_BUSY_RECOVERY_MS);
+    rpcLog("warn", { method: p.method, tabId: p.tabId, channel: p.channel, reqId: id, code: code || "EXT_DISCONNECTED" });
+    p.reject({ code: code || "EXT_DISCONNECTED", message: message || "扩展通道断开", method: p.method, tabId: p.tabId, channel: p.channel });
+  }
 }
 
 // 向 Agent 广播事件（ws 订阅者）
@@ -149,40 +249,58 @@ function sendEventToExtension(event, payload) {
 }
 
 // ---------- Native Messaging（stdio） ----------
+// 循环 drain buffer，支持多帧/粘包/拆包。
+// 原实现只处理一个完整帧，粘包/多帧滞留会丢消息，导致 RPC 偶发无响应。
 function setupNativeMessaging() {
   let buffer = Buffer.alloc(0);
-  let expectedLength = -1;
+
+  function drainBuffer() {
+    for (;;) {
+      // 需要至少 4 字节读出长度头
+      if (buffer.length < 4) return;
+      const expectedLength = buffer.readUInt32LE(0);
+      // 防御：上限 16MB，避免脏数据导致巨型分配
+      if (expectedLength > 16 * 1024 * 1024) {
+        log("native frame too large, dropping buffer:", expectedLength);
+        buffer = Buffer.alloc(0);
+        return;
+      }
+      if (buffer.length < 4 + expectedLength) return; // 拆包，等更多数据
+      const msgBuf = buffer.slice(4, 4 + expectedLength);
+      // 保留剩余字节（可能还有下一帧：粘包）
+      buffer = buffer.slice(4 + expectedLength);
+      try {
+        handleNativeMessage(JSON.parse(msgBuf.toString("utf8")));
+      } catch (e) {
+        log("native parse error:", e.message);
+      }
+    }
+  }
 
   process.stdin.on("readable", () => {
     let chunk;
     while ((chunk = process.stdin.read()) !== null) {
-      buffer = Buffer.concat([buffer, chunk]);
-      if (expectedLength === -1 && buffer.length >= 4) {
-        expectedLength = buffer.readUInt32LE(0);
-        buffer = buffer.slice(4);
-      }
-      if (expectedLength !== -1 && buffer.length >= expectedLength) {
-        const msgBuf = buffer.slice(0, expectedLength);
-        buffer = buffer.slice(expectedLength);
-        expectedLength = -1;
-        try {
-          handleNativeMessage(JSON.parse(msgBuf.toString("utf8")));
-        } catch (e) {
-          log("native parse error:", e.message);
-        }
-      }
+      buffer = buffer.length ? Buffer.concat([buffer, chunk]) : chunk;
     }
+    drainBuffer();
   });
 
   process.stdin.on("end", () => {
     log("native channel closed by Chrome");
     nativePort = null;
+    // 通道断开：未完成的 pending 不能无限挂起
+    failAllPending("EXT_DISCONNECTED", "Native 通道已关闭");
+    broadcastToAgent("ext.disconnected", { channel: "native" });
     // Chrome 关闭连接后进程即将退出；standalone 时继续存活
     if (!STANDALONE) {
       setTimeout(() => process.exit(0), 500);
     }
   });
-  process.stdin.on("error", () => { /* noop */ });
+  process.stdin.on("error", (e) => {
+    log("native stdin error:", e && e.message);
+    nativePort = null;
+    failAllPending("EXT_DISCONNECTED", "Native stdin 错误");
+  });
 }
 
 function writeNative(obj) {
@@ -255,9 +373,11 @@ function httpServer() {
         ok: true,
         name: HOST_NAME,
         version: VERSION,
-        channel: nativeReady() ? "native" : (extWs && !extWs.closed ? "ws" : "disconnected"),
+        channel: currentChannel() || "disconnected",
+        mode: STANDALONE ? "standalone" : "native",
         extConnected: extReady(),
         pending: pending.size,
+        tabQueues: tabQueues.size,
         uptimeSec: Math.round(process.uptime()),
         pid: process.pid,
         port: PORT,
@@ -322,8 +442,14 @@ function httpServer() {
             extWs = null;
             log("extension ws /agent disconnected");
             broadcastToAgent("ext.disconnected", {});
+            // 通道断开：pending 请求必须确定结局，不能无限挂起
+            failAllPending("EXT_DISCONNECTED", "扩展 WS 通道断开");
           }
         });
+        ws.on("wserror", (e) => {
+          log("extension ws /agent error:", e && e.code, e && e.message);
+        });
+        ws.on("error", () => { /* WSConnection 已处理，避免 EventEmitter unhandled */ });
       },
     },
     {
@@ -347,6 +473,10 @@ function httpServer() {
         ws.on("close", () => {
           agentWss = agentWss.filter((w) => w !== ws);
         });
+        ws.on("wserror", (e) => {
+          log("agent ws /bridge error:", e && e.code, e && e.message);
+        });
+        ws.on("error", () => { /* WSConnection 已处理 */ });
       },
     },
   ]);
@@ -370,8 +500,18 @@ function httpServer() {
 }
 
 // ---------- 启动 ----------
-// 单连接异常（ECONNRESET 等）不应拖垮整个桥：记录并继续服务
+// 单连接异常（ECONNRESET / EPIPE 等）不应拖垮整个桥，也不应刷爆日志。
+// 这些是连接断开时的常规错误，WSConnection 已处理；这里只作兑底，避免进程崩。
+let lastUncaughtLog = 0;
 process.on("uncaughtException", (e) => {
+  const code = e && (e.code || "");
+  const benign = ["ECONNRESET", "EPIPE", "ERR_STREAM_DESTROYED", "ERR_STREAM_WRITE_AFTER_END"].includes(code);
+  // 限流：无害错误每秒最多记一条，避免日志风暴 + CPU 烧
+  const now = Date.now();
+  if (benign) {
+    if (now - lastUncaughtLog > 1000) { lastUncaughtLog = now; log("conn error (benign):", code, e && e.message); }
+    return;
+  }
   log("uncaughtException:", e && e.message, (e && e.stack || "").split("\n")[1] || "");
 });
 process.on("unhandledRejection", (e) => {
@@ -381,14 +521,16 @@ log(`host v${VERSION} start, standalone=${STANDALONE}, port=${PORT}`);
 setupNativeMessaging();
 httpServer();
 
-// 定期清理超时 pending
+// 定期清理超时 pending（超时由自身 timer 触发；此处兑底，防 timer 泄漏）
 setInterval(() => {
   const now = Date.now();
   for (const [id, p] of pending) {
-    if (p.timer && now - p.timer._idleStart > 90000) {
+    if (p.startedAt && now - p.startedAt > 120000) {
       clearTimeout(p.timer);
       pending.delete(id);
-      p.reject({ code: "TIMEOUT", message: `扩展响应超时: ${p.method}` });
+      if (p.tabId != null) tabUnhealthy.set(p.tabId, now + TAB_BUSY_RECOVERY_MS);
+      rpcLog("warn", { method: p.method, tabId: p.tabId, channel: p.channel, reqId: id, code: "TIMEOUT", note: "swept" });
+      p.reject({ code: "TIMEOUT", message: `扩展响应超时(swept): ${p.method}`, method: p.method, tabId: p.tabId, channel: p.channel });
     }
   }
 }, 30000).unref();

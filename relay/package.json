@@ -7,7 +7,10 @@
     "start": "node host.js --standalone",
     "install-host": "bash install-host.sh",
     "icons": "node generate-icons.js",
-    "test": "node test.js"
+    "test": "node test.js && node test-unit.js && node --test test-verify.mjs",
+    "test:integration": "node test.js",
+    "test:unit": "node test-unit.js",
+    "test:verify": "node --test test-verify.mjs"
   },
   "engines": {
     "node": ">=18"
