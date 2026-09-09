@@ -52,14 +52,24 @@ chrome-agent-bridge/
 │   ├── host.sh           # node 发现 + 启动包装
 │   ├── install-host.sh   # 注册 native host 到 Chrome（需扩展 ID）
 │   ├── generate-icons.js # 图标生成
-│   └── test.js           # 集成测试（11/11）
+│   └── test.js           # 集成测试
 ├── agent/
 │   ├── client.mjs        # Bridge 客户端类
 │   └── cli.mjs           # 命令行工具
+├── docs/
+│   └── AI-INTEGRATION.md    # 给 AI Agent 的接入与操作指南
+├── skills/
+│   └── agent-browser-bridge/ # 配套 Agent Skill（可选）
+├── SECURITY.md
+├── LICENSE
 └── README.md
 ```
 
 ## 安装
+
+当前项目面向 macOS + Google Chrome。`skills/agent-browser-bridge/` 是可选的 Agent 使用说明和辅助脚本，不参与 relay/extension 的运行时依赖。
+
+如果你希望让 AI Agent 使用本项目，请同时阅读 [AI Agent 接入指南](docs/AI-INTEGRATION.md)。它把“扩展、relay、Token、RPC、Skill”这些概念和接入步骤拆成了可执行的检查清单。
 
 ### 1. 加载扩展
 
