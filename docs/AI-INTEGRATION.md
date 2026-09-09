@@ -45,14 +45,18 @@ node --version
 
 不要把某个用户的扩展 ID 写入脚本或文档；每次应读取用户本机显示的 ID。
 
-### 3. 启动 relay
+### 3. 注册并启动 Native host
 
 在项目根目录执行：
 
 ```bash
 cd /path/to/chrome-agent-bridge/relay
-npm start
+bash install-host.sh <用户的扩展ID>
 ```
+
+注意：`install-host.sh` 是 Shell 脚本，不要使用 `node install-host.sh`。
+
+完全退出并重新打开 Chrome，或重新加载扩展。Native 模式下不要先运行 `npm start`，Chrome 会按需启动 host。
 
 首次启动会生成本地 Token：
 
@@ -62,20 +66,7 @@ npm start
 
 Token 是本机能力凭证，不要发送给第三方、写入聊天记录、提交到 Git 或放到网页中。
 
-### 4. 注册 Native Messaging Host
-
-在另一个终端执行：
-
-```bash
-cd /path/to/chrome-agent-bridge/relay
-bash install-host.sh <用户的扩展ID>
-```
-
-然后重启 Chrome，或按 Chrome 的提示重新加载扩展。
-
-Native Messaging 是推荐通道；如果只想快速开发测试，也可以使用 relay 的 WebSocket 回退通道。
-
-### 5. 配置扩展
+### 4. 配置扩展
 
 打开：
 
@@ -85,10 +76,10 @@ chrome-extension://<用户的扩展ID>/options.html
 
 填写：
 
-- 通道：`auto`
+- 通道：`native`
 - Host：`127.0.0.1`
 - Port：`8778`
-- Token：`cat ~/.chrome-agent-bridge/token` 的输出内容
+- Native 模式下扩展不需要填写 Token；Agent CLI 从 `~/.chrome-agent-bridge/token` 读取 Token
 
 保存并重连。
 
@@ -148,7 +139,7 @@ console.log(snapshot.title, snapshot.url);
 
 ### `ECONNREFUSED`
 
-relay 没有运行，或者端口不是 8778：
+Native host 尚未被 Chrome 启动，或者端口不是 8778。先重新加载扩展并检查 Native 配置；如果明确使用 WS 模式，再运行：
 
 ```bash
 cd /path/to/chrome-agent-bridge/relay

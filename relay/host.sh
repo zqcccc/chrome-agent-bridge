@@ -10,7 +10,7 @@ for cand in \
   /opt/homebrew/bin/node \
   /usr/local/bin/node \
   /opt/local/bin/node
-; do
+ do
   if [ -n "$NODE_EXEC" ]; then break; fi
   if [ -x "$cand" ]; then NODE_EXEC="$cand"; fi
 done

@@ -105,6 +105,7 @@ function tryConnectNative() {
       }
       scheduleReconnect();
     });
+    port.postMessage({ type: "hello", name: "Agent Browser Bridge", version: chrome.runtime.getManifest().version });
     console.log("[bridge] native channel connecting…");
     return true;
   } catch (e) {

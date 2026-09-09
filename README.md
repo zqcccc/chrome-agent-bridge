@@ -38,7 +38,7 @@
                                                                └──────────────────┘
 ```
 
-- **扩展（extension/）**：MV3 后台脚本 + 页面注入脚本。负责连接本地桥（Native Messaging 优先，失败自动回退 WebSocket）、RPC 分发、标签页管理、页面快照与操作、截图、导航等待。
+- **扩展（extension/）**：MV3 后台脚本 + 页面注入脚本。负责连接本地桥（Native Messaging 优先，失败自动回退 WebSocket）、RPC 分发、标签页管理、页面快照与操作、截图、导航等待。Native 连接建立后会先发送 hello 握手消息。
 - **本地桥（relay/）**：既是 Native Messaging host 进程，又是 HTTP/WS 服务端。单进程双角色：Chrome 通过 native 或 ws 连进来，Agent 通过 HTTP/WS 连进来，两边消息转发。
 - **Agent 客户端（agent/）**：给 Agent 用的 JS 客户端与命令行工具。
 
@@ -87,6 +87,8 @@ chrome-agent-bridge/
 
 ### 2. 启动本地桥
 
+> 如果使用推荐的 Native 模式，请跳过本节，先完成下一节的 Native Messaging 注册。Native 模式不需要手动运行 `npm start`。
+
 ```bash
 cd relay
 npm start                # 等价于 node host.js --standalone
@@ -98,11 +100,13 @@ npm start                # 等价于 node host.js --standalone
 ### 3. 注册 Native Messaging Host（可选，推荐）
 
 ```bash
-cd relay
+cd /path/to/chrome-agent-bridge/relay
 bash install-host.sh <你的扩展ID>
 ```
 
-注册后**重启 Chrome** 生效。Native Messaging 与 ChatGPT/Claude 插件同款通道，无需 HTTP 端口暴露给扩展。
+注意：`install-host.sh` 是 Shell 脚本，使用 `bash` 执行，不要使用 `node install-host.sh`。
+
+注册后完全退出并重新打开 Chrome，或重新加载扩展。Native Messaging 与 ChatGPT/Claude 插件同款通道，无需 HTTP 端口暴露给扩展。
 
 > **两种运行模式（二选一）**
 > - **Native 模式（推荐）**：不启动 standalone host。Chrome 通过 Native Messaging 按需拉起 `host.js`，该进程自己监听 8778；Agent 连 8778 即是同一进程。Chrome 关闭连接时进程自动退出，无需常驻。
