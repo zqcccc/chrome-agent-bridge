@@ -23,13 +23,15 @@ description: 通过本地 Chrome 扩展 + 本地桥（Agent Browser Bridge）驱
 
 ## 快速开始（CLI）
 
+> CLI 依赖仓库根的 `agent/cli.mjs`，属于**本机仓库便利命令**；自包含的等价调用（RPC / HTTP）见下方「编程调用」与「HTTP 直调」——其他 Agent 若只有本 skill 目录，请用 RPC/HTTP 示例。
+
 ```bash
 export BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token)   # 每次 shell 都要
 cd /path/to/chrome-agent-bridge
 
 node agent/cli.mjs status              # host 状态 + 扩展连接
 node agent/cli.mjs tabs                # 列出所有标签页（拿 tabId，用户操作会变，用前必查）
-node agent/cli.mjs open <url>          # 新标签页打开 URL
+node agent/cli.mjs open <url>          # ⚠️ 慎用：新标签页打开。优先在现有 tab 内 page.navigate；确需新开时用完立即 tabs.close
 node agent/cli.mjs eval <tabId> "<js>" # 在页面执行 JS（同步求值）
 node agent/cli.mjs click <tabId> <css选择器>
 node agent/cli.mjs type <tabId> <sel> <text>
@@ -37,6 +39,8 @@ node agent/cli.mjs press <tabId> <key>
 node agent/cli.mjs scroll <tabId> <sel> <dir>
 node agent/cli.mjs snap <tabId>        # 页面快照（a11y 树+元素清单）
 node agent/cli.mjs shot <tabId>        # 页面截图（保存当前目录）
+node agent/cli.mjs inspect <tabId> [overview|links|media|scroll|modal|sel:<css>]  # 内置页面探查
+node agent/cli.mjs record <tabId> start|stop|status|get|clear [types:nav,modal,err,dom,console]  # 会话记录时间线
 node agent/cli.mjs listen              # 订阅页面事件
 ```
 
@@ -58,6 +62,19 @@ await bridge.rpc("page.navigate", { tabId, url });
 await bridge.rpc("page.evaluate", { tabId, expression: "..." , awaitPromise: false });
 await bridge.rpc("page.click", { tabId, selector: "..." });
 await bridge.rpc("page.type", { tabId, selector: "...", text: "..." });
+// 内置页面探查（不需要写 JS！遇到页面异常/陌生结构/交付前验证时先调这个）
+await bridge.rpc("page.inspect", { tabId, focus: "overview" });            // 页面概览
+await bridge.rpc("page.inspect", { tabId, focus: "links", limit: 6 });     // 列表卡片链接+可见性（防点隐藏链接）
+await bridge.rpc("page.inspect", { tabId, focus: "media" });               // 图片/视频/live/blob
+await bridge.rpc("page.inspect", { tabId, focus: "scroll" });              // 可滚动容器
+await bridge.rpc("page.inspect", { tabId, focus: "modal" });               // 弹窗详情
+await bridge.rpc("page.inspect", { tabId, focus: "sel", selector: ".foo" }); // 任意选择器 dump
+// 会话记录（Clarity 式变化时间线）：先 start，页面变化被记录，事后 get 分析过程
+await bridge.rpc("page.record.start", { tabId });        // 开始记录（content 监听 DOM/导航/弹窗/异常文本/console）
+await bridge.rpc("page.record.status", { tabId });       // 运行状态 + 各类型事件计数
+await bridge.rpc("page.record.get", { tabId, types: ["nav","modal","err","dom","console"], since: 0, limit: 500 }); // 拉时间线
+await bridge.rpc("page.record.stop", { tabId });         // 停止记录
+await bridge.rpc("page.record.clear", { tabId });        // 清空时间线
 ```
 
 HTTP 直调：`POST http://127.0.0.1:8778/rpc`，头 `Authorization: Bearer <token>`，体 `{"method":"...","params":{...},"timeoutMs":20000}` → `{"ok":true,"result":{...}}`。注意 **page.evaluate 的返回值在 `result.result` 里是 JSON 字符串**，需要再 JSON.parse 一次。
@@ -93,23 +110,33 @@ HTTP 直调：`POST http://127.0.0.1:8778/rpc`，头 `Authorization: Bearer <tok
 - `EXT_DISCONNECTED` 在扩展 WS/Native 断连时让所有 pending 请求确定结局，不无限挂起。
 - `TAB_LEASED`：Tab 已被其他 Agent 占用。
 
-HTTP 直调必须携带 `X-Agent-Id`；WebSocket 订阅使用 `/bridge?...&agentId=<id>`。
+HTTP 直调建议携带 `X-Agent-Id` 和 `X-Agent-Name`；WebSocket 订阅使用 `/bridge?...&agentId=<id>&name=<name>`。
 
-## 多 Agent 并行与 Tab 租约
+## 多 Agent 并行、Tab 租约与身份标识
 
 多个 Agent 可以共用一个 host。每个 Agent 必须使用唯一 `AGENT_ID`，不同 Tab 可以并行；操作某个 Tab 前建议先申请租约：
 
 ```bash
 export AGENT_ID="boss-agent-1"
+export AGENT_NAME="BOSS 投递"
 ```
 
 ```js
-const bridge = new Bridge({ agentId: process.env.AGENT_ID });
-await bridge.register("BOSS 投递 Agent");
+const bridge = new Bridge({
+  agentId: process.env.AGENT_ID || `agent-${process.pid}`,
+  agentName: process.env.AGENT_NAME || "豆包",
+});
+await bridge.register();
 await bridge.claimTab(tabId, 120000);
 // ...完成流程后释放
 await bridge.releaseTab(tabId);
 ```
+
+### 页面接管身份识别（支持同名 Agent 区分）
+当 Agent 接管页面时，页面右上角胶囊条、Chrome 标签页标题及扩展徽标会实时显示具体接管的 Agent 身份：
+- **同名 Agent 自动区分**：若多个 Agent 名字相同（例如都叫「豆包」或都叫「小红书采集」），系统会自动解析其实例短 ID 进行区分展示（例如显示为 `● [豆包 #101] 接管中` 与 `● [豆包 #102] 接管中`，右上角角标为 `接管: 豆包 #101`）；
+- 底部停止按钮同步展示专属停止文案（例如 `停止 [豆包 #101]`）；
+- 操作完毕空闲 12 秒后自动切换为「已放开: 豆包 #101」并恢复原标题。
 
 租约默认 120 秒，最长 1 小时；异常退出会自动过期。其他 Agent 访问已占用 Tab 会收到 `TAB_LEASED`，不要绕过租约强行操作。
 
@@ -125,6 +152,20 @@ await bridge.releaseTab(tabId);
 - `page.waitForReady` `{ tabId, timeoutMs? }`：等 `document.readyState` 为 complete。
 - `page.waitForSelector` `{ tabId, selector, by?, timeoutMs?, intervalMs? }`：等选择器出现。
 - `page.waitLoad` `{ tabId, timeoutMs? }`：等加载完成（webNavigation + 轮询兑底）。
+
+## Agent 行为约束（所有任务、所有网站，必须遵守）
+
+1. **遇到风控/安全验证 → 立即停止，禁止疯狂重试**：页面跳转到验证码页（如小红书 `website-login/captcha` /「Security Verification」）、滑块验证、人机校验，或大量 404 /「页面不见了」时，**立即停止该站点的所有后续请求**。不要换参数重试、不要加大滚动轮数、不要重新批量打开页面、不要换个 tab 再试。停下来向用户说明，等待用户手动完成验证或风控解除后再继续。疯狂重试会加重风控，导致账号/会话被更长时间限制。桥本身（host/扩展）几乎从不是这类问题的原因：先 `/status` 确认 `extConnected:true`，桥正常则归因于站点侧风控。
+2. **优先页面内跳转/点开，少开标签页**：目标站点的内容本身就能在页面内点开（如小红书每个笔记都是可点开的页面内弹窗），**优先在当前 tab 内 `page.navigate` 跳转或直接点开内容，不要为每条内容新开标签页**。确需新开时，用完立即 `tabs.close`。同一任务同时打开的 tab 控制在个位数，确需保留的只有搜索/列表页本身。大量并发 tab = 大量并发请求 = 更容易触发风控，也让快照/截图/tab 管理混乱。
+
+## 专项实战：按需加载子技能
+
+本 skill 的站点专项按需拆分，使用时才读取对应子技能的 `SKILL.md`：
+
+- **小红书（笔记 + 全部评论深度抓取）** → 读取 `xhs/SKILL.md`（含一键抓取脚本 `scripts/extract-xhs-comments.mjs` 的用法与执行规范）。仅当任务需要在站内检索、抓笔记/评论时读取，其余任务无需加载。
+- **临场 Debug（任何站点通用）** → 读取 `debug/SKILL.md`（工具 `scripts/browser-debug.mjs`）。仅当页面行为异常（404/风控误判、取不到内容、数量不对、URL 打不开）、需要理解陌生页面结构、或交付前验证提取结果时读取。**先探查后假设、不猜类名、异常先查 DOM 再下结论、输出独立验证**。
+
+---
 
 ## 安全
 

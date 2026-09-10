@@ -140,9 +140,12 @@ function rpcLog(level, ctx) {
 }
 
 // 向扩展发一个 RPC，返回 Promise。同一 tab 的串行方法排队串行执行。
-async function requestExtension(method, params, timeoutMs = 60000, agentId = "anonymous") {
+async function requestExtension(method, params, timeoutMs = 60000, agentId = "anonymous", agentName = "") {
   const tabId = tabIdOf(method, params);
-  touchAgent(agentId);
+  touchAgent(agentId, agentName);
+  const agentInfo = agents.get(agentId) || { name: agentName || "agent" };
+  const effectiveAgentName = agentName || agentInfo.name || "agent";
+
   const denied = tabId != null ? checkLease(tabId, agentId) : null;
   if (denied) throw denied;
   const serial = isSerialMethod(method) && tabId != null;
@@ -157,7 +160,7 @@ async function requestExtension(method, params, timeoutMs = 60000, agentId = "an
     }
   }
 
-  const exec = () => sendExtensionRequest(method, params, timeoutMs, tabId);
+  const exec = () => sendExtensionRequest(method, params, timeoutMs, tabId, agentId, effectiveAgentName);
   if (!serial) return exec();
 
   // per-tab 串行队列
@@ -184,7 +187,7 @@ async function requestExtension(method, params, timeoutMs = 60000, agentId = "an
   });
 }
 
-async function sendExtensionRequest(method, params, timeoutMs, tabId) {
+async function sendExtensionRequest(method, params, timeoutMs, tabId, agentId, agentName) {
   if (!extReady()) {
     const waited = await new Promise((resolve) => {
       const start = Date.now();
@@ -213,11 +216,12 @@ async function sendExtensionRequest(method, params, timeoutMs, tabId) {
     }, timeoutMs);
     pending.set(requestId, { resolve, reject, timer, method, tabId, channel, startedAt });
 
+    const reqPayload = { type: "request", requestId, method, params: params || {}, agentId, agentName };
     try {
       if (nativeReady()) {
-        nativePort.postMessage({ type: "request", requestId, method, params: params || {} });
+        nativePort.postMessage(reqPayload);
       } else if (extWs && !extWs.closed) {
-        extWs.sendJson({ id: requestId, method, params: params || {} });
+        extWs.sendJson({ id: requestId, method, params: params || {}, agentId, agentName });
       } else {
         clearTimeout(timer);
         pending.delete(requestId);
@@ -441,8 +445,11 @@ function httpServer() {
         const params = parsed.params || {};
         const timeoutMs = parsed.timeoutMs || 60000;
         if (!method) return send(400, { ok: false, error: { code: "BAD_PARAMS", message: "缺少 method" } });
-        const agentId = String(req.headers["x-agent-id"] || "anonymous");
-        requestExtension(method, params, timeoutMs, agentId)
+        const agentId = String(req.headers["x-agent-id"] || parsed.agentId || "anonymous");
+        let rawAgentName = req.headers["x-agent-name"] || parsed.agentName || "";
+        try { rawAgentName = decodeURIComponent(rawAgentName); } catch (e) { /* noop */ }
+        const agentName = String(rawAgentName || "");
+        requestExtension(method, params, timeoutMs, agentId, agentName)
           .then((result) => send(200, { ok: true, result: result === undefined ? null : result }))
           .catch((e) => send(200, { ok: false, error: { code: e.code || "INTERNAL", message: e.message || String(e) } }));
       });
@@ -500,10 +507,12 @@ function httpServer() {
       path: "/bridge",
       token: TOKEN,
       onConnection(ws, req) {
-        const agentId = String(new URL(req.url, `http://127.0.0.1:${PORT}`).searchParams.get("agentId") || crypto.randomUUID());
-        touchAgent(agentId); ws.agentId = agentId;
+        const reqUrl = new URL(req.url, `http://127.0.0.1:${PORT}`);
+        const agentId = String(reqUrl.searchParams.get("agentId") || crypto.randomUUID());
+        const agentName = String(reqUrl.searchParams.get("name") || reqUrl.searchParams.get("agentName") || "");
+        touchAgent(agentId, agentName); ws.agentId = agentId; ws.agentName = agentName;
         agentWss.push(ws);
-        log("agent connected via ws /bridge", agentId);
+        log("agent connected via ws /bridge", agentId, agentName ? `(${agentName})` : "");
         ws.sendJson({ type: "hello", host: HOST_NAME, version: VERSION, extConnected: extReady() });
         ws.on("message", (text) => {
           let msg;
@@ -511,7 +520,9 @@ function httpServer() {
           if (msg.id !== undefined && msg.method) {
             const requestId = String(msg.id);
             const timeoutMs = msg.timeoutMs || 60000;
-            requestExtension(msg.method, msg.params || {}, timeoutMs, ws.agentId)
+            const callerId = msg.agentId || ws.agentId;
+            const callerName = msg.agentName || ws.agentName;
+            requestExtension(msg.method, msg.params || {}, timeoutMs, callerId, callerName)
               .then((result) => ws.sendJson({ id: requestId, ok: true, result: result === undefined ? null : result }))
               .catch((e) => ws.sendJson({ id: requestId, ok: false, error: { code: e.code || "INTERNAL", message: e.message || String(e) } }));
           }

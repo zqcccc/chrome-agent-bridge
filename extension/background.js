@@ -177,7 +177,8 @@ function handleNativeMsg(msg) {
   }
   if (msg.type === "pong") return;
   if (msg.type === "request" && msg.requestId !== undefined && msg.method) {
-    dispatch(msg.method, msg.params || {})
+    const caller = { agentName: msg.agentName, agentId: msg.agentId };
+    dispatch(msg.method, msg.params || {}, caller)
       .then((result) => {
         nativePort.postMessage({ type: "response", responseToRequestId: msg.requestId, payload: result === undefined ? null : result });
       })
@@ -206,7 +207,8 @@ function handleWsMsg(msg) {
     return;
   }
   if (msg.id !== undefined && msg.method) {
-    dispatch(msg.method, msg.params || {})
+    const caller = { agentName: msg.agentName, agentId: msg.agentId };
+    dispatch(msg.method, msg.params || {}, caller)
       .then((result) => ws.send(JSON.stringify({ id: msg.id, ok: true, result: result === undefined ? null : result })))
       .catch((e) => ws.send(JSON.stringify({ id: msg.id, ok: false, error: { code: e && e.code || "INTERNAL", message: e && e.message ? String(e.message) : String(e) } })));
   }
@@ -242,14 +244,65 @@ function broadcastToTabs(msg) {
   });
 }
 
+// 记录每个 Tab 当前被哪个 Agent 接管（用于 popup 界面与监控）：tabId -> { agentDisplay, agentName, agentId, lastActiveAt, timer }
+const activeTabAgents = new Map();
+const TAB_AGENT_EXPIRE_MS = 15_000;
+
+function recordTabAgent(tabId, agentName, agentId, agentDisplay) {
+  if (tabId === undefined || tabId === null) return;
+  const existing = activeTabAgents.get(tabId);
+  if (existing?.timer) clearTimeout(existing.timer);
+
+  // 格式化展示名称
+  let display = agentDisplay;
+  if (!display) {
+    const rawName = typeof agentName === "string" ? agentName.trim() : "";
+    const rawId = typeof agentId === "string" ? agentId.trim() : "";
+    let shortId = "";
+    if (rawId && rawId !== "anonymous") {
+      shortId = rawId.replace(/^agent-/, "").replace(/^[a-zA-Z_-]+-/, "");
+      if (!shortId) shortId = rawId;
+    }
+    if (!rawName || rawName === "agent" || rawName === "anonymous") {
+      display = shortId ? `Agent #${shortId}` : "Agent";
+    } else if (shortId && (rawName.includes(shortId) || rawName.includes(rawId))) {
+      display = rawName;
+    } else {
+      display = shortId ? `${rawName} #${shortId}` : rawName;
+    }
+  }
+
+  const timer = setTimeout(() => {
+    activeTabAgents.delete(tabId);
+  }, TAB_AGENT_EXPIRE_MS);
+
+  activeTabAgents.set(tabId, {
+    tabId,
+    agentDisplay: display,
+    agentName: agentName || "",
+    agentId: agentId || "",
+    lastActiveAt: Date.now(),
+    timer,
+  });
+}
+
+function clearTabAgent(tabId) {
+  const existing = activeTabAgents.get(tabId);
+  if (existing?.timer) clearTimeout(existing.timer);
+  activeTabAgents.delete(tabId);
+}
+
 // Chrome 不允许扩展改写网站 tab 的标题或 favicon；因此使用扩展图标 badge，
 // 并和页面内状态条配对，提供浏览器级和页面级两个可见信号。
-function setTabControlBadge(tabId, active) {
+function setTabControlBadge(tabId, active, agentDisplay) {
   if (tabId === undefined || tabId === null) return;
   try {
     chrome.action.setBadgeText({ tabId, text: active ? "ON" : "" });
     if (active) chrome.action.setBadgeBackgroundColor({ tabId, color: "#1d4ed8" });
-    chrome.action.setTitle({ tabId, title: active ? "Agent 接管中" : "Agent Browser Bridge" });
+    const title = active
+      ? (agentDisplay ? `[${agentDisplay}] 接管中` : "Agent 接管中")
+      : "Agent Browser Bridge";
+    chrome.action.setTitle({ tabId, title });
   } catch (e) { /* noop */ }
 }
 function clearAllTabControlBadges() {
@@ -270,12 +323,15 @@ const INTERACTIVE_METHODS = new Set([
 function isPageControlMethod(method) {
   return typeof method === "string" && method.startsWith("page.") && !method.startsWith("page.indicator.");
 }
-async function dispatch(method, params) {
+async function dispatch(method, params, caller) {
+  const agentName = caller?.agentName || "";
+  const agentId = caller?.agentId || "";
   if (isPageControlMethod(method) && params && params.tabId) {
-    try { await indicatorCall(params.tabId, { action: "setControl", state: "active" }); } catch (e) { /* chrome:// 等受限页忽略 */ }
+    recordTabAgent(params.tabId, agentName, agentId);
+    try { await indicatorCall(params.tabId, { action: "setControl", state: "active", agentName, agentId }); } catch (e) { /* chrome:// 等受限页忽略 */ }
   }
   if (INTERACTIVE_METHODS.has(method) && params && params.tabId) {
-    try { await indicatorCall(params.tabId, { action: "showStop", label: "停止 Agent" }); } catch (e) { /* chrome:// 等受限页忽略 */ }
+    try { await indicatorCall(params.tabId, { action: "showStop", label: "停止 Agent", agentName, agentId }); } catch (e) { /* chrome:// 等受限页忽略 */ }
   }
   switch (method) {
     case "bridge.status": return bridgeStatus();
@@ -300,6 +356,12 @@ async function dispatch(method, params) {
 
     case "page.snapshot": return pageSnapshot(params.tabId, params);
     case "page.evaluate": return pageEvaluate(params.tabId, params);
+    case "page.inspect": return pageInspect(params.tabId, params);
+    case "page.record.start": return pageRecordStart(params.tabId);
+    case "page.record.stop": return pageRecordStop(params.tabId);
+    case "page.record.status": return pageRecordStatus(params.tabId);
+    case "page.record.get": return pageRecordGet(params.tabId, params);
+    case "page.record.clear": return pageRecordClear(params.tabId);
     case "page.click": return pageAction(params.tabId, "click", params);
     case "page.type": return pageAction(params.tabId, "type", params);
     case "page.press": return pageAction(params.tabId, "press", params);
@@ -339,6 +401,34 @@ async function bridgeStatus() {
   const manifest = chrome.runtime.getManifest();
   let active = null;
   try { active = await tabsActive(); } catch (e) { /* noop */ }
+
+  // 组装当前被各个 Agent 接管中的 Tab 列表
+  const activeTabs = [];
+  const now = Date.now();
+  for (const [tabId, info] of activeTabAgents.entries()) {
+    if (now - info.lastActiveAt > TAB_AGENT_EXPIRE_MS) {
+      activeTabAgents.delete(tabId);
+      continue;
+    }
+    let tabDetail = null;
+    try {
+      const t = await chrome.tabs.get(tabId);
+      tabDetail = serializeTab(t);
+    } catch {
+      // tab 可能已关闭
+      activeTabAgents.delete(tabId);
+      continue;
+    }
+    activeTabs.push({
+      tabId,
+      agentDisplay: info.agentDisplay,
+      agentName: info.agentName,
+      agentId: info.agentId,
+      lastActiveAt: info.lastActiveAt,
+      tab: tabDetail,
+    });
+  }
+
   return {
     name: manifest.name,
     version: manifest.version,
@@ -346,6 +436,7 @@ async function bridgeStatus() {
     connected: isChannelOpen(),
     relayUrl: wsUrl().replace(/token=.*/, "token=***"),
     activeTab: active ? active.tab : null,
+    operatingAgents: activeTabs,
   };
 }
 
@@ -713,6 +804,258 @@ async function pageAction(tabId, action, params) {
   return contentCall(tabId, action, params);
 }
 
+// ---------- page.inspect：内置页面探查（Agent 无需写 JS，一次调用拿页面结构与状态） ----------
+// 用法: page.inspect { tabId, focus: "overview"|"links"|"media"|"scroll"|"modal"|"sel", selector?, limit?, world? }
+// 设计要点:
+//   - 探查函数以【函数引用】传给 chrome.scripting.executeScript，函数体是普通 JS 源码，
+//     正则直接写 \d/\s 即可，完全避开模板字符串转义坑（单反斜杠被丢弃成 d 的静默失败）。
+//   - 只读操作，不点任何元素、不滚动页面、不产生副作用。
+const INSPECT_FUNCS = {
+  // 页面概览：URL/标题/弹窗/滚动/卡片/搜索框/可滚动容器
+  overview: function (p) {
+    const mask = document.querySelector(".note-detail-mask") || document.querySelector('[class*="modal"][class*="mask"]');
+    const mr = mask ? mask.getBoundingClientRect() : null;
+    const cards = document.querySelectorAll('section[class*="item"], article, [class*="card"]');
+    const scrollables = [];
+    const all = document.querySelectorAll("*");
+    for (let i = 0; i < all.length && scrollables.length < 8; i++) {
+      const el = all[i];
+      if (el.scrollHeight > el.clientHeight + 50) {
+        scrollables.push({ tag: el.tagName, cls: String(el.className || "").slice(0, 50), client: el.clientHeight, scroll: el.scrollHeight, top: el.scrollTop });
+      }
+    }
+    const searchBoxes = [];
+    document.querySelectorAll('input[type="search"], input[placeholder*="搜索"], [class*="search"] input, [class*="search-input"]').forEach((el) => {
+      if (searchBoxes.length < 3) searchBoxes.push({ placeholder: el.getAttribute("placeholder") || "", cls: String(el.className || "").slice(0, 40) });
+    });
+    return {
+      url: location.href.slice(0, 200),
+      title: (document.title || "").slice(0, 80),
+      readyState: document.readyState,
+      hasModal: !!mask,
+      modalVisible: mr ? (mr.width > 0 && mr.height > 0) : false,
+      scrollY: window.scrollY,
+      docScrollHeight: document.documentElement.scrollHeight,
+      innerHeight: window.innerHeight,
+      cardCount: cards.length,
+      scrollables,
+      searchBoxes,
+      iframes: document.querySelectorAll("iframe").length,
+      bodyTextLen: (document.body.innerText || "").length
+    };
+  },
+
+  // 列表卡片链接 + 可见性（防点 display:none 隐藏链接触发风控/404）
+  links: function (p) {
+    const n = (p && p.limit) || 6;
+    const sel = (p && p.selector) || 'section[class*="item"], article, [class*="card"]';
+    const cards = Array.from(document.querySelectorAll(sel)).slice(0, n);
+    return cards.map((c, i) => {
+      const links = [];
+      c.querySelectorAll("a").forEach((a) => {
+        const r = a.getBoundingClientRect();
+        links.push({
+          href: (a.href || "").slice(0, 120),
+          visible: r.width > 0 && r.height > 0 && getComputedStyle(a).display !== "none",
+          cls: String(a.className || "").slice(0, 40)
+        });
+      });
+      return { index: i, text: (c.innerText || "").replace(/\s+/g, " ").slice(0, 80), links };
+    });
+  },
+
+  // 图片/视频/live photo/blob
+  media: function () {
+    const imgs = [];
+    document.querySelectorAll("img").forEach((img) => {
+      if (imgs.length >= 20) return;
+      const r = img.getBoundingClientRect();
+      imgs.push({
+        src: (img.currentSrc || img.src || "").slice(0, 140),
+        dataSrc: img.getAttribute("data-src") ? img.getAttribute("data-src").slice(0, 140) : null,
+        nw: img.naturalWidth,
+        visible: r.width > 0 && r.height > 0 && getComputedStyle(img).display !== "none",
+        cls: String(img.className || "").slice(0, 30)
+      });
+    });
+    const vids = [];
+    document.querySelectorAll("video").forEach((v) => {
+      vids.push({ src: (v.src || "").slice(0, 100), poster: (v.poster || "").slice(0, 140), hasBlob: (v.src || "").startsWith("blob:") });
+    });
+    const blobs = [];
+    document.querySelectorAll('[src*="blob:"], [poster*="blob:"]').forEach((el) => {
+      blobs.push({ tag: el.tagName, v: (el.src || el.poster || "").slice(0, 100) });
+    });
+    return { imgCount: document.querySelectorAll("img").length, imgs, vids, blobs };
+  },
+
+  // 可滚动容器（找"该滚哪个"）
+  scroll: function (p) {
+    const n = (p && p.limit) || 15;
+    const out = [];
+    const all = document.querySelectorAll("*");
+    for (let i = 0; i < all.length && out.length < n; i++) {
+      const el = all[i];
+      if (el.scrollHeight > el.clientHeight + 50) {
+        out.push({ tag: el.tagName, cls: String(el.className || "").slice(0, 60), id: el.id || "", clientH: el.clientHeight, scrollH: el.scrollHeight, top: Math.round(el.scrollTop), overflowY: getComputedStyle(el).overflowY });
+      }
+    }
+    return out;
+  },
+
+  // 弹窗详情（存在/尺寸/内部滚动区/评论数/互动）
+  modal: function () {
+    const mask = document.querySelector(".note-detail-mask") || document.querySelector('[class*="modal"][class*="mask"]');
+    if (!mask) return { hasModal: false };
+    const r = mask.getBoundingClientRect();
+    const scrollers = [];
+    mask.querySelectorAll("*").forEach((el) => {
+      if (scrollers.length < 6 && el.scrollHeight > el.clientHeight + 50) {
+        scrollers.push({ tag: el.tagName, cls: String(el.className || "").slice(0, 50), client: el.clientHeight, scroll: el.scrollHeight });
+      }
+    });
+    const comments = mask.querySelectorAll('[class*="comment-item"]').length;
+    const titleEl = mask.querySelector(".title");
+    const bar = mask.querySelector(".engage-bar");
+    return {
+      hasModal: true,
+      w: Math.round(r.width), h: Math.round(r.height),
+      title: titleEl ? (titleEl.innerText || "").slice(0, 60) : "",
+      commentCount: comments,
+      engageText: bar ? (bar.innerText || "").replace(/\s+/g, " ").slice(0, 60) : "",
+      scrollers
+    };
+  },
+
+  // 任意选择器 dump
+  sel: function (p) {
+    const sel = (p && p.selector) || "";
+    if (!sel) return { error: "缺少 selector 参数" };
+    const n = (p && p.limit) || 8;
+    const els = Array.from(document.querySelectorAll(sel)).slice(0, n);
+    return {
+      count: document.querySelectorAll(sel).length,
+      sample: els.map((el) => {
+        const r = el.getBoundingClientRect();
+        return {
+          tag: el.tagName,
+          cls: String(el.className || "").slice(0, 50),
+          id: el.id || "",
+          text: (el.innerText || "").replace(/\s+/g, " ").slice(0, 100),
+          visible: r.width > 0 && r.height > 0,
+          html: el.outerHTML.slice(0, 200)
+        };
+      })
+    };
+  },
+};
+
+async function pageInspect(tabId, params) {
+  requireTabId(tabId);
+  const focus = (params && params.focus) || "overview";
+  const func = INSPECT_FUNCS[focus];
+  if (!func) throw { code: "BAD_PARAMS", message: `focus 仅支持: ${Object.keys(INSPECT_FUNCS).join("/")}` };
+  await ensureInjected(tabId);
+  let resp;
+  try {
+    resp = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        // 默认 MAIN world；只在显式 ISOLATED 时切换
+        world: params && params.world === "ISOLATED" ? "ISOLATED" : "MAIN",
+        func,
+        args: [params || {}],
+      }),
+      CONTENT_CALL_TIMEOUT_MS,
+      "PAGE_CONTEXT_TIMEOUT",
+      `page.inspect 超时(${CONTENT_CALL_TIMEOUT_MS}ms): 页面可能已导航/上下文销毁`
+    );
+  } catch (e) {
+    if (e && (e.code === "PAGE_CONTEXT_TIMEOUT")) throw e;
+    throw { code: "PAGE_CONTEXT_TIMEOUT", message: `executeScript 失败: ${e && e.message || e}` };
+  }
+  const out = resp && resp[0] && resp[0].result;
+  return { result: out, focus };
+}
+
+// ---------- 会话记录（Clarity 式轻量版：记录页面变化过程时间线，供 Agent 事后分析） ----------
+// content script 的 recorder 监听页面变化，事件经 bridge.recordEvent 上报到这里，
+// 按 tabId 存环形缓冲（上限 RECORD_LIMIT 条）。Agent 用 page.record.get 拉取时间线分析。
+const RECORD_LIMIT = 1000;
+const recordStore = new Map(); // tabId -> { running, events: [{t,type,data}], startedAt }
+
+function recordState(tabId) {
+  const st = recordStore.get(tabId);
+  return st || { running: false, events: [], startedAt: 0 };
+}
+
+function recordPush(tabId, event) {
+  if (!event || !event.type) return;
+  let st = recordStore.get(tabId);
+  if (!st) { st = { running: false, events: [], startedAt: 0 }; recordStore.set(tabId, st); }
+  st.events.push({ t: event.t || Date.now(), type: event.type, data: event.data || {} });
+  if (st.events.length > RECORD_LIMIT) st.events.splice(0, st.events.length - RECORD_LIMIT);
+}
+
+function recordSetRunning(tabId, running) {
+  let st = recordStore.get(tabId);
+  if (!st) { st = { running: false, events: [], startedAt: 0 }; recordStore.set(tabId, st); }
+  st.running = running;
+  if (running && !st.startedAt) st.startedAt = Date.now();
+}
+
+async function notifyRecorder(tabId, running) {
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: "bridge.recorder.control", running });
+  } catch (e) { /* content 未注入或已销毁：状态仍记录，注入后 wantState 会自动恢复 */ }
+}
+
+async function pageRecordStart(tabId) {
+  requireTabId(tabId);
+  await ensureInjected(tabId);
+  recordSetRunning(tabId, true);
+  await notifyRecorder(tabId, true);
+  return { running: true, tabId };
+}
+
+async function pageRecordStop(tabId) {
+  requireTabId(tabId);
+  recordSetRunning(tabId, false);
+  await notifyRecorder(tabId, false);
+  return { running: false, tabId };
+}
+
+function pageRecordStatus(tabId) {
+  requireTabId(tabId);
+  const st = recordState(tabId);
+  const last = st.events.length ? st.events[st.events.length - 1] : null;
+  const byType = {};
+  for (const e of st.events) byType[e.type] = (byType[e.type] || 0) + 1;
+  return { running: st.running, count: st.events.length, startedAt: st.startedAt, lastAt: last ? last.t : 0, byType };
+}
+
+function pageRecordGet(tabId, params) {
+  requireTabId(tabId);
+  const st = recordState(tabId);
+  const since = params && params.since || 0;
+  const types = params && params.types;
+  const limit = params && params.limit || 500;
+  let events = st.events.filter((e) => e.t >= since);
+  if (types && types.length) {
+    const set = new Set(Array.isArray(types) ? types : [types]);
+    events = events.filter((e) => set.has(e.type));
+  }
+  events = events.slice(-limit);
+  return { running: st.running, count: events.length, total: st.events.length, events };
+}
+
+function pageRecordClear(tabId) {
+  requireTabId(tabId);
+  const st = recordState(tabId);
+  st.events = [];
+  return { cleared: true };
+}
+
 // ---------- 截图 ----------
 async function pageScreenshot(tabId, params) {
   requireTabId(tabId);
@@ -841,9 +1184,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
     return false;
   }
+  // 会话记录器：content 上报页面变化事件 → 每 tab 环形缓冲
+  if (msg.type === "bridge.recordEvent") {
+    const tabId = sender.tab && sender.tab.id;
+    if (tabId != null) recordPush(tabId, msg.event);
+    sendResponse({ ok: true });
+    return false;
+  }
+  // content 注入后询问是否处于录制中（导航重载后自动恢复）
+  if (msg.type === "bridge.recorder.wantState") {
+    const tabId = sender.tab && sender.tab.id;
+    sendResponse({ ok: true, running: tabId != null ? recordState(tabId).running : false });
+    return false;
+  }
   // indicator 的闲置倒计时也会回报，确保 toolbar badge 不会滞留。
   if (msg.type === "bridge.tabControl") {
-    setTabControlBadge(sender.tab && sender.tab.id, msg.state === "active");
+    const tabId = sender.tab && sender.tab.id;
+    if (msg.state === "active") {
+      recordTabAgent(tabId, msg.agentName, msg.agentId, msg.agentDisplay);
+    } else {
+      clearTabAgent(tabId);
+    }
+    setTabControlBadge(tabId, msg.state === "active", msg.agentDisplay);
     sendResponse({ ok: true });
     return false;
   }

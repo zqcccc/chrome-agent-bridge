@@ -531,6 +531,140 @@
     });
   }
 
+  // ---------- 会话记录器（Clarity 式轻量版）----------
+  // 记录页面状态"变化过程"的时间线：导航/标题/弹窗出现消失/异常文本/DOM 变化摘要/console 错误。
+  // 默认关闭，由 background 经 page.record.start 通过 bridge.recorder.control 消息开启；
+  // 事件经 chrome.runtime.sendMessage({type:"bridge.recordEvent"}) 上报到 background 每 tab 环形缓冲。
+  // 只读监听，不修改页面行为；MutationObserver 合并节流，避免事件风暴。
+  const recorder = {
+    running: false,
+    observer: null,
+    lastUrl: location.href,
+    lastTitle: document.title,
+    lastModal: false,
+    domAccum: null, // 合并窗口内累积的 DOM 变化摘要
+    domTimer: null,
+    lastEmit: 0,
+    errKeywords: ["验证码", "安全验证", "security verification", "404", "页面不存在", "不存在或已删除", "参数错误", "系统繁忙", "风控", "access denied", "not found", "出错了"],
+
+    emit(type, data) {
+      try {
+        chrome.runtime.sendMessage({ type: "bridge.recordEvent", event: { t: Date.now(), type, data } });
+      } catch (e) { /* 页面销毁瞬间可能发送失败，忽略 */ }
+    },
+
+    scanErrors() {
+      // 页面可见区域出现异常关键词时记录（取 body 前 2000 字符，避免全量扫描开销）
+      const txt = (document.body && document.body.innerText || "").slice(0, 2000);
+      for (const kw of this.errKeywords) {
+        if (txt.includes(kw)) {
+          this.emit("err", { keyword: kw, snippet: txt.slice(0, 120) });
+          return;
+        }
+      }
+    },
+
+    flushDom() {
+      if (!this.domAccum) return;
+      const acc = this.domAccum;
+      this.domAccum = null;
+      if (acc.added > 0 || acc.removed > 0 || acc.textChanged > 0) {
+        this.emit("dom", {
+          added: acc.added, removed: acc.removed, textChanged: acc.textChanged,
+          addedTags: Object.entries(acc.tags).sort((a, b) => b[1] - a[1]).slice(0, 6),
+          sampleText: acc.sampleText
+        });
+      }
+    },
+
+    start() {
+      if (this.running) return;
+      this.running = true;
+      this.lastUrl = location.href;
+      this.lastTitle = document.title;
+      this.lastModal = !!document.querySelector(".note-detail-mask");
+      this.emit("recordStart", { url: location.href, title: document.title });
+      this.scanErrors();
+
+      // 导航（SPA pushState/hash + popstate）
+      const patch = (type) => () => {
+        const u = location.href;
+        if (u !== this.lastUrl) {
+          this.lastUrl = u;
+          this.emit("nav", { url: u, type, title: document.title });
+        }
+      };
+      const origPush = history.pushState;
+      const origReplace = history.replaceState;
+      history.pushState = function (...a) { const r = origPush.apply(this, a); patch("pushState")(); return r; };
+      history.replaceState = function (...a) { const r = origReplace.apply(this, a); patch("replaceState")(); return r; };
+      window.addEventListener("popstate", patch("popstate"));
+      window.addEventListener("hashchange", patch("hashchange"));
+      window.addEventListener("pagehide", () => this.emit("nav", { url: "PAGE_HIDDEN", type: "pagehide" }));
+
+      // console 错误（页面 JS 报错是 debug 关键线索）
+      const origError = console.error;
+      console.error = (...args) => {
+        try {
+          const txt = args.map((a) => (a && a.message) || String(a)).join(" ").slice(0, 200);
+          if (Date.now() - this.lastEmit > 2000) { this.lastEmit = Date.now(); this.emit("console", { level: "error", text: txt }); }
+        } catch (e) {}
+        return origError.apply(console, args);
+      };
+
+      // DOM 变化（合并节流 500ms）
+      this.observer = new MutationObserver((muts) => {
+        if (!this.domAccum) this.domAccum = { added: 0, removed: 0, textChanged: 0, tags: {}, sampleText: "" };
+        const acc = this.domAccum;
+        for (const m of muts) {
+          if (m.type === "childList") {
+            for (const n of m.addedNodes) {
+              if (n.nodeType === 1) {
+                acc.added++;
+                acc.tags[n.tagName] = (acc.tags[n.tagName] || 0) + 1;
+                // 弹窗出现（.note-detail-mask）
+                if (n.classList && n.classList.contains("note-detail-mask")) {
+                  this.lastModal = true;
+                  this.emit("modal", { state: "open", noteUrl: location.href });
+                }
+                // 异常文本关键词（截断正文）
+                if (n.innerText) {
+                  const t = n.innerText.slice(0, 300);
+                  for (const kw of this.errKeywords) {
+                    if (t.includes(kw)) { this.emit("err", { keyword: kw, snippet: t.slice(0, 120) }); break; }
+                  }
+                }
+              } else if (n.nodeType === 3 && n.textContent) { acc.textChanged++; }
+            }
+            acc.removed += m.removedNodes.length;
+            // 弹窗消失
+            if (this.lastModal && !document.querySelector(".note-detail-mask")) {
+              this.lastModal = false;
+              this.emit("modal", { state: "closed" });
+            }
+          } else if (m.type === "characterData" && m.target) {
+            acc.textChanged++;
+            if (!acc.sampleText && m.target.textContent) acc.sampleText = String(m.target.textContent).slice(0, 80);
+          }
+        }
+        if (!this.domTimer) {
+          this.domTimer = setTimeout(() => { this.domTimer = null; this.flushDom(); }, 500);
+        }
+      });
+      this.observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+      this.emit("recordReady", {});
+    },
+
+    stop() {
+      if (!this.running) return;
+      this.running = false;
+      if (this.observer) { this.observer.disconnect(); this.observer = null; }
+      if (this.domTimer) { clearTimeout(this.domTimer); this.domTimer = null; }
+      this.flushDom();
+      this.emit("recordStop", { url: location.href });
+    },
+  };
+
   // ---------- 消息入口 ----------
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || msg.type !== "bridge.action") return false;
@@ -559,11 +693,24 @@
     return true; // 异步响应
   });
 
-  // ping 直接响应
+  // ping 直接响应 + 会话记录器控制
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg && msg.type === "bridge.ping") {
       sendResponse({ ok: true, alive: true });
+      return false;
+    }
+    if (msg && msg.type === "bridge.recorder.control") {
+      if (msg.running) recorder.start(); else recorder.stop();
+      sendResponse({ ok: true, running: recorder.running });
+      return false;
     }
     return false;
   });
+
+  // 注入后向 background 询问是否处于录制中（导航重载后自动恢复录制）
+  try {
+    chrome.runtime.sendMessage({ type: "bridge.recorder.wantState" }, (resp) => {
+      if (resp && resp.ok && resp.running) recorder.start();
+    });
+  } catch (e) { /* 忽略 */ }
 })();

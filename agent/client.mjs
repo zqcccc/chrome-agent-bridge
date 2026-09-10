@@ -46,6 +46,7 @@ export class Bridge {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${this.token}`,
           "X-Agent-Id": this.agentId,
+          "X-Agent-Name": encodeURIComponent(this.agentName),
         },
       }, (res) => {
         let data = "";
@@ -61,7 +62,8 @@ export class Bridge {
           if (!parsed.ok) {
             return reject(new BridgeError(parsed.error?.code || "RPC_ERROR", parsed.error?.message || "未知错误"));
           }
-          resolve(parsed.result === undefined ? null : parsed.result);
+          // /status 等非 RPC 接口返回整个 body（无 result 字段）；/rpc 返回 result
+          resolve(method === "/rpc" ? (parsed.result === undefined ? null : parsed.result) : parsed);
         });
       });
       req.on("error", (e) => reject(new BridgeError("CONNECTION_REFUSED", `无法连接本地桥 ${this.base()}（${e.message}），请先启动: node relay/host.js --standalone`)));
@@ -140,7 +142,7 @@ export class Bridge {
   // ---------- 事件订阅（WS） ----------
   // 返回 AsyncIterable<{event, payload}>；通过 AbortController 停止
   subscribe(signal) {
-    const url = `ws://${this.host}:${this.port}/bridge?token=${encodeURIComponent(this.token)}&agentId=${encodeURIComponent(this.agentId)}`;
+    const url = `ws://${this.host}:${this.port}/bridge?token=${encodeURIComponent(this.token)}&agentId=${encodeURIComponent(this.agentId)}&name=${encodeURIComponent(this.agentName)}`;
     const ws = new WebSocket(url);
     const queue = [];
     const waiters = [];

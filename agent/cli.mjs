@@ -95,6 +95,40 @@ async function main() {
       console.log(JSON.stringify(r, null, 2).slice(0, 3000));
       break;
     }
+    case "record": {
+      // 会话记录（Clarity 式变化时间线）：cli.mjs record <tabId> start|stop|status|get|clear [types:nav,modal,err,dom,console]
+      const [tabId, action, typesArg] = rest;
+      if (!tabId || !action) return die(new Error("用法: cli record <tabId> start|stop|status|get|clear [types:nav,modal,err,dom,console]"));
+      const params = { tabId: Number(tabId) };
+      if (action === "get" && typesArg) params.types = typesArg.split(",");
+      const r = await bridge.rpc(`page.record.${action}`, params);
+      if (action === "get") {
+        console.log(`== record get @ tab ${tabId}: ${r.total} 条（返回 ${r.count}）==`);
+        for (const e of r.events) {
+          console.log(`[${new Date(e.t).toLocaleTimeString("zh-CN", { hour12: false })}] ${e.type}  ${JSON.stringify(e.data).slice(0, 160)}`);
+        }
+      } else {
+        console.log(JSON.stringify(r, null, 2));
+      }
+      break;
+    }
+    case "inspect": {
+      // 内置页面探查：cli.mjs inspect <tabId> [overview|links|media|scroll|modal|sel:<css>] [limit]
+      const [tabId, arg, limitArg] = rest;
+      if (!tabId) return die(new Error("用法: cli inspect <tabId> [overview|links|media|scroll|modal|sel:<css>]"));
+      let focus = "overview";
+      const params = {};
+      if (arg) {
+        if (arg.startsWith("sel:")) { focus = "sel"; params.selector = arg.slice(4); }
+        else if (["overview", "links", "media", "scroll", "modal"].includes(arg)) focus = arg;
+        else return die(new Error(`未知 focus: ${arg}（支持 overview/links/media/scroll/modal/sel:<css>）`));
+      }
+      if (limitArg && /^\d+$/.test(limitArg)) params.limit = parseInt(limitArg, 10);
+      const r = await bridge.rpc("page.inspect", { tabId: Number(tabId), focus, ...params });
+      console.log(`== inspect:${focus} @ tab ${tabId} ==`);
+      console.log(JSON.stringify(r.result, null, 2));
+      break;
+    }
     case "click": {
       const [tabId, selector, by] = rest;
       if (!tabId || !selector) return die(new Error("用法: cli click <tabId> <selector> [css|xpath|text|index]"));
