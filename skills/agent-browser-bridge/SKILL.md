@@ -1,6 +1,6 @@
 ---
 name: agent-browser-bridge
-description: 用本地 Chrome 扩展 + 本地桥（Agent Browser Bridge）操作真实 Chrome 浏览器的完整指南。当任务需要在用户的日常 Chrome 里操作网页（导航、读取页面、点击、输入、滚动、截图、执行 JS、管理标签页），且必须使用真实登录态（如 BOSS 直聘、公众号后台、网银等登录后页面）时使用本 Skill。与 Playwright/Puppeteer 无关——本桥直接接管日常 Chrome，参考 ChatGPT/Claude 官方 Chrome 插件的原生通道设计。触发词：操作浏览器、打开某网页、在 Chrome 里点击/输入/抓取、自动投递、登录后页面操作。
+description: 通过本地 Chrome 扩展 + 本地桥（Agent Browser Bridge）驱动用户的真实 Chrome 浏览器完成任务。最大优势：使用真实 Chrome 环境与真实登录态，能进入普通自动化工具被反爬/风控拦截的页面（验证码、登录墙、无头浏览器指纹检测、滑块等），拿到登录后或动态渲染的内容。当用户要求「搜索/查找/检索/查证某个网站里的信息」「站内搜索并整理结果」「抓取动态网页或登录后页面的数据」「打开某网页并读取/点击/输入/滚动/截图/执行 JS」时使用，尤其是普通搜索工具拿不到的内容（小红书、BOSS 直聘、公众号后台、网银、论坛、需账号的站内搜索等）。触发词：搜索、查找、检索、查询、查证、搜一下、抓取、爬数据、收集信息、小红书、登录后页面、操作浏览器、打开某网页、在 Chrome 里点击/输入。登录约束：页面需要登录/授权/扫码/验证码时，必须先告知用户要访问的页面和原因，等待用户手动完成登录后再继续，不得替用户登录或绕过验证。若任务不需要真实登录态、通用搜索/抓取工具即可完成，优先用通用工具。
 ---
 
 # Agent Browser Bridge —— 让 Agent 操作日常 Chrome
@@ -13,6 +13,7 @@ description: 用本地 Chrome 扩展 + 本地桥（Agent Browser Bridge）操作
 
 ## 前置条件（每个任务开始前必须检查）
 
+0. **登录由用户主导**：目标页面需要登录/授权/扫码/验证码时，必须先向用户说明要访问哪个页面、为什么需要登录，然后等待用户手动完成登录、确认登录成功后再继续。禁止替用户登录、绕过登录墙或静默跳过验证。用户未登录前不要继续执行后续步骤。
 1. **扩展已加载**：chrome://extensions 里有 "Agent Browser Bridge"（已解压；ID 以你本机 `chrome://extensions` 中显示的为准），开关为 On。
 2. **host 存活**：`curl -s http://127.0.0.1:8778/status` 返回 `{"ok":true,...}`。
    - **推荐 Native 模式**：不要手动 `npm start`。注册 native host 后，Chrome 按需拉起 host 进程，该进程监听 8778，Agent 连 8778 即同一进程。Chrome 关闭时进程自动退出。`status` 返回 `mode:native`。
@@ -43,7 +44,15 @@ node agent/cli.mjs listen              # 订阅页面事件
 
 ```js
 import { Bridge } from "./agent/client.mjs";   // 或直接 HTTP
-const bridge = new Bridge({ port: 8778, token: process.env.BRIDGE_TOKEN });
+const bridge = new Bridge({
+  port: 8778,
+  token: process.env.BRIDGE_TOKEN,
+  agentId: process.env.AGENT_ID || `agent-${process.pid}`,
+});
+await bridge.register();
+const tabs = await bridge.list();
+// 多 Agent 协作时，操作前先取得 Tab 租约
+await bridge.claimTab(tabs[0].id, 120000);
 await bridge.rpc("tabs.list");
 await bridge.rpc("page.navigate", { tabId, url });
 await bridge.rpc("page.evaluate", { tabId, expression: "..." , awaitPromise: false });
@@ -82,6 +91,27 @@ HTTP 直调：`POST http://127.0.0.1:8778/rpc`，头 `Authorization: Bearer <tok
 - `PAGE_CONTEXT_TIMEOUT`：页面上下文已销毁/无法注入 content script（导航中、chrome://、上下文崩溃）。
 - `CONTENT_TIMEOUT`：content 调用（click/type 等）超时。
 - `EXT_DISCONNECTED` 在扩展 WS/Native 断连时让所有 pending 请求确定结局，不无限挂起。
+- `TAB_LEASED`：Tab 已被其他 Agent 占用。
+
+HTTP 直调必须携带 `X-Agent-Id`；WebSocket 订阅使用 `/bridge?...&agentId=<id>`。
+
+## 多 Agent 并行与 Tab 租约
+
+多个 Agent 可以共用一个 host。每个 Agent 必须使用唯一 `AGENT_ID`，不同 Tab 可以并行；操作某个 Tab 前建议先申请租约：
+
+```bash
+export AGENT_ID="boss-agent-1"
+```
+
+```js
+const bridge = new Bridge({ agentId: process.env.AGENT_ID });
+await bridge.register("BOSS 投递 Agent");
+await bridge.claimTab(tabId, 120000);
+// ...完成流程后释放
+await bridge.releaseTab(tabId);
+```
+
+租约默认 120 秒，最长 1 小时；异常退出会自动过期。其他 Agent 访问已占用 Tab 会收到 `TAB_LEASED`，不要绕过租约强行操作。
 
 ## 同 tab 串行与跨 tab 并行
 

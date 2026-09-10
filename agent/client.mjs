@@ -31,6 +31,8 @@ export class Bridge {
     this.port = opts.port || Number(process.env.AGENT_BRIDGE_PORT) || 8778;
     this.token = opts.token || loadToken();
     this.timeoutMs = opts.timeoutMs || 60000;
+    this.agentId = opts.agentId || process.env.AGENT_ID || `agent-${process.pid}`;
+    this.agentName = opts.agentName || process.env.AGENT_NAME || this.agentId;
   }
 
   base() { return `http://${this.host}:${this.port}`; }
@@ -43,6 +45,7 @@ export class Bridge {
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${this.token}`,
+          "X-Agent-Id": this.agentId,
         },
       }, (res) => {
         let data = "";
@@ -72,6 +75,9 @@ export class Bridge {
   rpc(method, params = {}, opts = {}) {
     return this._request("/rpc", { method, params, timeoutMs: opts.timeoutMs }, opts.timeoutMs);
   }
+  register(name = this.agentName) { return this._request("/agents/register", { agentId: this.agentId, name }); }
+  claimTab(tabId, ttlMs) { return this._request("/tabs/claim", { tabId, agentId: this.agentId, ttlMs }); }
+  releaseTab(tabId) { return this._request("/tabs/release", { tabId, agentId: this.agentId }); }
 
   // ---------- 状态 ----------
   status() { return this._request("/status"); }
@@ -134,7 +140,7 @@ export class Bridge {
   // ---------- 事件订阅（WS） ----------
   // 返回 AsyncIterable<{event, payload}>；通过 AbortController 停止
   subscribe(signal) {
-    const url = `ws://${this.host}:${this.port}/bridge?token=${encodeURIComponent(this.token)}`;
+    const url = `ws://${this.host}:${this.port}/bridge?token=${encodeURIComponent(this.token)}&agentId=${encodeURIComponent(this.agentId)}`;
     const ws = new WebSocket(url);
     const queue = [];
     const waiters = [];

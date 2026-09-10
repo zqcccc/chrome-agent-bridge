@@ -120,6 +120,21 @@ node agent/cli.mjs tabs
 7. 操作会发送消息、投递、下单、删除或提交表单时，必须先向用户展示最终动作和目标，获得明确确认后再执行。
 8. 遇到登录、验证码、支付、二次确认或安全检查时停止并交给用户。
 
+### 多 Agent 并行 / Tab 租约
+
+多个 Agent 可以共用同一个 Relay。为避免业务流程互相干扰，每个 Agent 应设置唯一的 `AGENT_ID`，并在操作 Tab 前申请租约：
+
+```js
+const bridge = new Bridge({ agentId: "agent-a", agentName: "research" });
+await bridge.register();
+const tabs = await bridge.list();
+await bridge.claimTab(tabs[0].id, 120000);
+// ... 操作该 Tab ...
+await bridge.releaseTab(tabs[0].id);
+```
+
+租约默认 120 秒、最长 1 小时，Agent 异常退出后会自动过期。未被租约占用的 Tab 仍可访问；已被其他 Agent 占用时返回 `TAB_LEASED`。
+
 ### 同 tab 串行 / 跨 tab 并行
 
 - 同一 tab 的 `page.*` / `session.*` 请求在 host 端严格串行（按 tabId 队列），避免重型 SPA 下请求互相堆积导致超时。Agent 无需关心排队，但应避免在同一 tab 上“发完一个不等就发下一个”的反模式——串行由 host 保证。
@@ -136,6 +151,9 @@ node agent/cli.mjs tabs
 - `PAGE_CONTEXT_TIMEOUT`：页面上下文销毁/无法注入 content（导航中、chrome://、上下文崩溃）。
 - `CONTENT_TIMEOUT`：content 调用（click/type 等）超时。
 - `TAB_BUSY`：同 tab 串行队列占用（一般等待而非报错）。
+- `TAB_LEASED`：Tab 已由另一个 Agent 租用。
+
+HTTP 客户端可通过 `X-Agent-Id` 标识身份；WS 客户端在 `/bridge?...&agentId=<id>` 中传递身份。
 
 可以使用客户端库：
 

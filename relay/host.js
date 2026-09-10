@@ -16,7 +16,7 @@ const os = require("os");
 const path = require("path");
 const { attachWsServer, WSConnection } = require("./ws-server");
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const HOST_NAME = "com.agentbrowser.bridge";
 const STATE_DIR = path.join(os.homedir(), ".chrome-agent-bridge");
 const TOKEN_FILE = path.join(STATE_DIR, "token");
@@ -63,6 +63,36 @@ const TOKEN = ensureToken();
 let nativePort = null;   // { send, postMessage, onDisconnect }
 let extWs = null;        // WSConnection (扩展 ws 通道)
 let agentWss = [];       // Agent 的 ws 订阅连接
+// Agent 身份与 Tab 租约：不同 Agent 可并行；同一 Tab 明确互斥。
+const agents = new Map();
+const tabLeases = new Map();
+const DEFAULT_LEASE_MS = 120000;
+function touchAgent(agentId, name = "agent") {
+  if (!agentId) return;
+  const old = agents.get(agentId);
+  agents.set(agentId, { name: name || old?.name || "agent", connectedAt: old?.connectedAt || Date.now(), lastSeen: Date.now() });
+}
+function cleanupLeases() {
+  const now = Date.now();
+  for (const [tabId, lease] of tabLeases) if (lease.expiresAt <= now) tabLeases.delete(tabId);
+}
+function checkLease(tabId, agentId) {
+  cleanupLeases();
+  const lease = tabLeases.get(String(tabId));
+  return lease && lease.agentId !== agentId ? { code: "TAB_LEASED", message: `Tab ${tabId} 已被另一个 Agent 占用`, tabId, owner: lease.agentId } : null;
+}
+function claimTab(tabId, agentId, ttlMs = DEFAULT_LEASE_MS) {
+  if (tabId === undefined || tabId === null || !agentId) throw { code: "BAD_PARAMS", message: "需要 tabId 和 agentId" };
+  const denied = checkLease(tabId, agentId); if (denied) throw denied;
+  const lease = { tabId, agentId, expiresAt: Date.now() + Math.max(1000, Math.min(Number(ttlMs) || DEFAULT_LEASE_MS, 3600000)) };
+  tabLeases.set(String(tabId), lease); touchAgent(agentId); return lease;
+}
+function releaseTab(tabId, agentId) {
+  const key = String(tabId), lease = tabLeases.get(key);
+  if (!lease) return { released: false, tabId };
+  if (lease.agentId !== agentId) throw { code: "TAB_LEASED", message: "只能释放自己持有的 Tab 租约", tabId };
+  tabLeases.delete(key); return { released: true, tabId };
+}
 const pending = new Map(); // requestId -> { resolve, reject, timer, method, tabId, startedAt, channel }
 
 // 同一 tab 的 page.* 请求严格串行队列；跨 tab 并行。
@@ -110,8 +140,11 @@ function rpcLog(level, ctx) {
 }
 
 // 向扩展发一个 RPC，返回 Promise。同一 tab 的串行方法排队串行执行。
-async function requestExtension(method, params, timeoutMs = 60000) {
+async function requestExtension(method, params, timeoutMs = 60000, agentId = "anonymous") {
   const tabId = tabIdOf(method, params);
+  touchAgent(agentId);
+  const denied = tabId != null ? checkLease(tabId, agentId) : null;
+  if (denied) throw denied;
   const serial = isSerialMethod(method) && tabId != null;
 
   // tab unhealthy 恢复窗口：上次请求超时/断连后给一点恢复时间，避免雪崩
@@ -378,6 +411,8 @@ function httpServer() {
         extConnected: extReady(),
         pending: pending.size,
         tabQueues: tabQueues.size,
+        agents: [...agents].map(([agentId, a]) => ({ agentId, ...a })),
+        tabLeases: [...tabLeases].map(([tabId, lease]) => ({ tabId, ...lease })),
         uptimeSec: Math.round(process.uptime()),
         pid: process.pid,
         port: PORT,
@@ -386,6 +421,14 @@ function httpServer() {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/agents/register") {
+      let body = ""; req.on("data", (c) => { body += c; });
+      req.on("end", () => { try { const p = JSON.parse(body || "{}"); const agentId = String(p.agentId || crypto.randomUUID()); touchAgent(agentId, p.name); send(200, { ok: true, agent: { agentId, ...agents.get(agentId) } }); } catch (e) { send(400, { ok: false, error: { code: "BAD_JSON", message: e.message } }); } }); return;
+    }
+    if (req.method === "POST" && (url.pathname === "/tabs/claim" || url.pathname === "/tabs/release")) {
+      let body = ""; req.on("data", (c) => { body += c; });
+      req.on("end", () => { try { const p = JSON.parse(body || "{}"); const agentId = String(p.agentId || req.headers["x-agent-id"] || ""); const result = url.pathname.endsWith("claim") ? claimTab(p.tabId, agentId, p.ttlMs) : releaseTab(p.tabId, agentId); send(200, { ok: true, result }); } catch (e) { send(409, { ok: false, error: { code: e.code || "LEASE_FAILED", message: e.message || String(e) } }); } }); return;
+    }
     if (req.method === "POST" && url.pathname === "/rpc") {
       let body = "";
       req.on("data", (c) => { body += c; if (body.length > 8 * 1024 * 1024) req.destroy(); });
@@ -398,7 +441,8 @@ function httpServer() {
         const params = parsed.params || {};
         const timeoutMs = parsed.timeoutMs || 60000;
         if (!method) return send(400, { ok: false, error: { code: "BAD_PARAMS", message: "缺少 method" } });
-        requestExtension(method, params, timeoutMs)
+        const agentId = String(req.headers["x-agent-id"] || "anonymous");
+        requestExtension(method, params, timeoutMs, agentId)
           .then((result) => send(200, { ok: true, result: result === undefined ? null : result }))
           .catch((e) => send(200, { ok: false, error: { code: e.code || "INTERNAL", message: e.message || String(e) } }));
       });
@@ -455,9 +499,11 @@ function httpServer() {
     {
       path: "/bridge",
       token: TOKEN,
-      onConnection(ws) {
+      onConnection(ws, req) {
+        const agentId = String(new URL(req.url, `http://127.0.0.1:${PORT}`).searchParams.get("agentId") || crypto.randomUUID());
+        touchAgent(agentId); ws.agentId = agentId;
         agentWss.push(ws);
-        log("agent connected via ws /bridge");
+        log("agent connected via ws /bridge", agentId);
         ws.sendJson({ type: "hello", host: HOST_NAME, version: VERSION, extConnected: extReady() });
         ws.on("message", (text) => {
           let msg;
@@ -465,7 +511,7 @@ function httpServer() {
           if (msg.id !== undefined && msg.method) {
             const requestId = String(msg.id);
             const timeoutMs = msg.timeoutMs || 60000;
-            requestExtension(msg.method, msg.params || {}, timeoutMs)
+            requestExtension(msg.method, msg.params || {}, timeoutMs, ws.agentId)
               .then((result) => ws.sendJson({ id: requestId, ok: true, result: result === undefined ? null : result }))
               .catch((e) => ws.sendJson({ id: requestId, ok: false, error: { code: e.code || "INTERNAL", message: e.message || String(e) } }));
           }
@@ -481,6 +527,7 @@ function httpServer() {
     },
   ]);
 
+  const leaseTimer = setInterval(cleanupLeases, 10000); if (leaseTimer.unref) leaseTimer.unref();
   server.listen(PORT, "127.0.0.1", () => {
     log(`listening on http://127.0.0.1:${PORT}  token=${TOKEN.slice(0, 6)}…  ext=${extReady() ? "connected" : "waiting"}`);
     if (STANDALONE) {

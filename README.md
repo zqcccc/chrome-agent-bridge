@@ -40,7 +40,7 @@
 
 - **扩展（extension/）**：MV3 后台脚本 + 页面注入脚本。负责连接本地桥（Native Messaging 优先，失败自动回退 WebSocket）、RPC 分发、标签页管理、页面快照与操作、截图、导航等待。Native 连接建立后会先发送 hello 握手消息。
 - **本地桥（relay/）**：既是 Native Messaging host 进程，又是 HTTP/WS 服务端。单进程双角色：Chrome 通过 native 或 ws 连进来，Agent 通过 HTTP/WS 连进来，两边消息转发。
-- **Agent 客户端（agent/）**：给 Agent 用的 JS 客户端与命令行工具。
+- **Agent 客户端（agent/）**：给 Agent 用的 JS 客户端与命令行工具，内置 Agent 身份标识。
 
 ## 目录结构
 
@@ -167,11 +167,15 @@ node agent/cli.mjs shot
 
 ```js
 import { Bridge } from "./agent/client.mjs";
-const bridge = new Bridge({ port: 8778, token: "..." });
+const bridge = new Bridge({ port: 8778, token: "...", agentId: "research-agent" });
+await bridge.register("research-agent");
+const tabs = await bridge.list();
+await bridge.claimTab(tabs[0].id); // 可选：声明 Tab 所有权
 await bridge.rpc("tabs.list");
 await bridge.rpc("page.snapshot", { mode: "a11y" });
 await bridge.rpc("page.click", { selector: "#submit" });
 await bridge.rpc("page.screenshot");
+await bridge.releaseTab(tabs[0].id);
 ```
 
 ## 通道协议
@@ -194,10 +198,12 @@ await bridge.rpc("page.screenshot");
 - **截图**：CDP `Page.captureScreenshot`（支持整页）→ 兜底 `tabs.captureVisibleTab`
 - **导航等待**：`webNavigation.onCommitted` + 轮询兜底，默认 45s 超时；另提供 `page.waitForUrl`/`page.waitForReady`/`page.waitForSelector` 按条件等待（BOSS 重型 SPA 不依赖固定 sleep）
 - **导航安全**：导航必须用 `page.navigate`（`chrome.tabs.update`），**禁止用 `page.evaluate` 改 `location.href`**（会销毁执行上下文导致 RPC 无法返回）
+- **多 Agent 并行与租约**：多个 Agent 可同时连接；不同 Tab 并行；可用 Tab lease 明确分配所有权，避免同一 Tab 的业务流程互相干扰
 - **同 tab 串行**：同一 tab 的 `page.*`/`session.*` 请求在 host 端严格串行，跨 tab 并行；单个请求超时不级联
 - **错误码**：`TIMEOUT`/`EXT_DISCONNECTED`/`NAV_TIMEOUT`/`PAGE_CONTEXT_TIMEOUT`/`CONTENT_TIMEOUT`/`TAB_BUSY`，含 method/tabId/channel/耗时，日志不含 token 与页面内容
-- **视觉指示器**：幽灵光标 + 点击涟漪 + 停止按钮（页面内 `agent-bridge-cursor` / `agent-bridge-stop`），Agent 可远程开关；**只对真实交互操作（click/type/press/scroll/hover/focusEl/select/waitFor）显示**，只读/导航/evaluate/snapshot 不被阻塞，indicator 失败不影响主 RPC
+- **接管状态与视觉指示器**：Agent 对页面发出控制请求时，Chrome 标签标题会加上 `● Agent 接管中` 前缀，扩展工具栏图标显示蓝色 `ON` 徽标，页面右上角也显示「Agent 接管中」；连续 12 秒没有新的控制请求时自动切换为「Agent 已放开」，点击「停止 Agent」也会立即放开并清除标记。另保留幽灵光标、点击涟漪和停止按钮（页面内 `agent-bridge-cursor` / `agent-bridge-stop`）。
 - **事件订阅**：页面事件实时推送（导航、点击、输入等）
+- **Agent 身份与 Tab 租约**：`Bridge` 默认使用 `AGENT_ID` 或 `agent-<pid>`；可调用 `register()`、`claimTab()`、`releaseTab()`。租约默认 120 秒自动过期，最长 1 小时；其他 Agent 访问被占用 Tab 时返回 `TAB_LEASED`。
 
 ## 安全
 

@@ -152,7 +152,7 @@ class WSConnection extends EventEmitter {
 }
 
 // 在 http.Server 上挂 WebSocket 升级处理
-// routes: [{ path, token, onConnection(ws) }]
+// routes: [{ path, token, onConnection(ws, req) }]
 function attachWsServer(server, routes) {
   server.on("upgrade", (req, socket, head) => {
     socket.on("error", () => { /* 连接异常（如 ECONNRESET）不拖垮整个服务 */ });
@@ -184,7 +184,7 @@ function attachWsServer(server, routes) {
     );
     if (head && head.length) socket.unshift(head);
     const ws = new WSConnection(socket);
-    route.onConnection(ws);
+    route.onConnection(ws, req);
   });
 }
 
