@@ -138,7 +138,7 @@ async function main() {
   console.log(`🔍 正在连接小红书标签页 #${targetTabId}...`);
 
   try {
-    await rpc("tabs.activate", { tabId: targetTabId });
+    await rpc("tabs.prepare", { tabId: targetTabId });
   } catch (e) {}
 
   // 1. 检查页面状态及类型

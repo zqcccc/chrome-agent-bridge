@@ -225,7 +225,7 @@ node --test relay/test-verify.mjs  # send-chat 送达验证 helper（6 种情形
 已知边界：
 - `chrome://` 等受保护页面禁止内容注入（快照/操作不可用），截图需 `activeTab` 授权（点击一次扩展图标即可）
 - 超长页面整页截图（`captureBeyondViewport:true`）可能较慢，默认视口截图（秒级）
-- 对**非激活/被 OneTab 冻结**的标签截图可能卡住：先 `tabs.activate` 或 `page.activateAndShot` 激活该标签再截图（Agent 正常"导航→截图"流程不受影响）
+- 截图默认静默（v0.3.0+）：CDP 截图后台 tab 也可用、不抢焦点；CDP 失败时不再自动激活窗口，需要时显式 `page.activateAndShot` 或传 `allowActivate:true`。被 OneTab / 浏览器丢弃冻结的标签仍须先 `tabs.activate` 唤醒（激活即重载）
 - 扩展 MV3 service worker 会周期性休眠导致 WS 短暂断开：host 已内置"等待扩展重连（≤12s）再转发请求"，Agent 无感知
 
 ## 后续规划

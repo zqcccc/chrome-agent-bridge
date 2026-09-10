@@ -89,6 +89,8 @@ export class Bridge {
   async get(tabId) { const r = await this.rpc("tabs.get", { tabId }); return r.tab; }
   async create(url, opts = {}) { const r = await this.rpc("tabs.create", { url, ...opts }); return r.tab; }
   async activate(tabId) { const r = await this.rpc("tabs.activate", { tabId }); return r.tab; }
+  // 静默准备：注入 content script + 防后台冻结，不切激活 tab / 不聚焦窗口
+  async prepare(tabId) { return this.rpc("tabs.prepare", { tabId }); }
   async close(tabId) { return this.rpc("tabs.close", { tabId }); }
   async reload(tabId, opts = {}) { const r = await this.rpc("tabs.reload", { tabId, ...opts }); return r.tab; }
 

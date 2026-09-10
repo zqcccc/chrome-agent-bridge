@@ -274,6 +274,13 @@ function recordTabAgent(tabId, agentName, agentId, agentDisplay) {
 
   const timer = setTimeout(() => {
     activeTabAgents.delete(tabId);
+    // 自愈兜底（v0.3.1）：页面端 12s 闲置计时器可能因后台冻结(Memory Saver)/导航
+    // 而失效，导致「接管中」标题与 toolbar badge 永久滞留。15s 无新控制请求时，
+    // 后台直接撤销 badge，并请求页面释放（页面存活则立即恢复原标题；冻结页唤醒后
+    // 收到该消息同样会恢复）。
+    setTabControlBadge(tabId, false);
+    try { indicatorCall(tabId, { action: "setControl", state: "released" }); } catch (e) { /* noop */ }
+    try { indicatorCall(tabId, { action: "hideStop" }); } catch (e) { /* noop */ }
   }, TAB_AGENT_EXPIRE_MS);
 
   activeTabAgents.set(tabId, {
@@ -344,6 +351,7 @@ async function dispatch(method, params, caller) {
     case "tabs.active": return tabsActive();
     case "tabs.create": return tabsCreate(params);
     case "tabs.activate": return tabsActivate(params.tabId);
+    case "tabs.prepare": return tabsPrepare(params.tabId);
     case "tabs.close": return tabsClose(params.tabId);
     case "tabs.reload": return tabsReload(params.tabId, params);
 
@@ -473,7 +481,7 @@ function serializeTab(t) {
   return {
     id: t.id, windowId: t.windowId, index: t.index, active: t.active, pinned: t.pinned,
     audible: t.audible, muted: t.mutedInfo ? t.mutedInfo.muted : false, incognito: t.incognito,
-    status: t.status, url: t.url, title: t.title, favIconUrl: t.favIconUrl,
+    status: t.status, url: t.url, title: t.title, favIconUrl: t.favIconUrl, discarded: t.discarded || false,
   };
 }
 async function tabsGet(tabId) {
@@ -500,6 +508,21 @@ async function tabsActivate(tabId) {
   await chrome.tabs.update(tabId, { active: true });
   try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (e) { /* noop */ }
   return { tab: serializeTab(tab) };
+}
+// 静默准备：保证 content script 已注入 + 目标 tab 不会被后台冻结/回收。
+// 全程不切 active tab、不聚焦窗口——用户在用别的应用时不会被抢焦点。
+// 需要用户眼睛的步骤（登录/验证码/扫码/最终核对）才显式用 tabs.activate / page.focus。
+async function tabsPrepare(tabId) {
+  requireTabId(tabId);
+  const t = await chrome.tabs.get(tabId);
+  if (t.discarded) {
+    // 已被浏览器/OneTab 冻结（discarded）的 tab 无法静默唤醒：注入会失败。
+    // 明确报错，让 Agent 决定是否用 tabs.activate（激活即触发重载）。
+    throw { code: "TAB_DISCARDED", message: `标签页已被冻结/丢弃（${t.title || t.url}），tabs.prepare 无法静默唤醒；请改用 tabs.activate（会切到该 tab 并重载页面）` };
+  }
+  try { await chrome.tabs.update(tabId, { autoDiscardable: false }); } catch (e) { /* noop */ }
+  await ensureInjected(tabId);
+  return { ok: true, tabId };
 }
 async function tabsClose(tabId) {
   requireTabId(tabId);
@@ -724,9 +747,31 @@ async function indicatorCall(tabId, payload) {
     const resp = await chrome.tabs.sendMessage(tabId, { type: "bridge.indicator", ...payload });
     return resp || { ok: true };
   } catch (e) {
-    // 页面未注入 indicator（如 chrome:// 页），静默忽略
-    return { ok: true, skipped: true };
+    // 页面没有 indicator 实例（扩展 reload 前的旧标签页 / 实例被销毁）：按需补注入再重发。
+    // indicator.js 自带幂等守卫（__AGENT_BRIDGE_INDICATOR__），重复注入无害；
+    // chrome:// 等受保护页注入会失败，静默忽略。
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["indicator.js"] });
+      const resp = await chrome.tabs.sendMessage(tabId, { type: "bridge.indicator", ...payload });
+      return resp || { ok: true };
+    } catch (e2) {
+      return { ok: true, skipped: true };
+    }
   }
+}
+
+// 自愈清扫：扩展启动/更新后，旧标签页里被销毁的 indicator 实例可能留下
+// 「● [Agent] 接管中 | 原标题」的标题残影（reload 或页面冻结场景，页面端计时器已不存在）。
+// 对这类 tab 补注入 indicator 并发送 released——released 分支会剥掉「● …接管中 |」前缀恢复原标题。
+function sweepStaleControlTitles() {
+  chrome.tabs.query({}, (tabs) => {
+    for (const tab of tabs) {
+      if (!tab.id || !tab.title) continue;
+      if (!/^●\s*\[[^\]]+\]\s*接管中\s*\|/.test(tab.title)) continue;
+      indicatorCall(tab.id, { action: "setControl", state: "released" }).catch(() => {});
+    }
+  });
+  clearAllTabControlBadges();
 }
 
 // ---------- 页面操作 ----------
@@ -1057,6 +1102,9 @@ function pageRecordClear(tabId) {
 }
 
 // ---------- 截图 ----------
+// 默认静默：优先 CDP 截图（后台 tab 也可用，不抢焦点）。
+// CDP 失败时不再偷偷激活 tab / 聚焦窗口；只有显式 allowActivate:true 才降级到
+// captureVisibleTab（该 API 要求目标 tab 是窗口内激活 tab）。显式激活请用 page.activateAndShot。
 async function pageScreenshot(tabId, params) {
   requireTabId(tabId);
   const format = (params && params.format) || "png";
@@ -1064,10 +1112,14 @@ async function pageScreenshot(tabId, params) {
   const quality = params.quality || 90;
   // 默认视口截图（快、稳定）；captureBeyondViewport=true 时才做整页截图（长页面可能较慢）
   const captureBeyondViewport = params.captureBeyondViewport === true;
+  const allowActivate = params.allowActivate === true;
   try {
     const shot = await cdpScreenshot(tabId, format, quality, captureBeyondViewport);
     return { format, image: shot.data, type: "dataURL", captureMode: "cdp" };
   } catch (e) {
+    if (!allowActivate) {
+      throw { code: "SCREENSHOT_FAILED", message: `截图失败: ${e && e.message || e}（静默模式不激活窗口；若可接受浏览器跳到前台，用 page.activateAndShot 或传 allowActivate:true）` };
+    }
     console.warn("[bridge] cdp screenshot failed, fallback to visible tab", e && e.message);
   }
   try {
@@ -1085,7 +1137,7 @@ async function pageActivateAndShot(tabId, params) {
   requireTabId(tabId);
   await tabsActivate(tabId);
   await new Promise((r) => setTimeout(r, 400));
-  return pageScreenshot(tabId, params);
+  return pageScreenshot(tabId, { ...(params || {}), allowActivate: true });
 }
 function cdpScreenshot(tabId, format, quality, captureBeyondViewport) {
   return new Promise((resolve, reject) => {
@@ -1214,12 +1266,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // ---------- 启动 ----------
 chrome.runtime.onInstalled.addListener(() => {
-  loadConfig().then(() => { ensureKeepAlive(); connect(); });
+  loadConfig().then(() => { ensureKeepAlive(); connect(); sweepStaleControlTitles(); });
 });
 chrome.runtime.onStartup.addListener(() => {
-  loadConfig().then(() => { ensureKeepAlive(); connect(); });
+  loadConfig().then(() => { ensureKeepAlive(); connect(); sweepStaleControlTitles(); });
 });
 loadConfig().then(() => {
   ensureKeepAlive();
   connect();
+  sweepStaleControlTitles();
 });

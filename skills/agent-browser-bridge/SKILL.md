@@ -1,6 +1,6 @@
 ---
 name: agent-browser-bridge
-description: 通过本地 Chrome 扩展 + 本地桥（Agent Browser Bridge）驱动用户的真实 Chrome 浏览器完成任务。最大优势：使用真实 Chrome 环境与真实登录态，能进入普通自动化工具被反爬/风控拦截的页面（验证码、登录墙、无头浏览器指纹检测、滑块等），拿到登录后或动态渲染的内容。当用户要求「搜索/查找/检索/查证某个网站里的信息」「站内搜索并整理结果」「抓取动态网页或登录后页面的数据」「打开某网页并读取/点击/输入/滚动/截图/执行 JS」时使用，尤其是普通搜索工具拿不到的内容（小红书、BOSS 直聘、公众号后台、网银、论坛、需账号的站内搜索等）。触发词：搜索、查找、检索、查询、查证、搜一下、抓取、爬数据、收集信息、小红书、登录后页面、操作浏览器、打开某网页、在 Chrome 里点击/输入。登录约束：页面需要登录/授权/扫码/验证码时，必须先告知用户要访问的页面和原因，等待用户手动完成登录后再继续，不得替用户登录或绕过验证。若任务不需要真实登录态、通用搜索/抓取工具即可完成，优先用通用工具。
+description: 驱动用户的真实 Chrome 浏览器（本地扩展 + 本地桥）完成任务——**用户在浏览器上能做的任何事，本 skill 基本都能做**：网上查资料/搜信息、打开网页读取/查证内容、站内搜索并整理结果、抓取动态渲染或登录后页面的数据、点击/输入/滚动/截图/执行 JS/下载文件，以及登录后业务操作（填表提交、发消息、投递简历、下单、预订、管理后台操作）。最大优势：走真实 Chrome 环境与真实登录态，能进入普通自动化工具被反爬/风控拦截的页面（验证码、登录墙、无头浏览器指纹检测、滑块等），拿到登录后或动态渲染的内容——普通搜索工具拿不到的（小红书、BOSS 直聘、公众号后台、网银、论坛、需账号的站内搜索等）都从这里走。触发词：搜索、查找、检索、查询、查证、搜一下、抓取、爬数据、收集信息、打开某网页、读取网页内容、操作浏览器、在 Chrome 里点击/输入/滚动/截图、填表、提交、发消息、投递、下单、预订、下载、小红书、BOSS、登录后页面。登录约束：页面需要登录/授权/扫码/验证码时，必须先告知用户要访问的页面和原因，等待用户手动完成登录后再继续，不得替用户登录或绕过验证。若任务不需要真实登录态、通用搜索/抓取工具即可完成，优先用通用工具。
 ---
 
 # Agent Browser Bridge —— 让 Agent 操作日常 Chrome
@@ -10,6 +10,19 @@ description: 通过本地 Chrome 扩展 + 本地桥（Agent Browser Bridge）驱
 ```
 你的 Chrome（真实登录态）──native messaging / ws──▶ 本地桥 host(:8778) ◀──HTTP POST /rpc── Agent
 ```
+
+## 这个 skill 是干什么的（核心定位）
+
+**一句话：用户在浏览器上能做的任何事，本 skill 基本都能做。** 它驱动的是用户日常在用的真实 Chrome——真实登录态、真实指纹、真实环境，不是无头模拟器或远程浏览器。普通工具做不了的事（过风控、进登录墙、拿动态内容）正是它的主场。
+
+| 任务类型 | 例子 |
+|---|---|
+| 查资料 / 查证 | 打开某网页读取内容、站内搜索并整理结果、核实某个说法、比较商品与价格 |
+| 抓取数据 | 动态渲染页面、登录后才能看到的内容、普通搜索工具拿不到的站（小红书、BOSS 直聘、公众号后台、网银、论坛等） |
+| 操作页面 | 点击、输入、滚动、截图、执行 JS、下载文件、查看媒体 |
+| 登录后业务操作 | 填表提交、发消息、投递简历、下单、预订、管理后台操作 |
+
+**什么时候不用它**：任务不需要真实登录态、通用搜索/抓取工具就能拿到结果时，优先用通用工具（更快、更省、不打扰用户的浏览器）。
 
 ## 前置条件（每个任务开始前必须检查）
 
@@ -57,6 +70,7 @@ await bridge.register();
 const tabs = await bridge.list();
 // 多 Agent 协作时，操作前先取得 Tab 租约
 await bridge.claimTab(tabs[0].id, 120000);
+await bridge.rpc("tabs.prepare", { tabId });  // 静默准备：注入 content script + 防后台冻结，不切激活 tab / 不聚焦窗口（v0.3.0+）
 await bridge.rpc("tabs.list");
 await bridge.rpc("page.navigate", { tabId, url });
 await bridge.rpc("page.evaluate", { tabId, expression: "..." , awaitPromise: false });
@@ -82,7 +96,7 @@ HTTP 直调：`POST http://127.0.0.1:8778/rpc`，头 `Authorization: Bearer <tok
 ## 实战踩坑清单（务必先读）
 
 1. **host 可能随时死**：开工前、长流程中途，都 `curl /status` 确认；死了就重启，token 不变。
-2. **刚 reload 扩展前的旧标签页 content script 不注入**：`page.evaluate` 报 "Cannot access contents of the page"。解决：先 `page.activate`（或 tabs.activate）激活该标签再操作。被 OneTab 冻结的标签同理。
+2. **刚 reload 扩展前的旧标签页 content script 不注入**：`page.evaluate` 报 "Cannot access contents of the page"。解决：先 `tabs.prepare`（静默注入，不抢焦点）再操作，见下方「静默模式」。只有**被 OneTab 冻结 / 被浏览器丢弃（discarded）的标签**才必须 `tabs.activate` 唤醒（激活会自动重载页面）。
 3. **`chrome://` 等受保护页面**不能注入/截图（需 activeTab 授权，点一次扩展图标即可）。
 4. **eval 是同步求值**：表达式里有 `await`/Promise 必须传 `awaitPromise:true`，否则返回空对象。
 5. **受控组件（React/Vue）输入**：`el.value=x` 无效。用 native setter + InputEvent：
@@ -92,11 +106,55 @@ HTTP 直调：`POST http://127.0.0.1:8778/rpc`，头 `Authorization: Bearer <tok
    el.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:text}));
    ```
    输完检查发送/提交按钮是否从 disabled 变 enabled，再点它。
-6. **部分动态页面的截图**：CDP `page.screenshot` 可能卡住或无法得到期望结果；先激活标签页，必要时使用系统级截图方案。
-7. **激活标签后 tabId 不变**，但用户手动开/关标签会变——多步流程每步都重新 `tabs` 确认。
+6. **截图的静默策略**：`page.screenshot` 默认走 CDP（后台 tab 也可用，不抢焦点）。CDP 失败时**默认不再自动激活窗口**，返回 `SCREENSHOT_FAILED`；若可接受浏览器跳到前台，用 `page.activateAndShot` 或传 `allowActivate:true`。确实需要用户观看/系统级截图时再显式激活。
+7. **激活/准备后 tabId 不变**，但用户手动开/关标签会变——多步流程每步都重新 `tabs` 确认。
 8. **导航等待**：导航必须用 `page.navigate`（走 `chrome.tabs.update`），**禁止用 `page.evaluate` 改 `location.href`/`location.assign`/`history.go`**——后者会销毁执行上下文，导致 RPC 无法返回、Host 超时。`page.navigate` 后可调 `page.waitForUrl`/`page.waitForSelector`/`page.waitForReady` 按条件等待，不要用固定 sleep。
 9. **视觉指示器**：Agent 操作时页面会显示幽灵光标 + 点击涟漪 + 「停止 Agent」按钮（默认开启）。用户可随时点停止打断。
 10. **停止按钮实现**：background 的 dispatch() 只对真实交互操作（click/type/press/scroll/hover/focusEl/select/waitFor）显示停止按钮；只读/导航（navigate/info/evaluate/snapshot/waitLoad/waitForUrl/waitForSelector/waitForReady）不被 indicator 阻塞，indicator 失败也不影响主 RPC。如需默认关闭改 background.js 的 INTERACTIVE_METHODS。
+
+## 静默模式（后台操作不抢焦点，扩展 v0.3.0+）
+
+默认情况下，桥的读/写/点击/截图都**不会**把浏览器窗口拉到前台、也不会切换激活 tab——用户在用别的应用时不会被抢焦点。需要用户眼睛的步骤（登录、验证码、扫码、选文件、最终核对）才由 Agent 显式 `tabs.activate` / `page.focus` / `page.activateAndShot`。
+
+### 操作前准备：`tabs.prepare`
+
+保证 content script 已注入 + 目标 tab 不被浏览器后台冻结/回收（`autoDiscardable:false`）；**不切激活 tab、不聚焦窗口**。多步流程第一步用它代替 `tabs.activate`。
+
+- 调用：`POST /rpc`，体 `{"method":"tabs.prepare","params":{"tabId":<id>},"timeoutMs":15000}`
+- 参数：
+
+  | 参数 | 类型 | 必填 | 说明 |
+  |---|---|---|---|
+  | tabId | number | 是 | 目标标签页 ID |
+
+- 返回：`{"ok":true,"tabId":<id>}`
+- 失败：`UNSUPPORTED_URL`（chrome:// 等不可注入页）/ `TAB_GONE` / `TAB_DISCARDED`（tab 已被 OneTab/浏览器冻结丢弃，静默无法唤醒，改用 `tabs.activate`）/ `PAGE_CONTEXT_TIMEOUT`（注入失败）
+- 提示：`tabs.list` / `tabs.get` 返回的 tab 带 `discarded` 字段，选目标 tab 时先避开 `discarded:true` 的（或预判需要 `tabs.activate`）。
+- 最小可用示例：
+
+  ```js
+  await b.rpc("tabs.prepare", { tabId }, 15000);   // 静默准备，全程不抢焦点
+  await b.rpc("page.evaluate", { tabId, expression: "location.href" }); // 后台 tab 直接可用
+  ```
+
+- **版本要求**：扩展 v0.3.0+。旧版（返回 `UNKNOWN_METHOD`）兜底：直接跳下一步——`page.*` 内容调用内部自带 `ensureInjected`，会自动注入 content script，唯一损失是「防后台冻结」不生效；被 OneTab / 浏览器丢弃冻结的 tab 仍需 `tabs.activate`。
+
+### 何时仍要显式激活
+
+| 场景 | 用什么 |
+|---|---|
+| 登录 / 扫码 / 验证码 / 2FA / 选文件 | `tabs.activate`（或 `page.focus`），并告知用户 |
+| 最终给用户核对的可视化结果 | `page.activateAndShot` |
+| 被 OneTab / 浏览器丢弃冻结的 tab | `tabs.activate`（激活即唤醒重载） |
+| 后台 tab 定时器被节流、页面"不反应" | 放宽等待仍不行再 `tabs.activate` |
+
+### 截图行为变化（v0.3.0+）
+
+`page.screenshot` 默认 CDP 静默截图（后台 tab 可用）；CDP 失败时**不再偷偷激活窗口**，报 `SCREENSHOT_FAILED`。显式传 `allowActivate:true` 或改用 `page.activateAndShot` 才会降级到 `captureVisibleTab`（该路径要求目标 tab 是窗口内激活 tab）。
+
+### 后台节流注意
+
+Chrome 会把后台 tab 的定时器压到 1 秒级、长闲后可能冻结：依赖 rAF/轮询渲染的页面（瀑布流、懒加载）可能看似无响应。处理：`page.waitForSelector` / `page.waitForUrl` 超时放宽到 30s+；仍无响应再 `tabs.activate`。
 
 ## 错误码（可诊断）
 
@@ -142,7 +200,7 @@ await bridge.releaseTab(tabId);
 
 ## 同 tab 串行与跨 tab 并行
 
-- 同一 tab 的 `page.*` / `tabs.get|activate|close|reload` / `session.*` 请求在 host 端**严格串行**（按 tabId 维护队列），避免 BOSS 重型 SPA 下 navigate/snapshot/evaluate 互相堆积导致超时。
+- 同一 tab 的 `page.*` / `tabs.get|activate|prepare|close|reload` / `session.*` 请求在 host 端**严格串行**（按 tabId 维护队列），避免 BOSS 重型 SPA 下 navigate/snapshot/evaluate 互相堆积导致超时。
 - 跨 tab 请求并行。
 - 单个请求超时不会让同 tab 后续所有请求雪崩：超时后该 tab 进入短恢复窗口（约 500ms），后续请求重试而非级联失败。
 

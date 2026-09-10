@@ -154,7 +154,7 @@ const EXPRS = {
 
 async function main() {
   const tabId = args.tabId;
-  try { await rpc("tabs.activate", { tabId }, 8000); } catch {}
+  try { await rpc("tabs.prepare", { tabId }, 8000); } catch {}
   await new Promise((r) => setTimeout(r, 700));
 
   if (args.mode === "sel") {

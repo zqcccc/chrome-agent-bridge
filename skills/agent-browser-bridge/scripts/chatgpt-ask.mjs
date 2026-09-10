@@ -207,8 +207,8 @@ async function downloadImages(images, dir) {
 
 async function main() {
   const t0 = Date.now();
-  // 0. 激活标签页（content script 注入 + CDP 访问前提）
-  try { await rpc("tabs.activate", { tabId }, 15000); } catch {}
+  // 0. 静默准备标签页（content script 注入 + CDP 访问前提，不抢焦点）
+  try { await rpc("tabs.prepare", { tabId }, 15000); } catch {}
   await sleep(600);
 
   // 1. 状态检查：是否在 chatgpt.com、是否登录墙

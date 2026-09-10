@@ -118,8 +118,8 @@ const EXTRACT_EXPR = `(() => {
 })()`;
 
 async function main() {
-  // 0. 激活标签页
-  try { await rpc("tabs.activate", { tabId }, 15000); } catch {}
+  // 0. 静默准备标签页
+  try { await rpc("tabs.prepare", { tabId }, 15000); } catch {}
 
   // 1. 状态检查：验证码/404 立即停止；确认是用户主页
   const st = await evaluate(`(() => {

@@ -105,8 +105,8 @@ function channelAvailable(id, chans) {
 }
 
 async function main() {
-  // 0. 激活标签页（content script 注入前提）
-  try { await rpc("tabs.activate", { tabId }, 15000); } catch {}
+  // 0. 静默准备标签页（content script 注入前提，不抢焦点）
+  try { await rpc("tabs.prepare", { tabId }, 15000); } catch {}
 
   // 1. 状态检查：验证码/404 立即停止，不重试
   const st = await evaluate(`(() => {

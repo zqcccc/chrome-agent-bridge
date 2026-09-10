@@ -114,7 +114,7 @@ async function closeNoteModal(tabId) {
 
 async function main() {
   const tabId = args.tabId;
-  try { await rpc("tabs.activate", { tabId }, 15000); } catch {}
+  try { await rpc("tabs.prepare", { tabId }, 15000); } catch {}
 
   // 1. 状态检查：验证码/404 立即停止，不重试
   const checkStatusExpr = `(() => {

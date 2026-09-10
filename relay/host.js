@@ -111,7 +111,7 @@ function tabIdOf(method, params) {
 function isSerialMethod(method) {
   return typeof method === "string" &&
     (method.startsWith("page.") || method.startsWith("session.") ||
-     ["tabs.get", "tabs.activate", "tabs.close", "tabs.reload"].includes(method));
+     ["tabs.get", "tabs.activate", "tabs.prepare", "tabs.close", "tabs.reload"].includes(method));
 }
 
 function nativeReady() { return !!(nativePort && nativePort.ready); }

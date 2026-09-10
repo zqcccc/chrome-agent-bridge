@@ -37,8 +37,8 @@ const rpc = async (method, params = {}, t = timeoutMs) => {
 };
 
 async function main() {
-  // 0. 激活标签页（content script 注入前提，session 也需要页面可访问）
-  try { await rpc("tabs.activate", { tabId }, 15000); } catch {}
+  // 0. 静默准备标签页（注入 content script，不切激活 tab / 不聚焦窗口）
+  try { await rpc("tabs.prepare", { tabId }, 15000); } catch {}
   // 1. 挂上 CDP session
   await rpc("session.attach", { tabId }, 15000);
   try {

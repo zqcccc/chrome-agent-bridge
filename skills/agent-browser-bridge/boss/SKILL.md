@@ -60,8 +60,9 @@ https://www.zhipin.com/web/geek/jobs?query={关键词}&city=101010100&salary=406
 BOSS 薪资/经验的数字用 **PUA 字符**（U+E030~U+E03A）显示，DOM 里拿不到真实数字，@font-face 动态字体每页都变。
 
 **可靠方案：macOS 窗口截图 + 视觉 OCR**（不要用 CDP 截图，BOSS 页会卡）：
-1. `mac_computer_use_tool` cu 平面 `get_app_state("com.google.Chrome", screenshot=True)` 截 Chrome 窗口；
-2. 保存 Frame 为 png，用 Read/视觉模型读出渲染后的真实薪资（如"20-35K·15薪"）。
+1. **此步要求 Chrome 窗口在屏幕上可见**（截的是真实渲染画面，窗口被遮挡/最小化会截到旧内容或空白）——若任务处于静默模式（默认后台操作不抢焦点），**先 `tabs.activate` 或 `page.focus` 把窗口带到前台**，再执行下面两步；
+2. `mac_computer_use_tool` cu 平面 `get_app_state("com.google.Chrome", screenshot=True)` 截 Chrome 窗口；
+3. 保存 Frame 为 png，用 Read/视觉模型读出渲染后的真实薪资（如"20-35K·15薪"）。
 
 已实测确认的码点映射（页面对 `kanzhun-mix` 字体，**注意每页可能不同，仅作参考**）：
 `0xE030=2, 0xE031=0, 0xE032=1, 0xE033=2, 0xE034=3, 0xE035=4, 0xE036=5, 0xE037=6, 0xE038=7, 0xE039=8, 0xE03A=9`。**不要依赖映射猜数，以 OCR 为准**；详情页 body 文本有时含明文薪资（如"20-30K"），可作交叉验证。
