@@ -13,7 +13,11 @@
   let stopTimer = null;
   let currentX = -1000;
   let currentY = -1000;
+  let controlBadge = null;
+  let controlTimer = null;
+  let titleBeforeControl = null;
 
+  const CONTROL_IDLE_MS = 12_000;
   const NS = "http://www.w3.org/2000/svg";
 
   function buildCursor() {
@@ -80,7 +84,7 @@
       cursorInner.style.transform = "scale(0.75)";
       setTimeout(() => {
         if (cursorInner) {
-          cursorInner.style.transition = "transform 180ms cubic-bezier(0.2,0.8,0.3,1.4)";
+          cursorInner.style.transition = "transform 180ms cubic-bezier(0.2,0,0,1)";
           cursorInner.style.transform = "scale(1)";
         }
       }, 120);
@@ -110,6 +114,50 @@
     if (cursor) cursor.style.opacity = "1";
   }
 
+  // ---------- 标签页接管状态 ----------
+  // 视觉状态放在页面右上角；document.title 前缀直接标记 Chrome 标签页，扩展图标也有辅助 badge。
+  // 没有新的页面控制请求后自动变为「已放开」，不把短暂读页面误报成持续接管。
+  function setControl(state) {
+    if (!isTop) return;
+    const active = state === "active";
+    if (controlTimer) { clearTimeout(controlTimer); controlTimer = null; }
+    // Tab 自身必须可辨认：接管时给 document.title 加前缀，放开时原样恢复。
+    // title 是网页可写的，不能通过 Chrome action badge 代替它。
+    if (active && titleBeforeControl === null) {
+      titleBeforeControl = document.title;
+      document.title = `● Agent 接管中 | ${titleBeforeControl}`;
+    } else if (!active && titleBeforeControl !== null) {
+      document.title = titleBeforeControl;
+      titleBeforeControl = null;
+    }
+    if (!controlBadge) {
+      controlBadge = document.createElement("div");
+      controlBadge.id = "agent-bridge-control-status";
+      controlBadge.setAttribute("role", "status");
+      controlBadge.setAttribute("aria-live", "polite");
+      controlBadge.style.cssText = [
+        "position:fixed;top:16px;right:16px;display:flex;align-items:center;gap:8px;",
+        "padding:9px 12px 9px 10px;border-radius:10px;pointer-events:none;",
+        "font:600 13px/1 -apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif;",
+        "box-shadow:0 10px 26px rgba(15,23,42,.20);z-index:2147483647;",
+        "transition:opacity 180ms ease,transform 180ms ease;",
+      ].join("");
+      document.documentElement.appendChild(controlBadge);
+    }
+    controlBadge.style.display = "flex";
+    controlBadge.style.opacity = "1";
+    controlBadge.style.transform = "translateY(0)";
+    controlBadge.style.background = active ? "#1d4ed8" : "#334155";
+    controlBadge.style.color = "#fff";
+    controlBadge.innerHTML = active
+      ? '<span style="width:8px;height:8px;border-radius:50%;background:#86efac;box-shadow:0 0 0 3px rgba(134,239,172,.22)"></span><span>Agent 接管中</span>'
+      : '<span style="width:8px;height:8px;border-radius:50%;background:#cbd5e1"></span><span>Agent 已放开</span>';
+    try {
+      chrome.runtime.sendMessage({ type: "bridge.tabControl", state: active ? "active" : "released" });
+    } catch (e) { /* noop */ }
+    if (active) controlTimer = setTimeout(() => setControl("released"), CONTROL_IDLE_MS);
+  }
+
   // ---------- 停止按钮 ----------
   function showStop(label) {
     if (!isTop) return;
@@ -131,6 +179,7 @@
         chrome.runtime.sendMessage({ type: "bridge.indicatorEvent", event: "agent.stop" });
       } catch (e) { /* noop */ }
       hideStop();
+      setControl("released");
     });
     document.documentElement.appendChild(stopBtn);
   }
@@ -177,6 +226,10 @@
           break;
         case "hide":
           hide();
+          sendResponse({ ok: true });
+          break;
+        case "setControl":
+          setControl(msg.state);
           sendResponse({ ok: true });
           break;
         case "showStop":

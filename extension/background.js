@@ -216,9 +216,11 @@ function handleWsMsg(msg) {
 function handleHostEvent(event, payload) {
   switch (event) {
     case "agent.stop":
-      // 通知所有页面隐藏指示器
+      // 用户按下停止：光标、按钮和标签页接管状态都立即撤销。
       broadcastToTabs({ type: "bridge.indicator", action: "hide" });
       broadcastToTabs({ type: "bridge.indicator", action: "hideStop" });
+      broadcastToTabs({ type: "bridge.indicator", action: "setControl", state: "released" });
+      clearAllTabControlBadges();
       break;
     default:
       break;
@@ -240,7 +242,24 @@ function broadcastToTabs(msg) {
   });
 }
 
+// Chrome 不允许扩展改写网站 tab 的标题或 favicon；因此使用扩展图标 badge，
+// 并和页面内状态条配对，提供浏览器级和页面级两个可见信号。
+function setTabControlBadge(tabId, active) {
+  if (tabId === undefined || tabId === null) return;
+  try {
+    chrome.action.setBadgeText({ tabId, text: active ? "ON" : "" });
+    if (active) chrome.action.setBadgeBackgroundColor({ tabId, color: "#1d4ed8" });
+    chrome.action.setTitle({ tabId, title: active ? "Agent 接管中" : "Agent Browser Bridge" });
+  } catch (e) { /* noop */ }
+}
+function clearAllTabControlBadges() {
+  chrome.tabs.query({}, (tabs) => tabs.forEach((tab) => setTabControlBadge(tab.id, false)));
+}
+
 // ---------- 命令分发 ----------
+// 所有会触及页面的 RPC 都在标签标题和页面右上角明确标为「Agent 接管中」。
+// 标记会由页面端的闲置计时器自动撤销；收到 agent.stop 时则立即撤销，避免用户
+// 只能从一次性的幽灵光标判断脚本是否还持有该标签页。
 // 护栏：只对真实交互操作（click/type/press/scroll/hover/focusEl/select/waitFor）
 // 显示「停止 Agent」按钮。只读/导航/evaluate/snapshot/waitLoad 不被 indicator 阻塞，
 // 避免给读操作和导航增加竞态。indicator 失败不得影响主 RPC。
@@ -248,7 +267,13 @@ const INTERACTIVE_METHODS = new Set([
   "page.click", "page.type", "page.press", "page.scroll",
   "page.hover", "page.focusEl", "page.waitFor", "page.select",
 ]);
+function isPageControlMethod(method) {
+  return typeof method === "string" && method.startsWith("page.") && !method.startsWith("page.indicator.");
+}
 async function dispatch(method, params) {
+  if (isPageControlMethod(method) && params && params.tabId) {
+    try { await indicatorCall(params.tabId, { action: "setControl", state: "active" }); } catch (e) { /* chrome:// 等受限页忽略 */ }
+  }
   if (INTERACTIVE_METHODS.has(method) && params && params.tabId) {
     try { await indicatorCall(params.tabId, { action: "showStop", label: "停止 Agent" }); } catch (e) { /* chrome:// 等受限页忽略 */ }
   }
@@ -813,6 +838,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 页面 indicator 上报（如 agent.stop 按钮被点击）
   if (msg.type === "bridge.indicatorEvent") {
     sendToHost({ type: "event", event: msg.event, payload: msg.payload || null });
+    sendResponse({ ok: true });
+    return false;
+  }
+  // indicator 的闲置倒计时也会回报，确保 toolbar badge 不会滞留。
+  if (msg.type === "bridge.tabControl") {
+    setTabControlBadge(sender.tab && sender.tab.id, msg.state === "active");
     sendResponse({ ok: true });
     return false;
   }
