@@ -153,6 +153,48 @@ await bridge.releaseTab(tabId);
 - `page.waitForSelector` `{ tabId, selector, by?, timeoutMs?, intervalMs? }`：等选择器出现。
 - `page.waitLoad` `{ tabId, timeoutMs? }`：等加载完成（webNavigation + 轮询兑底）。
 
+## CDP 直通：`session.send`（未封装的底层能力都从这里走）
+
+桥暴露了一条通用 CDP 通道，很多只有 DevTools Protocol 才有的能力（设备模拟、精确截图、性能指标、网络拦截等）都用它，不必自己装 Playwright。
+
+```js
+await b.rpc("session.attach", { tabId }, 15000);                       // 先挂上
+const r = await b.rpc("session.send", {
+  tabId,
+  method: "Page.captureScreenshot",                                    // 任意 CDP 方法
+  params: { format: "png", captureBeyondViewport: true,
+            clip: { x: 0, y: scrollY, width: 390, height: 800, scale: 2 } },
+}, 30000);
+fs.writeFileSync(out, Buffer.from(r.result.data, "base64"));           // 返回在 r.result
+await b.rpc("session.detach", { tabId }, 10000).catch(() => {});       // 收工记得卸
+```
+
+> 注意 `session.*` 也走同 tab 串行队列；报错时先确认 `session.attach` 成功再 `send`。
+
+### 实用配方：真机尺寸的移动端核查（改页面/查响应式必用）
+
+`page.screenshot` 截的是**浏览器窗口**，不是模拟视口——窗口大、页面窄时，图里只有左边一条有内容。要拿到真机视角必须走 CDP：
+
+```js
+await b.rpc("session.send", { tabId, method: "Emulation.setDeviceMetricsOverride",
+  params: { width: 390, height: 844, screenWidth: 390, screenHeight: 844,
+            deviceScaleFactor: 2, mobile: true } }, 20000);
+// 此时 document.documentElement.clientWidth === 390，真实触发 @media
+// 再用上面的 Page.captureScreenshot + clip{x:0,y:scrollY,width:390,...} 截图
+```
+
+**判定横向溢出（响应式的硬指标）**——别看 `window.innerWidth`，布局视口会因内容超宽被撑大而掩盖问题：
+
+```js
+const de = document.documentElement;
+const hasHScroll = de.scrollWidth > de.clientWidth;   // 真正的判据
+```
+
+定位元凶时要**排除已被横滚容器吸收的子元素**（否则全是假阳性）：向上遍历祖先，若某祖先 `overflow-x` 为 `auto/scroll/hidden` 就跳过该元素。修完在 320/360/390/430/…/1024 各宽度跑一遍，全部 `hasHScroll === false` 才算干净。
+
+**常见元凶**：`<table>` 里的 `th{white-space:nowrap}` / `td{white-space:nowrap}`——列一多，表格最小内容宽度就顶破 `.card`，进而把整个页面撑出横向滚动条。**修法是给表格套一层 `overflow-x:auto` 容器**（不要给 `.card` 加，会把圆角和内边距一起卷进去）。
+另附两个高频低级坑：CSS 里写成 `media(...)` 漏掉 `@`（整块规则静默失效，DevTools 都不报错）、写了不存在的属性如 `.dest{cards}`。
+
 ## Agent 行为约束（所有任务、所有网站，必须遵守）
 
 1. **遇到风控/安全验证 → 立即停止，禁止疯狂重试**：页面跳转到验证码页（如小红书 `website-login/captcha` /「Security Verification」）、滑块验证、人机校验，或大量 404 /「页面不见了」时，**立即停止该站点的所有后续请求**。不要换参数重试、不要加大滚动轮数、不要重新批量打开页面、不要换个 tab 再试。停下来向用户说明，等待用户手动完成验证或风控解除后再继续。疯狂重试会加重风控，导致账号/会话被更长时间限制。桥本身（host/扩展）几乎从不是这类问题的原因：先 `/status` 确认 `extConnected:true`，桥正常则归因于站点侧风控。
@@ -162,7 +204,9 @@ await bridge.releaseTab(tabId);
 
 本 skill 的站点专项按需拆分，使用时才读取对应子技能的 `SKILL.md`：
 
-- **小红书（笔记 + 全部评论深度抓取）** → 读取 `xhs/SKILL.md`（含一键抓取脚本 `scripts/extract-xhs-comments.mjs` 的用法与执行规范）。仅当任务需要在站内检索、抓笔记/评论时读取，其余任务无需加载。
+- **小红书（笔记 + 全部评论深度抓取）** → 读取 `xhs/SKILL.md`（含站内搜索/筛选/频道、搜用户、用户主页全部笔记、问点点 AI 问答、一键抓取脚本 `scripts/extract-xhs-comments.mjs` 等示例脚本与执行规范）。仅当任务需要在站内检索、抓笔记/评论/用户时读取，其余任务无需加载。
+- **ChatGPT 网页版（问答/选模型/生图）** → 读取 `chatgpt/SKILL.md`（脚本 `scripts/chatgpt-ask.mjs` 一键提问读回复、`scripts/cdp-eval.mjs` CDP 求值）。仅当任务需要在 chatgpt.com 网页端提问、读回复或生成图片时读取。**注意：chatgpt.com 有严格 CSP，`page.evaluate` 不可用，一切页面内 JS 走 CDP（`cdp-eval.mjs` / `session.send`）。** 前置：用户已在浏览器登录 chatgpt.com。
+- **BOSS 直聘（职位搜索/筛选/打招呼投递）** → 读取 `boss/SKILL.md`（脚本 `scripts/boss-send-chat.mjs` 单条消息发送+送达验证、`scripts/boss-batch-apply.mjs` 批量投递模板、`scripts/boss-verify-helpers.mjs` 送达验证纯逻辑模块）。覆盖搜索 URL 与薪资档位、职位卡片提取、薪资字体加密（PUA 码点，用窗口截图 OCR）、按简历画像评分与定制打招呼、3 条消息投递、每日沟通上限与风控停止规则。仅当任务需要在 zhipin.com 找工作/投递/打招呼时读取。前置：用户已登录 zhipin.com，发送前须经用户确认。
 - **临场 Debug（任何站点通用）** → 读取 `debug/SKILL.md`（工具 `scripts/browser-debug.mjs`）。仅当页面行为异常（404/风控误判、取不到内容、数量不对、URL 打不开）、需要理解陌生页面结构、或交付前验证提取结果时读取。**先探查后假设、不猜类名、异常先查 DOM 再下结论、输出独立验证**。
 
 ---
