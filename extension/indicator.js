@@ -15,10 +15,15 @@
   let currentY = -1000;
   let controlBadge = null;
   let controlTimer = null;
+  let controlHideTimer = null;
+  let controlEverActive = false;
   let titleBeforeControl = null;
   let currentAgentDisplay = "Agent";
 
   const CONTROL_IDLE_MS = 12_000;
+  // 「已放开」提示只是过场态：短暂展示后淡出移除，避免空状态长期占据页面右上角。
+  const CONTROL_RELEASED_MS = 2_600;
+  const CONTROL_FADE_MS = 200;
   const NS = "http://www.w3.org/2000/svg";
 
   function formatAgentDisplay(name, id) {
@@ -143,6 +148,8 @@
 
   function hide() {
     if (cursor) cursor.style.opacity = "0";
+    // 显式 hide / hideAll 视为彻底收尾：接管状态条一并清掉。
+    hideControlBadge();
   }
 
   function show() {
@@ -161,9 +168,11 @@
     const displayName = currentAgentDisplay || "Agent";
 
     if (controlTimer) { clearTimeout(controlTimer); controlTimer = null; }
-    
+    if (controlHideTimer) { clearTimeout(controlHideTimer); controlHideTimer = null; }
+
     // Tab 自身必须可辨认：接管时给 document.title 加带有具体 Agent 实例标识的前缀，放开时原样恢复。
     const cleanTitle = stripControlPrefix(document.title);
+    const hadStalePrefix = document.title !== cleanTitle;
     if (active) {
       if (titleBeforeControl === null) {
         titleBeforeControl = cleanTitle;
@@ -178,6 +187,26 @@
       }
     }
 
+    // 只有本页确实被接管过（或残留了「接管中」标题）才展示「已放开」过场提示；
+    // agent.stop / 自愈清扫会给所有标签页广播 released，不能让无关页面凭空冒出徽标。
+    if (!active && !controlEverActive && !hadStalePrefix) {
+      hideControlBadge();
+    } else if (active) {
+      controlEverActive = true;
+      showControlBadge(true, displayName);
+    } else {
+      controlEverActive = false;
+      showControlBadge(false, displayName);
+      controlHideTimer = setTimeout(hideControlBadge, CONTROL_RELEASED_MS);
+    }
+
+    try {
+      chrome.runtime.sendMessage({ type: "bridge.tabControl", state: active ? "active" : "released", agentDisplay: displayName });
+    } catch (e) { /* noop */ }
+    if (active) controlTimer = setTimeout(() => setControl("released"), CONTROL_IDLE_MS);
+  }
+
+  function showControlBadge(active, displayName) {
     if (!controlBadge) {
       controlBadge = document.createElement("div");
       controlBadge.id = "agent-bridge-control-status";
@@ -188,7 +217,7 @@
         "padding:9px 14px 9px 11px;border-radius:10px;pointer-events:none;",
         "font:600 13px/1 -apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif;",
         "box-shadow:0 10px 26px rgba(15,23,42,.20);z-index:2147483647;",
-        "transition:opacity 180ms ease,transform 180ms ease;",
+        `transition:opacity ${CONTROL_FADE_MS}ms ease,transform ${CONTROL_FADE_MS}ms ease;`,
       ].join("");
       document.documentElement.appendChild(controlBadge);
     }
@@ -202,11 +231,19 @@
     controlBadge.innerHTML = active
       ? `<span style="width:8px;height:8px;border-radius:50%;background:#86efac;box-shadow:0 0 0 3px rgba(134,239,172,.22);flex-shrink:0;"></span><span style="display:flex;align-items:center;gap:4px;"><span>接管:</span><strong style="font-weight:700;color:#93c5fd;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${safeDisplay}</strong></span>`
       : `<span style="width:8px;height:8px;border-radius:50%;background:#cbd5e1;flex-shrink:0;"></span><span style="display:flex;align-items:center;gap:4px;"><span>已放开:</span><span style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${safeDisplay}</span></span>`;
-    
-    try {
-      chrome.runtime.sendMessage({ type: "bridge.tabControl", state: active ? "active" : "released", agentDisplay: displayName });
-    } catch (e) { /* noop */ }
-    if (active) controlTimer = setTimeout(() => setControl("released"), CONTROL_IDLE_MS);
+  }
+
+  // 淡出并移除接管状态条。用 opacity + transform 过渡而不是直接 display:none，
+  // 让「已放开」是看得见的过场，而不是突然消失。
+  function hideControlBadge() {
+    if (controlHideTimer) { clearTimeout(controlHideTimer); controlHideTimer = null; }
+    controlEverActive = false;
+    if (!controlBadge) return;
+    controlBadge.style.opacity = "0";
+    controlBadge.style.transform = "translateY(-6px)";
+    const el = controlBadge;
+    controlBadge = null;
+    setTimeout(() => el.remove(), CONTROL_FADE_MS + 40);
   }
 
   // ---------- 停止按钮 ----------

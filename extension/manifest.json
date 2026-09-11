@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Agent Browser Bridge",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "通用浏览器桥：让本地 Agent 通过安全通道接管你的 Chrome——列出/管理标签页、导航、读取页面、点击、输入、滚动、截图。参考 ChatGPT/Claude 插件的原生通道设计。",
   "minimum_chrome_version": "116",
   "permissions": [
