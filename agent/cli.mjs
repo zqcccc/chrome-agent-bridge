@@ -112,6 +112,34 @@ async function main() {
       }
       break;
     }
+    case "verify": {
+      // 回归自检：验证各修复项是否生效（方法注册、错误码归一、会话状态、CSP 兜底前提）
+      // 用法: node agent/cli.mjs verify
+      const { spawn } = await import("node:child_process");
+      const path = await import("node:path");
+      const script = path.join(path.dirname(new URL(import.meta.url).pathname), "verify-bridge.mjs");
+      await new Promise((resolve) => {
+        const p = spawn(process.execPath, [script], { stdio: "inherit", env: process.env });
+        p.on("exit", (code) => resolve(code));
+      });
+      break;
+    }
+    case "wait": {
+      // 增强等待：cli.mjs wait <tabId> ready|url|selector <match|selector> [timeoutMs]
+      // 取代固定 sleep——之前脚本只能用裸 sleep，正是因为这几个等待方法没暴露到 CLI
+      const [tabId, kind, arg, timeoutArg] = rest;
+      if (!tabId || !kind) return die(new Error("用法: cli wait <tabId> ready|url|selector <match|selector> [timeoutMs]"));
+      const t = Number(tabId);
+      const timeoutMs = timeoutArg ? Number(timeoutArg) : undefined;
+      let method, params = { tabId: t };
+      if (kind === "ready") { method = "page.waitForReady"; params.timeoutMs = timeoutMs; }
+      else if (kind === "url") { if (!arg) return die(new Error("url 模式需要 match 参数")); method = "page.waitForUrl"; params.match = arg; params.timeoutMs = timeoutMs; }
+      else if (kind === "selector") { if (!arg) return die(new Error("selector 模式需要选择器参数")); method = "page.waitForSelector"; params.selector = arg; params.timeoutMs = timeoutMs; }
+      else return die(new Error(`未知 kind: ${kind}（支持 ready/url/selector）`));
+      const r = await bridge.rpc(method, params, (timeoutMs || 30000) + 5000);
+      console.log(`✓ ${method} 满足：${JSON.stringify(r)}`);
+      break;
+    }
     case "inspect": {
       // 内置页面探查：cli.mjs inspect <tabId> [overview|links|media|scroll|modal|sel:<css>] [limit]
       const [tabId, arg, limitArg] = rest;
@@ -141,6 +169,37 @@ async function main() {
       if (!tabId || !selector) return die(new Error("用法: cli type <tabId> <selector> <text>"));
       const r = await bridge.type(Number(tabId), selector, textParts.join(" "));
       console.log("typed:", JSON.stringify(r));
+      break;
+    }
+    case "reload-ext": {
+      // 重载扩展自身（免手工去 chrome://extensions 点刷新）。
+      // 注意：扩展 reload 会连带关闭 native channel，host 进程随之退出并由 Chrome 重新拉起，
+      // 因此 HTTP 响应会丢失。这里把「丢响应」当正常信号处理：发完请求就转而轮询 /status。
+      const started = Date.now();
+      const before = await bridge.status().catch(() => null);
+      let ack = null;
+      try {
+        ack = await bridge.rpc("extension.reload", { delayMs: Number(rest[0]) || 300 }, 10000);
+      } catch (e) {
+        // 响应丢失（host 被回收）也算触发成功，后续轮询确认
+        if (e && e.code !== "TIMEOUT" && e.code !== "EXT_DISCONNECTED") return die(e);
+      }
+      console.log(`已触发重载${ack ? `（from v${ack.fromVersion}）` : "（响应丢失，属预期）"}`);
+      const deadline = Date.now() + 30000;
+      let ok = false, ver = null;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 700));
+        try {
+          const st = await bridge.status();
+          if (st.extConnected) {
+            const r = await bridge.rpc("bridge.status", {}, 5000);
+            ver = r.version; ok = true; break;
+          }
+        } catch (e) { /* host 重启中，继续等 */ }
+      }
+      if (!ok) return die(new Error("重载后 30s 内未重连，请检查 chrome://extensions"));
+      console.log(`✓ 扩展已重载并重连：v${ver}（耗时 ${((Date.now() - started) / 1000).toFixed(1)}s）`);
+      if (before && ver && before.version !== ver) console.log(`  注意: host /status 的 version 是启动缓存(${before.version})，实际扩展为 v${ver}`);
       break;
     }
     case "press": {
@@ -180,7 +239,7 @@ async function main() {
       break;
     }
     default:
-      console.log(`未知命令: ${cmd}\n可用命令: status / tabs / active / open / snap / shot / eval / click / type / press / scroll / cursor / listen`);
+      console.log(`未知命令: ${cmd}\n可用命令: status / tabs / active / open / snap / shot / eval / wait / reload-ext / verify / click / type / press / scroll / cursor / listen`);
   }
 }
 

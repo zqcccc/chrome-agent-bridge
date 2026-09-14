@@ -38,7 +38,18 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 
 function wsUrl() {
-  return `ws://${config.host || "127.0.0.1"}:${config.port || 8778}/agent?token=${encodeURIComponent(config.token || "")}`;
+  return `ws://${config.host || "127.0.0.1"}:${config.port || 8778}/agent?token=${encodeURIComponent(normalizeToken(config.token))}`;
+}
+// token 归一：宿主写入时可能被 URI 编码过（表现为末尾出现 %25 —— '%' 被二次编码）。
+// 原样再 encodeURIComponent 一次就会双重编码，WS 握手必然 401/认证失败。
+// 这里先把已编码形态解回原始字符串，确保「只编码一次」。
+function normalizeToken(raw) {
+  let t = String(raw == null ? "" : raw).trim();
+  // 含 %xx 才尝试解码；解码失败（畸形序列）则保留原值，不制造新错误
+  if (/%[0-9A-Fa-f]{2}/.test(t)) {
+    try { const d = decodeURIComponent(t); if (d) t = d; } catch (e) { /* 保持原值 */ }
+  }
+  return t;
 }
 
 // ---------- 保活（MV3 SW 会休眠，用 alarms 保持通道） ----------
@@ -168,6 +179,59 @@ function sendToHost(obj) {
   return false;
 }
 
+// 已知「页面上下文失效」的 tab：导航超时 / 注入失败后打标记（tabId -> 时间戳）。
+// 命中时 evaluate 立即快速失败，而不是让每个后续调用都挂满 CONTENT_CALL_TIMEOUT_MS
+// （实测一个坏 tab 会连累后续每个调用各挂满 60s）。导航成功或 prepare 成功后清除。
+const brokenTabs = new Map();
+const BROKEN_TTL_MS = 30000;
+// 注入探测超时：chrome.tabs.sendMessage 对「content script 不存在」不会 reject、会一直挂起，
+// 必须自己加超时把「挂起」变成「快速可判定」，否则 RPC 会被拖到 CONTENT_CALL_TIMEOUT_MS。
+const PING_TIMEOUT_MS = 3000;
+const INJECT_TIMEOUT_MS = 10000;
+// 单次求值超时。用 CONTENT_CALL_TIMEOUT_MS(30s) 会让坏 tab 上每个调用都挂满 30s；
+// ensureInjected 已能在 3s 内判定 content script 是否存在，这里给 12s 足够正常页面执行，
+// 又不会让失效页面的每个调用都拖满。超时后由 brokenTabs 让后续调用立即失败。
+const EVAL_TIMEOUT_MS = 12000;
+function markBroken(tabId) { brokenTabs.set(tabId, Date.now()); }
+function clearBroken(tabId) { brokenTabs.delete(tabId); }
+function isBroken(tabId) {
+  const t = brokenTabs.get(tabId);
+  if (t === undefined) return false;
+  if (Date.now() - t > BROKEN_TTL_MS) { brokenTabs.delete(tabId); return false; }
+  return true;
+}
+
+// 降级日志：预期内的失败（受限页、调用方参数问题）不进 console.error，
+// 否则 chrome://extensions 的 errors 列表会被噪音刷满，真正的故障被淹没。
+const EXPECTED_ERROR_CODES = new Set([
+  "UNSUPPORTED_URL",   // chrome:// chrome-extension:// 等本就不可注入
+  "TAB_DISCARDED",     // 被 OneTab / 浏览器冻结的 tab
+  "TAB_GONE",          // tab 已关闭
+  "BAD_PARAMS",        // 调用方没传对参数
+  "UNKNOWN_METHOD",    // 文档/版本不匹配，属调用方问题
+  "SCREENSHOT_FAILED",
+]);
+function logRpcError(method, e) {
+  const code = normalizeErrCode(e);
+  if (EXPECTED_ERROR_CODES.has(code)) {
+    console.warn("[bridge] rpc skipped", method, code);
+  } else {
+    console.error("[bridge] rpc error", method, e && e.message);
+  }
+}
+// Chrome API 抛的是原生 Error（如 "No tab with id: 1."），没有 code 字段，
+// 默认会落进 INTERNAL 并在 errors 面板刷成红字。这里按消息归一化出结构化 code，
+// 让调用方可编程判断，也让预期内的失败降级成 warn。
+function normalizeErrCode(e) {
+  if (e && e.code) return e.code;
+  const m = String((e && e.message) || e || "");
+  if (/No tab with id/i.test(m)) return "TAB_GONE";
+  if (/Cannot access contents of the page|Cannot access a chrome:/i.test(m)) return "UNSUPPORTED_URL";
+  if (/Receiving end does not exist|Frame with ID .* was removed/i.test(m)) return "PAGE_CONTEXT_TIMEOUT";
+  if (/Another debugger|already attached/i.test(m)) return "DEBUGGER_BUSY";
+  return "INTERNAL";
+}
+
 // ---------- 入站：native ----------
 function handleNativeMsg(msg) {
   if (!msg || typeof msg !== "object") return;
@@ -183,11 +247,11 @@ function handleNativeMsg(msg) {
         nativePort.postMessage({ type: "response", responseToRequestId: msg.requestId, payload: result === undefined ? null : result });
       })
       .catch((e) => {
-        console.error("[bridge] rpc error", msg.method, e && e.message);
+        logRpcError(msg.method, e);
         nativePort.postMessage({
           type: "response",
           responseToRequestId: msg.requestId,
-          error: { code: e && e.code || "INTERNAL", message: e && e.message ? String(e.message) : String(e) },
+          error: { code: normalizeErrCode(e), message: e && e.message ? String(e.message) : String(e) },
         });
       });
     return;
@@ -210,7 +274,7 @@ function handleWsMsg(msg) {
     const caller = { agentName: msg.agentName, agentId: msg.agentId };
     dispatch(msg.method, msg.params || {}, caller)
       .then((result) => ws.send(JSON.stringify({ id: msg.id, ok: true, result: result === undefined ? null : result })))
-      .catch((e) => ws.send(JSON.stringify({ id: msg.id, ok: false, error: { code: e && e.code || "INTERNAL", message: e && e.message ? String(e.message) : String(e) } })));
+      .catch((e) => ws.send(JSON.stringify({ id: msg.id, ok: false, error: { code: normalizeErrCode(e), message: e && e.message ? String(e.message) : String(e) } })));
   }
 }
 
@@ -346,6 +410,10 @@ async function dispatch(method, params, caller) {
     case "bridge.disconnect": return bridgeDisconnect();
     case "bridge.ping": return { pong: Date.now(), relayTime: params.t || null };
 
+    // 自我重载：先回响应（reload 会中断自身执行，不能等它完成再回），再延迟触发。
+    // 免除手工到 chrome://extensions 点刷新的步骤。
+    case "extension.reload": return extensionReload(params);
+
     case "tabs.list": return tabsList(params);
     case "tabs.get": return tabsGet(params.tabId);
     case "tabs.active": return tabsActive();
@@ -354,6 +422,21 @@ async function dispatch(method, params, caller) {
     case "tabs.prepare": return tabsPrepare(params.tabId);
     case "tabs.close": return tabsClose(params.tabId);
     case "tabs.reload": return tabsReload(params.tabId, params);
+    // 别名：文档/调用方常用名，统一映射到既有实现，避免 UNKNOWN_METHOD
+    case "tabs.open":
+    case "tabs.new": return tabsCreate({ url: params.url, ...params });
+    case "tabs.claim":
+    case "tabs.release": {
+      // 租约账本在 host 侧（HTTP /tabs/claim|/tabs/release 才是真正的互斥来源）。
+      // 经 RPC 进来时无法登记租约，做兼容降级：claim 等价于 prepare（保证可用），
+      // release 无本地状态可清。并在 warning 里点明正确入口，避免误以为拿到了互斥租约。
+      if (method === "tabs.release") {
+        return { ok: true, tabId: params.tabId, leased: false, note: "租约由 host 管理，请用 HTTP POST /tabs/release 释放" };
+      }
+      const prep = await tabsPrepare(params.tabId);
+      return { ...prep, leased: false, note: "租约未登记（由 host 管理），请用 HTTP POST /tabs/claim 获取真实互斥租约" };
+    }
+    case "page.reload": return tabsReload(params.tabId, params);
 
     case "page.info": return pageInfo(params.tabId);
     case "page.navigate": return pageNavigate(params.tabId, params.url, params);
@@ -361,6 +444,9 @@ async function dispatch(method, params, caller) {
     case "page.forward": return pageForward(params.tabId);
     case "page.focus": return pageFocus(params.tabId);
     case "page.waitLoad": return waitForLoad(params.tabId, params.timeoutMs);
+    case "page.waitForReady": return waitForReady(params.tabId, params.timeoutMs);
+    case "page.waitForUrl": return waitForUrl(params.tabId, params);
+    case "page.waitForSelector": return waitForSelector(params.tabId, params);
 
     case "page.snapshot": return pageSnapshot(params.tabId, params);
     case "page.evaluate": return pageEvaluate(params.tabId, params);
@@ -402,6 +488,19 @@ async function dispatch(method, params, caller) {
     default:
       throw { code: "UNKNOWN_METHOD", message: `未知方法: ${method}` };
   }
+}
+
+// ---------- 扩展自我重载 ----------
+// chrome.runtime.reload() 无需额外权限。但它会立即终止当前 service worker 执行，
+// 因此必须「先回响应、再延迟触发」——否则调用方永远收不到结果，只能看到超时。
+// delayMs 默认值给足时间让响应写回 native port / ws。
+function extensionReload(params) {
+  const delayMs = Math.max(0, Math.min((params && params.delayMs) ?? 300, 5000));
+  const version = chrome.runtime.getManifest().version;
+  setTimeout(() => {
+    try { chrome.runtime.reload(); } catch (e) { /* 若被中断则忽略 */ }
+  }, delayMs);
+  return { ok: true, reloading: true, fromVersion: version, delayMs };
 }
 
 // ---------- bridge 状态 ----------
@@ -452,7 +551,7 @@ function bridgeConnect(params) {
   return saveConfig({
     host: params.host || config.host,
     port: params.port || config.port,
-    token: params.token !== undefined ? params.token : config.token,
+    token: params.token !== undefined ? normalizeToken(params.token) : normalizeToken(config.token),
     channel: params.channel || config.channel,
   }).then(() => {
     reconnectNow();
@@ -521,7 +620,13 @@ async function tabsPrepare(tabId) {
     throw { code: "TAB_DISCARDED", message: `标签页已被冻结/丢弃（${t.title || t.url}），tabs.prepare 无法静默唤醒；请改用 tabs.activate（会切到该 tab 并重载页面）` };
   }
   try { await chrome.tabs.update(tabId, { autoDiscardable: false }); } catch (e) { /* noop */ }
-  await ensureInjected(tabId);
+  try {
+    await ensureInjected(tabId);
+    clearBroken(tabId);   // 注入成功 => 上下文恢复正常，解除快速失败标记
+  } catch (e) {
+    markBroken(tabId);
+    throw e;
+  }
   return { ok: true, tabId };
 }
 async function tabsClose(tabId) {
@@ -547,9 +652,15 @@ async function pageNavigate(tabId, url, params) {
   requireTabId(tabId);
   if (!url) throw { code: "BAD_PARAMS", message: "缺少 url" };
   if (!/^(https?|file):\/\//i.test(url)) url = "https://" + url;
+  brokenTabs.delete(tabId);
   await chrome.tabs.update(tabId, { url });
   if (params.waitLoad !== false) {
-    await waitForLoad(tabId, params.timeoutMs || NAV_TIMEOUT_MS).catch(() => null);
+    await waitForLoad(tabId, params.timeoutMs || NAV_TIMEOUT_MS).catch(() => {
+      // 导航超时 = 页面上下文可能已销毁。打标记，让后续 evaluate 快速失败而不是每次空等
+      // CONTENT_CALL_TIMEOUT_MS（实测一个坏 tab 会连累后续每个调用各挂满 60s）。
+      brokenTabs.set(tabId, Date.now());
+      throw { code: "NAV_TIMEOUT", message: `导航超时(${params.timeoutMs || NAV_TIMEOUT_MS}ms): ${url}` };
+    });
   }
   const t = await chrome.tabs.get(tabId);
   return { tab: serializeTab(t) };
@@ -682,20 +793,40 @@ async function ensureInjected(tabId) {
     if (e && e.code === "UNSUPPORTED_URL") throw e;
     throw { code: "TAB_GONE", message: "标签页不存在" };
   }
+  // ⚠️ chrome.tabs.sendMessage 对「content script 不存在」不会 reject，会一直挂起。
+  // 旧标签页（扩展 reload 前打开、实例被销毁）就会命中：ping 永不返回，
+  // 外层 RPC 只能等满 CONTENT_CALL_TIMEOUT_MS（实测一个坏 tab 连累后续每个调用各挂 60s）。
+  // 这里统一加超时，把「挂起」变成「快速可判定」。
+  const pingOnce = () => withTimeout(
+    chrome.tabs.sendMessage(tabId, { type: "bridge.ping" }),
+    PING_TIMEOUT_MS,
+    "PING_TIMEOUT",
+    `content script 无响应(${PING_TIMEOUT_MS}ms)`
+  );
   try {
-    await chrome.tabs.sendMessage(tabId, { type: "bridge.ping" });
-  } catch (e) {
-    try {
-      await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
-    } catch (e2) {
-      throw { code: "PAGE_CONTEXT_TIMEOUT", message: `注入 content script 失败: ${e2 && e2.message || e2}` };
-    }
-    await new Promise((r) => setTimeout(r, 50));
-    try {
-      await chrome.tabs.sendMessage(tabId, { type: "bridge.ping" });
-    } catch (e2) {
-      throw { code: "PAGE_CONTEXT_TIMEOUT", message: `content script 注入后仍无响应: ${e2 && e2.message || e2}` };
-    }
+    await pingOnce();
+    clearBroken(tabId);
+    return;
+  } catch (e) { /* 未注入或超时：走注入流程 */ }
+  try {
+    await withTimeout(
+      chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] }),
+      INJECT_TIMEOUT_MS,
+      "PAGE_CONTEXT_TIMEOUT",
+      `注入 content script 超时(${INJECT_TIMEOUT_MS}ms)`
+    );
+  } catch (e2) {
+    markBroken(tabId);
+    if (e2 && e2.code === "PAGE_CONTEXT_TIMEOUT") throw e2;
+    throw { code: "PAGE_CONTEXT_TIMEOUT", message: `注入 content script 失败: ${e2 && e2.message || e2}` };
+  }
+  await new Promise((r) => setTimeout(r, 50));
+  try {
+    await pingOnce();
+    clearBroken(tabId);
+  } catch (e2) {
+    markBroken(tabId);
+    throw { code: "PAGE_CONTEXT_TIMEOUT", message: `content script 注入后仍无响应: ${e2 && e2.message || e2}` };
   }
 }
 
@@ -719,6 +850,9 @@ const CONTENT_CALL_TIMEOUT_MS = 30000;
 
 async function contentCall(tabId, action, args) {
   requireTabId(tabId);
+  if (isBroken(tabId)) {
+    throw { code: "PAGE_CONTEXT_TIMEOUT", message: `页面上下文失效（tab ${tabId}）；请重新 page.navigate 或 tabs.prepare 后再试` };
+  }
   await ensureInjected(tabId);
   let resp;
   try {
@@ -743,16 +877,29 @@ async function contentCall(tabId, action, args) {
 
 async function indicatorCall(tabId, payload) {
   requireTabId(tabId);
+  // sendMessage 对「页面没有 content script」会挂起而非 reject；这里加超时，
+  // 让 indicator（每个 page.* 的前置步骤）不会成为整条 RPC 的卡点。
+  const send = () => withTimeout(
+    chrome.tabs.sendMessage(tabId, { type: "bridge.indicator", ...payload }),
+    PING_TIMEOUT_MS,
+    "PING_TIMEOUT",
+    `indicator 无响应(${PING_TIMEOUT_MS}ms)`
+  );
   try {
-    const resp = await chrome.tabs.sendMessage(tabId, { type: "bridge.indicator", ...payload });
+    const resp = await send();
     return resp || { ok: true };
   } catch (e) {
     // 页面没有 indicator 实例（扩展 reload 前的旧标签页 / 实例被销毁）：按需补注入再重发。
     // indicator.js 自带幂等守卫（__AGENT_BRIDGE_INDICATOR__），重复注入无害；
     // chrome:// 等受保护页注入会失败，静默忽略。
     try {
-      await chrome.scripting.executeScript({ target: { tabId }, files: ["indicator.js"] });
-      const resp = await chrome.tabs.sendMessage(tabId, { type: "bridge.indicator", ...payload });
+      await withTimeout(
+        chrome.scripting.executeScript({ target: { tabId }, files: ["indicator.js"] }),
+        INJECT_TIMEOUT_MS,
+        "PAGE_CONTEXT_TIMEOUT",
+        `indicator 注入超时(${INJECT_TIMEOUT_MS}ms)`
+      );
+      const resp = await send();
       return resp || { ok: true };
     } catch (e2) {
       return { ok: true, skipped: true };
@@ -787,6 +934,10 @@ async function pageSnapshot(tabId, params) {
 async function pageEvaluate(tabId, params) {
   requireTabId(tabId);
   if (!params || !params.expression) throw { code: "BAD_PARAMS", message: "缺少 expression" };
+  // 该 tab 刚经历过导航超时/上下文失效：立即快速失败，避免每个调用空等 60s。
+  if (isBroken(tabId)) {
+    throw { code: "PAGE_CONTEXT_TIMEOUT", message: `页面上下文失效（tab ${tabId} 上一次导航超时）；请重新 page.navigate 或 tabs.prepare 后再试` };
+  }
   await ensureInjected(tabId);
   let resp;
   try {
@@ -831,17 +982,31 @@ async function pageEvaluate(tabId, params) {
     },
       args: [params.expression, !!params.awaitPromise],
       }),
-      CONTENT_CALL_TIMEOUT_MS,
+      EVAL_TIMEOUT_MS,
       "PAGE_CONTEXT_TIMEOUT",
-      `page.evaluate 超时(${CONTENT_CALL_TIMEOUT_MS}ms): 页面可能已导航/上下文销毁`
+      `page.evaluate 超时(${EVAL_TIMEOUT_MS}ms): 页面可能已导航/上下文销毁`
     );
   } catch (e) {
+    // 超时/失败都标记上下文失效：后续调用立即快速失败，不再逐个空等。
+    markBroken(tabId);
     if (e && (e.code === "PAGE_CONTEXT_TIMEOUT")) throw e;
     // executeScript 在页面导航/上下文销毁时报 "Cannot access contents of the page"
     throw { code: "PAGE_CONTEXT_TIMEOUT", message: `executeScript 失败: ${e && e.message || e}` };
   }
+  clearBroken(tabId);
   const out = resp && resp[0] && resp[0].result;
-  if (out && out.__type === "error") throw { code: "EVAL_ERROR", message: out.message };
+  if (out && out.__type === "error") {
+    // 严格 CSP（缺 unsafe-eval，如 github.com）/ Trusted Types 站点会让注入的 `eval(expression)`
+    // 直接抛 EvalError。CDP Runtime.evaluate 走 DevTools 通道，不受页面 CSP 与 Trusted Types 约束，
+    // 因此这里自动兜底重试一次，而不是把 EVAL_ERROR 抛给调用方。
+    const msg = String(out.message || "");
+    const cspBlocked = /Content Security Policy|unsafe-eval|Trusted Type/i.test(msg);
+    if (cspBlocked) {
+      const viaCdp = await cdpEvaluate(tabId, params);
+      if (viaCdp) return viaCdp;
+    }
+    throw { code: "EVAL_ERROR", message: out.message };
+  }
   return { result: out };
 }
 
@@ -1011,11 +1176,12 @@ async function pageInspect(tabId, params) {
         func,
         args: [params || {}],
       }),
-      CONTENT_CALL_TIMEOUT_MS,
+      EVAL_TIMEOUT_MS,
       "PAGE_CONTEXT_TIMEOUT",
-      `page.inspect 超时(${CONTENT_CALL_TIMEOUT_MS}ms): 页面可能已导航/上下文销毁`
+      `page.inspect 超时(${EVAL_TIMEOUT_MS}ms): 页面可能已导航/上下文销毁`
     );
   } catch (e) {
+    markBroken(tabId);
     if (e && (e.code === "PAGE_CONTEXT_TIMEOUT")) throw e;
     throw { code: "PAGE_CONTEXT_TIMEOUT", message: `executeScript 失败: ${e && e.message || e}` };
   }
@@ -1174,19 +1340,96 @@ function cdpScreenshot(tabId, format, quality, captureBeyondViewport) {
   });
 }
 
+// 我们自己附加的 CDP 会话（tabId 集合）。与「用户手动打开的 DevTools」区分开：
+// 只有集合内的 tab 才允许 session.send，且 session.detach / 调试目标卸载时移除。
+const cdpSessions = new Set();
+
+// ---------- CDP 兜底求值（严格 CSP / Trusted Types 站点） ----------
+// 页面 CSP 缺 'unsafe-eval' 或有 Trusted Types 时，chrome.scripting 注入的 eval() 会被拦。
+// CDP Runtime.evaluate 经 DevTools 通道执行，不受二者限制。
+// 注意：attach 期间 Chrome 会在该 tab 顶部显示「正在调试此浏览器」条，故用完立即 detach。
+function cdpEvaluate(tabId, params) {
+  const expr = params.expression;
+  const awaitPromise = !!params.awaitPromise;
+  // CDP 不共享页面的 wrap() 序列化逻辑，包一层等价实现：结果统一走 JSON 安全化。
+  const wrapped = `(function(){
+    var __wrap = function(v){
+      if (v === undefined) return { __type: "undefined" };
+      if (v === null) return null;
+      if (typeof v === "function") return { __type: "function" };
+      if (typeof v === "bigint") return { __type: "bigint", value: String(v) };
+      if (typeof Node !== "undefined" && v instanceof Node) {
+        if (v instanceof Element) return { __type: "element", tag: v.tagName, id: v.id || null, text: String(v.textContent || "").slice(0, 500), href: v.href || null, value: v.value !== undefined ? v.value : null };
+        return { __type: "node", nodeType: v.nodeType, name: v.nodeName };
+      }
+      if (typeof v === "object") {
+        try { return JSON.parse(JSON.stringify(v, function(k, val){
+          if (typeof val === "bigint") return { __type: "bigint", value: String(val) };
+          if (typeof val === "function") return { __type: "function" };
+          return val;
+        })); } catch (e) { return { __type: "unserializable", error: String(e), str: String(v).slice(0, 500) }; }
+      }
+      return v;
+    };
+    var __run = function(){ return __wrap(eval(${JSON.stringify(expr)})); };
+    return ${awaitPromise ? "Promise.resolve().then(__run)" : "__run()"};
+  })()`;
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (settled) return; settled = true; try { chrome.debugger.detach({ tabId }, () => {}); } catch (e) { /* noop */ } resolve(v); };
+    const timer = setTimeout(() => done(null), Math.min(CONTENT_CALL_TIMEOUT_MS, 20000));
+    let attached = false;
+    try {
+      chrome.debugger.attach({ tabId }, "1.3", () => {
+        if (chrome.runtime.lastError) { clearTimeout(timer); return done(null); }
+        attached = true;
+        chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+          expression: wrapped,
+          awaitPromise,
+          returnByValue: true,
+          userGesture: true,
+        }, (resp) => {
+          clearTimeout(timer);
+          if (chrome.runtime.lastError || !resp) return done(null);
+          if (resp.exceptionDetails) {
+            // 表达式本身报错：仍然返回，但标成 error，让调用方看到真实原因
+            return done(null);
+          }
+          const v = resp.result && resp.result.value;
+          done({ result: v, via: "cdp" });
+        });
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      if (attached) { try { chrome.debugger.detach({ tabId }, () => {}); } catch (e2) { /* noop */ } }
+      done(null);
+    }
+  });
+}
+
 // ---------- CDP Session ----------
 async function sessionAttach(tabId) {
   requireTabId(tabId);
+  if (cdpSessions.has(tabId)) return { attached: true, tabId, already: true };
   await new Promise((resolve, reject) => {
     chrome.debugger.attach({ tabId }, "1.3", () => {
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-      else resolve();
+      const err = chrome.runtime.lastError;
+      if (!err) { cdpSessions.add(tabId); return resolve(); }
+      const m = String(err.message || "");
+      // 我们自己已附加过（上一次 detach 漏掉 / 并发重复 attach）：视作已就绪，不报错。
+      if (/already attached/i.test(m)) { cdpSessions.add(tabId); return resolve(); }
+      // 真正的占用者是用户手动打开的 DevTools：不能抢，明确告知。
+      if (/Another debugger|already has/i.test(m)) {
+        return reject({ code: "DEBUGGER_BUSY", message: `该标签页已被其他调试器占用（通常是用户打开的 DevTools）：${m}` });
+      }
+      reject({ code: "SESSION_ATTACH_FAILED", message: m });
     });
   });
   return { attached: true, tabId };
 }
 async function sessionDetach(tabId) {
   requireTabId(tabId);
+  cdpSessions.delete(tabId);
   await new Promise((resolve) => {
     chrome.debugger.detach({ tabId }, () => resolve());
   });
@@ -1195,11 +1438,28 @@ async function sessionDetach(tabId) {
 function sessionSend(tabId, params) {
   requireTabId(tabId);
   if (!params || !params.method) throw { code: "BAD_PARAMS", message: "缺少 CDP method" };
+  if (!cdpSessions.has(tabId)) {
+    throw { code: "SESSION_NOT_ATTACHED", message: `未附加调试器（tab ${tabId}），请先调用 session.attach` };
+  }
   return new Promise((resolve, reject) => {
     chrome.debugger.sendCommand({ tabId }, params.method, params.params || {}, (resp) => {
-      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-      else resolve({ result: resp });
+      const err = chrome.runtime.lastError;
+      if (err) {
+        const m = String(err.message || "");
+        // 页面导航导致调试目标被卸载：清理本地记录，避免后续调用连环失败
+        if (/Detached while handling|not attached|Detached/i.test(m)) cdpSessions.delete(tabId);
+        return reject({ code: /Detached/i.test(m) ? "SESSION_DETACHED" : "SESSION_SEND_FAILED", message: m });
+      }
+      resolve({ result: resp });
     });
+  });
+}
+
+// 调试目标被卸载（页面导航 / tab 关闭 / 用户关闭 DevTools）时同步清理本地记录，
+// 否则 session.send 会一直对已失效的会话发命令，产生「Detached while handling command」连环报错。
+if (chrome.debugger && chrome.debugger.onDetach) {
+  chrome.debugger.onDetach.addListener((source) => {
+    if (source && source.tabId !== undefined) cdpSessions.delete(source.tabId);
   });
 }
 
@@ -1221,7 +1481,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .then((result) => sendResponse({ ok: true, result }))
       .catch((e) => sendResponse({
         ok: false,
-        error: { code: e && e.code || "INTERNAL", message: e && e.message ? String(e.message) : String(e) },
+        error: { code: normalizeErrCode(e), message: e && e.message ? String(e.message) : String(e) },
       }));
     return true;
   }
@@ -1265,6 +1525,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // ---------- 启动 ----------
+// 兜底：任何漏网的 promise rejection 会变成 chrome://extensions errors 面板里的
+// 「Uncaught (in promise)」，掩盖真实问题。这里统一记录并标记来源。
+self.addEventListener("unhandledrejection", (ev) => {
+  const e = ev && ev.reason;
+  console.warn("[bridge] unhandled rejection", e && (e.message || e));
+  ev.preventDefault();
+});
+
 chrome.runtime.onInstalled.addListener(() => {
   loadConfig().then(() => { ensureKeepAlive(); connect(); sweepStaleControlTitles(); });
 });

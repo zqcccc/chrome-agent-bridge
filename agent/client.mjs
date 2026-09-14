@@ -101,6 +101,9 @@ export class Bridge {
   async forward(tabId) { const r = await this.rpc("page.forward", { tabId }); return r.tab; }
   async focus(tabId) { return this.rpc("page.focus", { tabId }); }
   async waitLoad(tabId, timeoutMs) { return this.rpc("page.waitLoad", { tabId, timeoutMs }); }
+  async waitForReady(tabId, timeoutMs) { return this.rpc("page.waitForReady", { tabId, timeoutMs }); }
+  async waitForUrl(tabId, opts = {}) { return this.rpc("page.waitForUrl", { tabId, ...opts }); }
+  async waitForSelector(tabId, selector, opts = {}) { return this.rpc("page.waitForSelector", { tabId, selector, ...opts }); }
 
   async snapshot(tabId, opts = {}) {
     return this.rpc("page.snapshot", { tabId, mode: opts.mode || "a11y", maxDepth: opts.maxDepth, maxNodes: opts.maxNodes, includeText: opts.includeText });

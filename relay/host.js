@@ -94,6 +94,7 @@ function releaseTab(tabId, agentId) {
   tabLeases.delete(key); return { released: true, tabId };
 }
 const pending = new Map(); // requestId -> { resolve, reject, timer, method, tabId, startedAt, channel }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 同一 tab 的 page.* 请求严格串行队列；跨 tab 并行。
 // 目的：BOSS 重型 SPA 下同 tab 的 navigate/snapshot/evaluate 互相堆积导致 Host 超时。
@@ -428,6 +429,35 @@ function httpServer() {
     if (req.method === "POST" && url.pathname === "/agents/register") {
       let body = ""; req.on("data", (c) => { body += c; });
       req.on("end", () => { try { const p = JSON.parse(body || "{}"); const agentId = String(p.agentId || crypto.randomUUID()); touchAgent(agentId, p.name); send(200, { ok: true, agent: { agentId, ...agents.get(agentId) } }); } catch (e) { send(400, { ok: false, error: { code: "BAD_JSON", message: e.message } }); } }); return;
+    }
+    // 重载扩展并等待其重新连上：省去人工到 chrome://extensions 点刷新。
+    // 流程：RPC extension.reload（扩展先回响应再延迟自重载）→ 轮询 bridge.ping 直到恢复。
+    if (req.method === "POST" && url.pathname === "/extension/reload") {
+      let body = ""; req.on("data", (c) => { body += c; });
+      req.on("end", async () => {
+        try {
+          const p = JSON.parse(body || "{}");
+          const waitMs = Math.max(0, Math.min(Number(p.waitMs) || 15000, 60000));
+          const r = await requestExtension("extension.reload", { delayMs: p.delayMs ?? 300 }, 10000, "host", "host-reload");
+          const fromVersion = r && r.fromVersion;
+          // 等扩展重连：轮询 bridge.status，直到拿到版本号（重连后 service worker 是新实例）
+          const deadline = Date.now() + waitMs;
+          let reconnected = false, version = null;
+          await sleep(1200);
+          while (Date.now() < deadline) {
+            try {
+              const st = await requestExtension("bridge.status", {}, 4000, "host", "host-reload");
+              const v = st && st.version;
+              if (v) { reconnected = true; version = v; break; }
+            } catch (e) { /* 重载中，继续等 */ }
+            await sleep(500);
+          }
+          send(200, { ok: reconnected, fromVersion, version, waitedMs: waitMs });
+        } catch (e) {
+          send(502, { ok: false, error: { code: "RELOAD_FAILED", message: e && e.message || String(e) } });
+        }
+      });
+      return;
     }
     if (req.method === "POST" && (url.pathname === "/tabs/claim" || url.pathname === "/tabs/release")) {
       let body = ""; req.on("data", (c) => { body += c; });
