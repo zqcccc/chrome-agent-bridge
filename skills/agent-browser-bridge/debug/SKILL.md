@@ -1,11 +1,15 @@
 ---
 name: agent-browser-debug
-description: 浏览器页面临场 debug 通用能力。当通过 Agent Browser Bridge 操作真实浏览器遇到页面行为异常（404/风控误判、取不到内容、选择器失败、数量不对、URL 打不开）、需要理解陌生页面结构、或需要在交付前验证提取结果时使用。核心：先探查后假设、不猜类名、异常先查 DOM 再下结论、输出独立验证。首选插件内置 page.inspect / page.record RPC（一次调用拿页面结构与变化时间线）；兜底脚本 scripts/browser-debug.mjs。
+description: 浏览器页面临场 debug 通用能力。当通过 Agent Browser Bridge 操作真实浏览器遇到页面行为异常（404/风控误判、取不到内容、选择器失败、数量不对、URL 打不开）、需要理解陌生页面结构、或需要在交付前验证提取结果时使用。核心：先探查后假设、不猜类名、异常先查 DOM 再下结论、输出独立验证。首选插件内置 page.inspect / page.record RPC（一次调用拿页面结构与变化时间线）；兜底脚本 <skill 目录>/scripts/browser-debug.mjs。
 ---
 
 # 浏览器页面临场 Debug
 
+> **路径约定**：本文的 `<skill 目录>` 指本文件所在目录，`<仓库根>` = `<skill 目录>/../..`，主 CLI 为 `<仓库根>/agent/cli.mjs`。**这些位置是可推导的，不要用 `find ~` 之类全盘搜索去定位**；完整约定见根 `SKILL.md`「路径约定（读本 skill 任何命令前先看这里）」一节。
+
 在真实浏览器里干活（抓取、点选、输入、验证）时，**第一版选择器必须来自 DOM 探查，不是来自想象**。本 skill 提供探查工具 + 工作流 + 实测踩坑，适用于任何站点，不限小红书。
+
+> **进入 debug 前先确认是否命中子技能**：小红书 / BOSS 直聘 / ChatGPT / NotebookLM 有专项子技能（见根 `SKILL.md`「第一原则」的索引），其中已内置该站的风控防护与现成脚本。**先把专项脚本跑通再 debug**；直接自己写脚本绕过专项，往往既触发风控又把时间花在已解决的问题上。
 
 ## 首选：插件内置 page.inspect（不用读脚本、不用写 JS）
 
@@ -20,7 +24,7 @@ await bridge.rpc("page.inspect", { tabId, focus: "modal" });                 // 
 await bridge.rpc("page.inspect", { tabId, focus: "sel", selector: ".foo" }); // 任意选择器 dump
 ```
 
-CLI 等价：`node agent/cli.mjs inspect <tabId> [overview|links|media|scroll|modal|sel:<css>]`（在仓库根目录执行，见下方工具用法）
+CLI 等价：`node "$ROOT/agent/cli.mjs" inspect <tabId> [overview|links|media|scroll|modal|sel:<css>]`（`ROOT` 见根 SKILL.md「快速开始」，CLI 不依赖 cwd，无需 cd 到仓库根）
 
 探查函数内置在扩展 background 里（函数引用直接注入，无模板字符串转义坑），**只读、无副作用**：不点元素、不滚动页面。遇到 404/异常/取不到内容/交付前验证，**第一步就是 page.inspect**。
 
@@ -98,15 +102,15 @@ await bridge.rpc("page.record.stop", { tabId });
 export BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token)
 cd <chrome-agent-bridge 仓库根>   # 含 agent/ 与 extension/ 的代码仓库，不是 skill 目录
 
-node agent/cli.mjs inspect <tabId>                  # 页面概览
-node agent/cli.mjs inspect <tabId> links 6          # 前 6 张卡片链接 + 可见性
-node agent/cli.mjs inspect <tabId> media            # 图片/视频/live/blob
-node agent/cli.mjs inspect <tabId> scroll           # 可滚动容器
-node agent/cli.mjs inspect <tabId> modal            # 弹窗详情
-node agent/cli.mjs inspect <tabId> sel:.note-item   # 任意选择器 dump
-node agent/cli.mjs record <tabId> start             # 开始会话记录
-node agent/cli.mjs record <tabId> get               # 拉变化时间线
-node agent/cli.mjs record <tabId> stop              # 停止记录
+node "$ROOT/agent/cli.mjs" inspect <tabId>                  # 页面概览
+node "$ROOT/agent/cli.mjs" inspect <tabId> links 6          # 前 6 张卡片链接 + 可见性
+node "$ROOT/agent/cli.mjs" inspect <tabId> media            # 图片/视频/live/blob
+node "$ROOT/agent/cli.mjs" inspect <tabId> scroll           # 可滚动容器
+node "$ROOT/agent/cli.mjs" inspect <tabId> modal            # 弹窗详情
+node "$ROOT/agent/cli.mjs" inspect <tabId> sel:.note-item   # 任意选择器 dump
+node "$ROOT/agent/cli.mjs" record <tabId> start             # 开始会话记录
+node "$ROOT/agent/cli.mjs" record <tabId> get               # 拉变化时间线
+node "$ROOT/agent/cli.mjs" record <tabId> stop              # 停止记录
 ```
 
 **兜底脚本（随 skill 分发的 `scripts/browser-debug.mjs`，任何环境可用）**：
@@ -116,4 +120,4 @@ cd <skill 目录>/scripts          # 即 skills/agent-browser-bridge/scripts
 node browser-debug.mjs <tabId> [--links N|--media|--scroll|--modal|--sel "<css>"|--js "<expr>"]
 ```
 
-tabId 用 `node agent/cli.mjs tabs`（本机）或 `page.inspect` 无此能力时用 `tabs.list` RPC 现查，用户操作会变。
+tabId 用 `node "$ROOT/agent/cli.mjs" tabs`（本机）或 `page.inspect` 无此能力时用 `tabs.list` RPC 现查，用户操作会变。

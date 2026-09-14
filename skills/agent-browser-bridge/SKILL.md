@@ -1,6 +1,6 @@
 ---
 name: agent-browser-bridge
-description: 驱动用户的真实 Chrome 浏览器（本地扩展 + 本地桥）完成任务——**用户在浏览器上能做的任何事，本 skill 基本都能做**：网上查资料/搜信息、打开网页读取/查证内容、站内搜索并整理结果、抓取动态渲染或登录后页面的数据、点击/输入/滚动/截图/执行 JS/下载文件，以及登录后业务操作（填表提交、发消息、投递简历、下单、预订、管理后台操作）。最大优势：走真实 Chrome 环境与真实登录态，能进入普通自动化工具被反爬/风控拦截的页面（验证码、登录墙、无头浏览器指纹检测、滑块等），拿到登录后或动态渲染的内容——普通搜索工具拿不到的（小红书、BOSS 直聘、公众号后台、网银、论坛、需账号的站内搜索等）都从这里走。触发词：搜索、查找、检索、查询、查证、搜一下、抓取、爬数据、收集信息、打开某网页、读取网页内容、操作浏览器、在 Chrome 里点击/输入/滚动/截图、填表、提交、发消息、投递、下单、预订、下载、小红书、BOSS、登录后页面。登录约束：页面需要登录/授权/扫码/验证码时，必须先告知用户要访问的页面和原因，等待用户手动完成登录后再继续，不得替用户登录或绕过验证。若任务不需要真实登录态、通用搜索/抓取工具即可完成，优先用通用工具。
+description: 驱动用户的真实 Chrome 浏览器（本地扩展 + 本地桥）完成任务——**用户在浏览器上能做的任何事，本 skill 基本都能做**：网上查资料/搜信息、打开网页读取/查证内容、站内搜索并整理结果、抓取动态渲染或登录后页面的数据、点击/输入/滚动/截图/执行 JS/下载文件，以及登录后业务操作（填表提交、发消息、投递简历、下单、预订、管理后台操作）。最大优势：走真实 Chrome 环境与真实登录态，能进入普通自动化工具被反爬/风控拦截的页面（验证码、登录墙、无头浏览器指纹检测、滑块等），拿到登录后或动态渲染的内容——普通搜索工具拿不到的（小红书、BOSS 直聘、公众号后台、网银、论坛、需账号的站内搜索等）都从这里走。触发词：搜索、查找、检索、查询、查证、搜一下、抓取、爬数据、收集信息、调研口碑、避坑、打开某网页、读取网页内容、操作浏览器、在 Chrome 里点击/输入/滚动/截图、填表、提交、发消息、投递、下单、预订、下载、小红书、BOSS 直聘、NotebookLM、ChatGPT 网页版、登录后页面。执行规则：小红书/BOSS/ChatGPT/NotebookLM 等已有专项子技能，必须先读对应子技能 SKILL.md 并优先跑其 scripts/ 下现成脚本（自带风控防护），禁止自己从零写抓取脚本；缺功能时以现有脚本为模板改写并注明来源。登录约束：页面需要登录/授权/扫码/验证码时，必须先告知用户要访问的页面和原因，等待用户手动完成登录后再继续，不得替用户登录或绕过验证。若任务不需要真实登录态、通用搜索/抓取工具即可完成，优先用通用工具。
 ---
 
 # Agent Browser Bridge —— 让 Agent 操作日常 Chrome
@@ -24,37 +24,100 @@ description: 驱动用户的真实 Chrome 浏览器（本地扩展 + 本地桥�
 
 **什么时候不用它**：任务不需要真实登录态、通用搜索/抓取工具就能拿到结果时，优先用通用工具（更快、更省、不打扰用户的浏览器）。
 
+## 第一原则：先查子技能，用现成脚本（禁止重造）
+
+**这是本 skill 的硬性执行规则，优先级高于「快速开始」里的任何命令。**
+
+这些站点的风控是按行为特征判定的（请求频率、并发标签数、滚动节奏、DOM 遍历方式）。子技能里的 `scripts/*.mjs` 是踩过坑以后调出来的参数：内置限速与随机抖动、并发 tab 控制、验证码/404/「Security Verification」自动拦截退出、`tabs.prepare` 静默注入、受控组件的正确 setter、以及该站专属的坑（如 BOSS 的 PUA 薪资字体、chatgpt.com 的 CSP 禁止 `page.evaluate`）。**自己临时写的裸脚本没有这些防护，几轮就会把账号/会话打到风控里，而且报错信息往往看不出是被风控还是脚本 bug。**
+
+### 执行流程（命中站点时必须照做）
+
+1. **先查子技能索引**（下表）。任务站点/目标命中任一行 → **先读取对应子技能的 `SKILL.md`**，再动浏览器。
+2. **优先直接跑它给的脚本**：子技能的 `scripts/*.mjs` 自包含（不依赖 CLI / 不依赖 cwd），按文档给的命令行直接跑，不要退化成自己拼 HTTP / 自己写 `page.evaluate`。
+3. **脚本不完全贴合时，先改参数，再改脚本**：绝大多数情况改 `--max-scrolls` / `--max-results` / `--channel` / `--filter` / 选择器就够了。
+4. **确实没有的功能才自己写**，且必须满足三点：
+   - 以同类子技能脚本为**模板复制改写**（继承它的限速、拦截检测、静默 prepare、单 tab 内操作）；
+   - 沿用它的 RPC 调用方式与等待策略，不要回退成固定 `sleep`；
+   - 在交付说明里注明「子技能 X 未覆盖 Y，故基于 `scripts/Z.mjs` 改写」。
+5. **任何站点行为异常（取不到内容、数量不对、404、疑似风控）** → 读 `debug/SKILL.md`，先 `page.inspect` 探查再下结论，不要凭猜重试。
+
+### 子技能索引（命中即必须加载）
+
+| 站点 / 目标 | 子技能 | 现成脚本（`<skill 目录>/scripts/`） |
+| --- | --- | --- |
+| **小红书 xiaohongshu.com**（搜笔记、抓笔记正文、**全量评论含楼中楼二级回复**、搜用户、用户主页笔记、点点 AI 问答） | `xhs/SKILL.md` | `extract-xhs-comments.mjs`、`xhs-search-inpage.mjs`、`xhs-note-full.mjs`、`xhs-search-user.mjs`、`xhs-user-notes.mjs`、`xhs-ask-diandian.mjs` |
+| **BOSS 直聘 zhipin.com**（搜职位、筛选、读 JD、打招呼投递） | `boss/SKILL.md` | `boss-send-chat.mjs`、`boss-batch-apply.mjs`、`boss-verify-helpers.mjs` |
+| **ChatGPT chatgpt.com**（网页端提问、读回复、选模型、生图） | `chatgpt/SKILL.md` | `chatgpt-ask.mjs`、`cdp-eval.mjs`（**该站 CSP 严格，`page.evaluate` 不可用，一律走 CDP**） |
+| **NotebookLM**（新建笔记本、上传来源、提问、Studio 产物） | `notebooklm/SKILL.md` | `notebooklm/upload.mjs`、`notebooklm/ask.mjs`、`notebooklm/scripts/*.mjs`、`scripts/cdp-upload.mjs` |
+| **任何站点：页面异常 / 结构陌生 / 交付前验证** | `debug/SKILL.md` | `browser-debug.mjs`（首选仍是插件内置 `page.inspect` / `page.record`） |
+
+> 通用能力也可复用：`scripts/cdp-eval.mjs`（强 CSP 站点求值）、`scripts/cdp-upload.mjs`（注入文件上传）、`scripts/type-text.mjs`（受控组件输入）。
+
+## 路径约定（读本 skill 任何命令前先看这里）
+
+本 skill 在仓库里位于 `skills/<本目录名>/`。**所有路径都相对本 skill 目录给出**，这样 clone 到任何机器、放到任何目录都成立；**不要在文档里写死某台机器的绝对路径，也不要用 `find ~` 之类全盘搜索去定位本 skill 或 CLI**——位置是可推导的，不需要搜。
+
+| 记号 | 含义 | 解析方式 |
+| --- | --- | --- |
+| `<skill 目录>` | 本 skill 目录（`SKILL.md` 所在目录） | 由读取者自行替换；若是 symlink 请用解析后的真实路径 |
+| `<仓库根>` / `$ROOT` | 仓库根 = `<skill 目录>/../..` | `ROOT="$(cd -P <skill 目录> && pwd)/../.."`（`-P` 解引用 symlink，不能省） |
+| `<cli>` | 主 CLI `agent/cli.mjs` 的绝对路径 | `"$ROOT/agent/cli.mjs"` |
+| `scripts/xxx.mjs` | 本 skill 目录内的开箱脚本 | `<skill 目录>/scripts/xxx.mjs`，**不依赖 CLI** |
+
+说明：
+- 主 CLI 与子 skill 脚本是两套东西：子 skill 的 `scripts/*.mjs` 自包含、不依赖 `agent/cli.mjs`，**能直接用就用（强制首选）**，不要退化成裸 HTTP / 裸 `page.evaluate` 重造——见上方「第一原则：先查子技能，用现成脚本（禁止重造）」。
+- `<cli>` 是纯 HTTP 客户端，**不依赖 cwd**，给绝对路径即可，无需 `cd` 到仓库根。
+- 子 skill 文档（「专项实战」列出的各 `*/SKILL.md`）沿用本表记号。
+
+**什么时候必须用它（从 agent-browser 降级）**：主流 UGC 站点（小红书、知乎、大众点评、脉脉、淘宝、京东、Reddit 等）有严格反爬（验证码滑块、强制扫码登录、封禁无头指纹）。**一旦 `agent-browser` 打不开、被拦截、跳转登录页或内容被折叠截断，立即无缝切到本 skill**，借真实 Chrome 环境继续；不要在原工具上重试加码。前置检查在本文件「前置条件」一节。
+
 ## 前置条件（每个任务开始前必须检查）
+
+先按「第一原则」的子技能索引确认是否命中专项（命中则先读子技能、优先跑脚本），再检查下面这些。
 
 0. **登录由用户主导**：目标页面需要登录/授权/扫码/验证码时，必须先向用户说明要访问哪个页面、为什么需要登录，然后等待用户手动完成登录、确认登录成功后再继续。禁止替用户登录、绕过登录墙或静默跳过验证。用户未登录前不要继续执行后续步骤。
 1. **扩展已加载**：chrome://extensions 里有 "Agent Browser Bridge"（已解压；ID 以你本机 `chrome://extensions` 中显示的为准），开关为 On。
 2. **host 存活**：`curl -s http://127.0.0.1:8778/status` 返回 `{"ok":true,...}`。
    - **推荐 Native 模式**：不要手动 `npm start`。注册 native host 后，Chrome 按需拉起 host 进程，该进程监听 8778，Agent 连 8778 即同一进程。Chrome 关闭时进程自动退出。`status` 返回 `mode:native`。
-   - **standalone WS 模式（二选一）**：`cd /path/to/chrome-agent-bridge/relay && npm start`，host 常驻 8778，扩展用 `ws://127.0.0.1:8778/agent` 连入。`status` 返回 `mode:standalone`。
+   - **standalone WS 模式（二选一）**：`cd "$ROOT/relay" && npm start`（`$ROOT` 见下方「快速开始」）,host 常驻 8778，扩展用 `ws://127.0.0.1:8778/agent` 连入。`status` 返回 `mode:standalone`。
    - **两种模式不要同时运行**：standalone 占着 8778 时，native 拉起的进程会因端口占用退出，扩展 `auto` 通道会回退到 WS（不透明）。推荐只用 Native。
 3. **扩展已连上 host**：status 输出 `extConnected:true`。扩展 reload 或 Chrome 重启后几秒内自动重连。
 
 ## 快速开始（CLI）
 
-> CLI 依赖仓库根的 `agent/cli.mjs`，属于**本机仓库便利命令**；自包含的等价调用（RPC / HTTP）见下方「编程调用」与「HTTP 直调」——其他 Agent 若只有本 skill 目录，请用 RPC/HTTP 示例。
+> ⚠️ **先回头看「第一原则」的子技能索引**：小红书 / BOSS 直聘 / ChatGPT / NotebookLM 有专项子技能与现成脚本，**命中就先跑脚本，不要从这里开始手写裸 RPC / 裸 `page.evaluate` 抓数据**（会触发风控）。通用站点或不涉及数据抓取的单点操作才用下面这些命令。
+>
+> **CLI 就在本 skill 目录旁的仓库里（`<仓库根>/agent/cli.mjs`），用上表「路径约定」的 `$ROOT` 直接引用，不要去文件系统里搜索它。**
+>
+> ```bash
+> ROOT="$(cd -P <skill 目录> && pwd)/../.."   # 仓库根 = skill 目录的上两级
+> node "$ROOT/agent/cli.mjs" status
+> ```
+>
+> 命令：`status / tabs / active / open / snap / shot / eval / click / type / press / scroll / cursor / listen`（跑 `node "$ROOT/agent/cli.mjs"` 无参数可打印这份列表）。
+> 它只是 HTTP 客户端，**不依赖 cwd**，给绝对路径即可，无需 `cd` 到仓库根。
+>
+> 自包含的等价调用（RPC / HTTP）见下方「编程调用」与「HTTP 直调」——任何环境都能用，不依赖 CLI 的存在。
 
 ```bash
 export BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token)   # 每次 shell 都要
-cd /path/to/chrome-agent-bridge
+ROOT="$(cd -P <skill 目录> && pwd)/../.."                # 仓库根 = skill 目录的上两级
+CLI="$ROOT/agent/cli.mjs"                                # 下文的 <cli>
 
-node agent/cli.mjs status              # host 状态 + 扩展连接
-node agent/cli.mjs tabs                # 列出所有标签页（拿 tabId，用户操作会变，用前必查）
-node agent/cli.mjs open <url>          # ⚠️ 慎用：新标签页打开。优先在现有 tab 内 page.navigate；确需新开时用完立即 tabs.close
-node agent/cli.mjs eval <tabId> "<js>" # 在页面执行 JS（同步求值）
-node agent/cli.mjs click <tabId> <css选择器>
-node agent/cli.mjs type <tabId> <sel> <text>
-node agent/cli.mjs press <tabId> <key>
-node agent/cli.mjs scroll <tabId> <sel> <dir>
-node agent/cli.mjs snap <tabId>        # 页面快照（a11y 树+元素清单）
-node agent/cli.mjs shot <tabId>        # 页面截图（保存当前目录）
-node agent/cli.mjs inspect <tabId> [overview|links|media|scroll|modal|sel:<css>]  # 内置页面探查
-node agent/cli.mjs record <tabId> start|stop|status|get|clear [types:nav,modal,err,dom,console]  # 会话记录时间线
-node agent/cli.mjs listen              # 订阅页面事件
+node "$CLI" status              # host 状态 + 扩展连接
+node "$CLI" tabs                # 列出所有标签页（拿 tabId，用户操作会变，用前必查）
+node "$CLI" open <url>          # ⚠️ 慎用：新标签页打开。优先在现有 tab 内 page.navigate；确需新开时用完立即 tabs.close
+node "$CLI" eval <tabId> "<js>" # 在页面执行 JS（同步求值）
+node "$CLI" wait <tabId> ready|url|selector <match|选择器> [timeoutMs]  # 增强等待（v0.3.3+，取代固定 sleep）
+node "$CLI" click <tabId> <css选择器>
+node "$CLI" type <tabId> <sel> <text>
+node "$CLI" press <tabId> <key>
+node "$CLI" scroll <tabId> <sel> <dir>
+node "$CLI" snap <tabId>        # 页面快照（a11y 树+元素清单）
+node "$CLI" shot <tabId>        # 页面截图（保存当前目录）
+node "$CLI" inspect <tabId> [overview|links|media|scroll|modal|sel:<css>]  # 内置页面探查
+node "$CLI" record <tabId> start|stop|status|get|clear [types:nav,modal,err,dom,console]  # 会话记录时间线
+node "$CLI" listen              # 订阅页面事件
 ```
 
 ## 编程调用（推荐用于多步流程）
@@ -70,6 +133,9 @@ await bridge.register();
 const tabs = await bridge.list();
 // 多 Agent 协作时，操作前先取得 Tab 租约
 await bridge.claimTab(tabs[0].id, 120000);
+await bridge.rpc("page.waitForReady", { tabId, timeoutMs: 30000 });   // 等 readyState（v0.3.3+）
+await bridge.rpc("page.waitForUrl", { tabId, match: "search_result", timeoutMs: 15000 });
+await bridge.rpc("page.waitForSelector", { tabId, selector: ".card", timeoutMs: 30000 });
 await bridge.rpc("tabs.prepare", { tabId });  // 静默准备：注入 content script + 防后台冻结，不切激活 tab / 不聚焦窗口（v0.3.0+）
 await bridge.rpc("tabs.list");
 await bridge.rpc("page.navigate", { tabId, url });
@@ -92,6 +158,22 @@ await bridge.rpc("page.record.clear", { tabId });        // 清空时间线
 ```
 
 HTTP 直调：`POST http://127.0.0.1:8778/rpc`，头 `Authorization: Bearer <token>`，体 `{"method":"...","params":{...},"timeoutMs":20000}` → `{"ok":true,"result":{...}}`。注意 **page.evaluate 的返回值在 `result.result` 里是 JSON 字符串**，需要再 JSON.parse 一次。
+
+## 报错排查：先看 host.log，别看 chrome://extensions
+
+排查任何桥相关报错，**第一站是 `~/.chrome-agent-bridge/host.log`**（带时间戳 / method / tabId / 耗时 / 错误码，可统计）：
+
+```bash
+cd ~/.chrome-agent-bridge
+grep -o "code=[A-Z_]*" host.log | sort | uniq -c | sort -rn                              # 报错码分布
+grep "code=UNKNOWN_METHOD" host.log | grep -o "method=[a-zA-Z.]*" | sort | uniq -c | sort -rn
+grep "code=TIMEOUT" host.log | grep -o "method=[a-zA-Z.]*" | sort | uniq -c | sort -rn
+grep "tab=<id>" host.log | grep -E "TIMEOUT|note=dispatch" | head -20                   # 单 tab 时间线
+```
+
+原因：chrome://extensions 的 errors 面板**只留最近若干条、不能滚动**，且混着大量预期失败噪音；它还是 `chrome://` 协议，桥既不能注入也不能截图。
+
+**当前标签页操作报 `PAGE_CONTEXT_TIMEOUT`**（页面上下文失效，如扩展刚重载过、标签页被冻结）时，先 `tabs.prepare` 重新注入，或 `tabs.reload` 刷新页面；该错误是快速失败，不会挂死。
 
 ## 实战踩坑清单（务必先读）
 
@@ -256,16 +338,18 @@ const hasHScroll = de.scrollWidth > de.clientWidth;   // 真正的判据
 ## Agent 行为约束（所有任务、所有网站，必须遵守）
 
 1. **遇到风控/安全验证 → 立即停止，禁止疯狂重试**：页面跳转到验证码页（如小红书 `website-login/captcha` /「Security Verification」）、滑块验证、人机校验，或大量 404 /「页面不见了」时，**立即停止该站点的所有后续请求**。不要换参数重试、不要加大滚动轮数、不要重新批量打开页面、不要换个 tab 再试。停下来向用户说明，等待用户手动完成验证或风控解除后再继续。疯狂重试会加重风控，导致账号/会话被更长时间限制。桥本身（host/扩展）几乎从不是这类问题的原因：先 `/status` 确认 `extConnected:true`，桥正常则归因于站点侧风控。
+   - **例外：小红书「`.reds-alert` 软风控弹窗」不算入本条**（2026-09-14 补充）。这类弹窗（`操作太频繁，请稍后再试` / `网络异常点此重试` / `系统繁忙` / `广告屏蔽插件提示` 等）只有「我知道了」按钮，点一下就过，**不是**需要人验的硬风控。识别与一键关掉工具：`xhs/scripts/xhs-dismiss-softblock.mjs`（软风控退出码 0；硬风控退出码 2 才停下来等用户）。详见 `xhs/SKILL.md`「软风控弹窗一键处理」与 `KNOWN_ISSUES.md` 约束一·例外。
 2. **优先页面内跳转/点开，少开标签页**：目标站点的内容本身就能在页面内点开（如小红书每个笔记都是可点开的页面内弹窗），**优先在当前 tab 内 `page.navigate` 跳转或直接点开内容，不要为每条内容新开标签页**。确需新开时，用完立即 `tabs.close`。同一任务同时打开的 tab 控制在个位数，确需保留的只有搜索/列表页本身。大量并发 tab = 大量并发请求 = 更容易触发风控，也让快照/截图/tab 管理混乱。
 
-## 专项实战：按需加载子技能
+## 专项实战：子技能详解
 
-本 skill 的站点专项按需拆分，使用时才读取对应子技能的 `SKILL.md`：
+> **索引与强制使用规则见上文「第一原则：先查子技能，用现成脚本（禁止重造）」——命中站点必须先读子技能再动手。** 本节是各子技能的能力说明。
 
-- **小红书（笔记 + 全部评论深度抓取）** → 读取 `xhs/SKILL.md`（含站内搜索/筛选/频道、搜用户、用户主页全部笔记、问点点 AI 问答、一键抓取脚本 `scripts/extract-xhs-comments.mjs` 等示例脚本与执行规范）。仅当任务需要在站内检索、抓笔记/评论/用户时读取，其余任务无需加载。
-- **ChatGPT 网页版（问答/选模型/生图）** → 读取 `chatgpt/SKILL.md`（脚本 `scripts/chatgpt-ask.mjs` 一键提问读回复、`scripts/cdp-eval.mjs` CDP 求值）。仅当任务需要在 chatgpt.com 网页端提问、读回复或生成图片时读取。**注意：chatgpt.com 有严格 CSP，`page.evaluate` 不可用，一切页面内 JS 走 CDP（`cdp-eval.mjs` / `session.send`）。** 前置：用户已在浏览器登录 chatgpt.com。
-- **BOSS 直聘（职位搜索/筛选/打招呼投递）** → 读取 `boss/SKILL.md`（脚本 `scripts/boss-send-chat.mjs` 单条消息发送+送达验证、`scripts/boss-batch-apply.mjs` 批量投递模板、`scripts/boss-verify-helpers.mjs` 送达验证纯逻辑模块）。覆盖搜索 URL 与薪资档位、职位卡片提取、薪资字体加密（PUA 码点，用窗口截图 OCR）、按简历画像评分与定制打招呼、3 条消息投递、每日沟通上限与风控停止规则。仅当任务需要在 zhipin.com 找工作/投递/打招呼时读取。前置：用户已登录 zhipin.com，发送前须经用户确认。
-- **临场 Debug（任何站点通用）** → 读取 `debug/SKILL.md`（工具 `scripts/browser-debug.mjs`）。仅当页面行为异常（404/风控误判、取不到内容、数量不对、URL 打不开）、需要理解陌生页面结构、或交付前验证提取结果时读取。**先探查后假设、不猜类名、异常先查 DOM 再下结论、输出独立验证**。
+- **小红书（笔记 + 全部评论深度抓取）** → `xhs/SKILL.md`。含站内搜索/筛选/频道切换、搜用户、用户主页全部笔记、问点点 AI 问答；一键脚本 `scripts/extract-xhs-comments.mjs`（全量滚动 + 递归展开楼中楼二级回复）、`xhs-search-inpage.mjs`、`xhs-note-full.mjs`、`xhs-search-user.mjs`、`xhs-user-notes.mjs`、`xhs-ask-diandian.mjs`。**核心规约：进笔记必须展开全部评论（含二级回复）；脚本内置验证码/404 拦截自动退出。禁止自己写小红书抓取脚本。**
+- **ChatGPT 网页版（问答/选模型/生图）** → `chatgpt/SKILL.md`。脚本 `scripts/chatgpt-ask.mjs`（一键提问读回复）、`scripts/cdp-eval.mjs`（CDP 求值）。**注意：chatgpt.com 有严格 CSP，`page.evaluate` 不可用，一切页面内 JS 走 CDP（`cdp-eval.mjs` / `session.send`）。** 前置：用户已在浏览器登录 chatgpt.com。
+- **BOSS 直聘（职位搜索/筛选/打招呼投递）** → `boss/SKILL.md`。脚本 `scripts/boss-send-chat.mjs`（单条消息发送 + 送达验证）、`scripts/boss-batch-apply.mjs`（批量投递模板）、`scripts/boss-verify-helpers.mjs`（送达验证纯逻辑模块）。覆盖搜索 URL 与薪资档位、职位卡片提取、薪资字体加密（PUA 码点，用窗口截图 OCR）、按简历画像评分与定制打招呼、3 条消息投递、每日沟通上限与风控停止规则。前置：用户已登录 zhipin.com，发送前须经用户确认。
+- **NotebookLM**（新建笔记本、上传来源含视频/音频/图片/PDF、提问取回答、生成下载 Studio 产物）→ `notebooklm/SKILL.md`。脚本 `notebooklm/upload.mjs`、`notebooklm/ask.mjs`、`notebooklm/scripts/nblm-*.mjs`；文件上传走 CDP 注入。注意：网络出口需在开放地区（美国节点可用，香港/中国大陆不可用）。
+- **临场 Debug（任何站点通用）** → `debug/SKILL.md`（工具 `scripts/browser-debug.mjs`）。页面行为异常（404/风控误判、取不到内容、数量不对、URL 打不开）、需要理解陌生页面结构、或交付前验证提取结果时读取。**先探查后假设、不猜类名、异常先查 DOM 再下结论、输出独立验证**。
 
 ---
 
@@ -274,4 +358,4 @@ const hasHScroll = de.scrollWidth > de.clientWidth;   // 真正的判据
 - host 只监听 127.0.0.1；Agent 调用需 Bearer token（首次启动随机生成，0600 权限）。
 - 页面快照自动遮蔽敏感字段（密码、hidden、信用卡、验证码）为 `[value redacted]`。
 - 发送消息/提交表单前，涉及不可逆动作（投递、发消息、下单）务必先给用户确认清单。
-- 项目根目录由使用者自行决定；以下命令中的 `/path/to/chrome-agent-bridge` 请替换为实际路径。Native Messaging host 名 `com.agentbrowser.bridge`。
+- 本 skill 位于仓库 `skills/<本目录名>/`，因此**仓库根可用相对路径确定**：`ROOT="$(cd -P <skill 目录> && pwd)/../.."`（`-P` 用于解引用 symlink）。文中所有 `$ROOT/...` 都指仓库根下的路径；`agent/cli.mjs` 是纯 HTTP 客户端、不依赖 cwd，给绝对路径即可运行。Native Messaging host 名 `com.agentbrowser.bridge`。

@@ -5,7 +5,11 @@ description: agent-browser-bridge 的子技能——BOSS 直聘（zhipin.com）�
 
 # BOSS 直聘专项：职位筛选与打招呼投递
 
+> **路径约定**：本文的 `<skill 目录>` 指本文件所在目录，`<仓库根>` = `<skill 目录>/../..`，主 CLI 为 `<仓库根>/agent/cli.mjs`。**这些位置是可推导的，不要用 `find ~` 之类全盘搜索去定位**；完整约定见根 `SKILL.md`「路径约定（读本 skill 任何命令前先看这里）」一节。
+
 依赖：`agent-browser-bridge` 根 skill（host 存活、扩展已连接、用户已登录 zhipin.com）。所有浏览器操作走该桥的 `page.*` RPC 或下方自包含脚本。
+
+> **禁止自己写 BOSS 投递脚本（强制）**：本专项 `scripts/*.mjs` 内置了 BOSS 风控防护——限速与随机抖动、单 tab 内操作、`tabs.prepare` 静默注入、安全验证/频率限制/每日沟通上限自动停止、PUA 薪资字体解密、送达验证。**自己临时写的裸脚本没有这些防护，容易触发 BOSS 的频率限制与安全验证，且报错常被误判成选择器问题而继续重试，进一步加重限制。** 需求不匹配时先改参数（`--query` / `--city` / `--salary` / 评分阈值 / 模板文案）；确实缺功能才自己写，且必须**以本目录 `scripts/` 中同类脚本为模板复制改写**，继承其限速与阻断检测，并在交付说明里注明「基于 `scripts/X.mjs` 改写，因缺少 Y」。禁止从零手写。
 
 **多 Agent 要求**：每个投递 Agent 必须设置唯一 `AGENT_ID`，并在操作目标 Tab 前取得租约；不要让多个投递 Agent 共用同一 Tab。租约被占用时收到 `TAB_LEASED` 必须停止并换用自己的 Tab，不得绕过。
 ```bash

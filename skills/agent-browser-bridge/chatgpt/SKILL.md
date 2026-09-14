@@ -5,6 +5,8 @@ description: agent-browser-bridge 的子技能——网页版 ChatGPT（chatgpt.
 
 # ChatGPT 网页版专项：问答、读回复、选模型、生图
 
+> **路径约定**：本文的 `<skill 目录>` 指本文件所在目录，`<仓库根>` = `<skill 目录>/../..`，主 CLI 为 `<仓库根>/agent/cli.mjs`。**这些位置是可推导的，不要用 `find ~` 之类全盘搜索去定位**；完整约定见根 `SKILL.md`「路径约定（读本 skill 任何命令前先看这里）」一节。
+
 用真实登录态驱动 chatgpt.com：发提问 → 等回复 → 读文本/图片结果。**网页额度单端计算**，与 API 额度互不占用；网页端模型通常比 API 更新（当前实例默认模型为 GPT-5.6 Luna）。
 
 > ⚠️ 必须先读：本专项受根 SKILL.md「Agent 行为约束」与根目录 `KNOWN_ISSUES.md` 约束。遇到登录墙/额度弹窗/升级引导时，**立即停止并让用户手动处理**，禁止替用户登录、绕过验证或反复重试。
@@ -25,7 +27,9 @@ BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/cdp
 
 **可用（不走 eval）的 RPC**：`page.type` / `page.click` / `page.press` / `page.scroll` / `page.waitForSelector` / `page.waitForUrl` / `page.waitForReady` / `page.waitLoad` / `page.snapshot` / `page.inspect` / `page.screenshot` / `tabs.*` / `session.*`。**不可用**：`page.evaluate`、`page.waitFor`（带 expression 时）。
 
-## 一键提问（推荐入口）
+> **禁止自己写 ChatGPT 自动化脚本（强制）**：优先直接用 `scripts/chatgpt-ask.mjs`（一键提问读回复，已处理生成完成判定、图片轮读取、临时图片 URL 页面内 fetch）与 `scripts/cdp-eval.mjs`（CDP 求值）。自己写脚本最容易犯的错就是在这里用 `page.evaluate`——被 CSP 拦成 `EVAL_ERROR` 后误判为「选择器/表达式写错」而反复重试，既浪费轮次又可能触发网页端风控。需求不匹配时**先改参数**（`--new` / `--model` / `--timeout` / `--json`）；确实缺功能才自己写，且必须**以 `scripts/chatgpt-ask.mjs` 为模板复制改写**（继承其 CDP 求值路径与完成判定），并在交付说明里注明改写来源。禁止从零手写、禁止在本站用 `page.evaluate`。
+
+## 一键提问（推荐入口 / 默认入口）
 
 ```bash
 # 在当前 chatgpt tab 提问并读回复（自动等待生成完成，输出 JSON）

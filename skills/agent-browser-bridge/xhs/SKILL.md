@@ -5,12 +5,72 @@ description: agent-browser-bridge 的子技能——小红书（Xiaohongshu）�
 
 # 小红书专项：笔记与全部评论深度抓取
 
+> **路径约定**：本文的 `<skill 目录>` 指本文件所在目录，`<仓库根>` = `<skill 目录>/../..`，主 CLI 为 `<仓库根>/agent/cli.mjs`。**这些位置是可推导的，不要用 `find ~` 之类全盘搜索去定位**；完整约定见根 `SKILL.md`「路径约定（读本 skill 任何命令前先看这里）」一节。
+
 在小红书进行信息检索、避坑调研或口碑分析时，**切忌仅抓取正文或首屏评论**。小红书正文往往含有软广或滤镜，真实体验、踩雷槽点与深度博弈往往集中在**评论区**，尤其是折叠的**二级回复（楼中楼）**中。
 
 > ⚠️ 行为约束（必须先读）：本专项受根 SKILL.md「Agent 行为约束」和根目录 `KNOWN_ISSUES.md` 约束。遇到验证码页（`website-login/captcha` /「Security Verification」）或大量 404 时，**立即停止并等待用户手动验证**，禁止疯狂重试；**优先用页面内弹窗**查看笔记，看完关闭弹窗再点下一条，不要为每条内容开新标签页。
+>
+> ⚠️ **软风控 ≠ 终止信号**（重要，2026-09-14 实测）：小红书在操作过快/被频繁请求时会弹出 `.reds-alert` 软风控弹窗，标题如「温馨提示 / 小贴士」，正文如「操作太频繁，请稍后再试 / 网络异常，点此重试 / 系统繁忙 / 广告屏蔽插件提示」等，**弹窗上只有「我知道了」按钮，点一下就能继续**——这不是 `website-login/captcha` 那种硬风控，不要当成阻断处理。识别与一键关掉工具见下文「软风控弹窗一键处理」一节。
+
+## 软风控弹窗一键处理（2026-09-14 新增）
+
+小红书“太频繁 / 点此重试 / 广告插件提示”这类弹窗本质是 **软风控**：DOM 里 `.reds-alert-wrapper` 从 `display:none` 改为 `block` 就出现，内含「我知道了」按钮，点一下就消失，**不是 `website-login/captcha` 那种需要人验的硬风控**。以前的 xhs 脚本一律当“出现风控迹象 = 停”处理，实际上抹掉了点一下就能过的场景。
+
+新增 `scripts/xhs-dismiss-softblock.mjs` 专门区分软/硬风控、软的一键关掉、硬的回报不动。
+
+### 什么时候跑
+
+- 主动调用：在 `xhs-search-inpage.mjs` / `xhs-note-full.mjs` / `extract-xhs-comments.mjs` 任何脚本前后跑一轮，发现弹窗就关。
+- 循环防护：用 `--loop` 模式在后台跑，另起一个进程（或者包装成调用前置），主抓取脚本只管抓，遇到抓取失败/页偆不动/反复重试失败时先看这个脚本是否处理了软风控。
+- 携外环境：在另一个 tab 走“外防护”不够准——软风控是 **当前 tab 会话** 的状态，必须在同 tab 跑。
+
+### 用法
+
+```bash
+BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-dismiss-softblock.mjs <tabId>                     # 单轮巡检（默认不点，仅检测；加 --format json 看结构化报告）
+BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-dismiss-softblock.mjs <tabId> --loop             # 持续巡检，连续 --stable-rounds 轮干净才退出
+BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-dismiss-softblock.mjs <tabId> --loop --interval-ms 4000 --stable-rounds 3
+BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-dismiss-softblock.mjs <tabId> --dry-run          # 只看、不点
+```
+
+### 返回/退出码
+
+| 退出码 | 含义 | 是否动弹窗 |
+|---|---|---|
+| `0` | 无弹窗 / 软风控已全部关掉 / `--loop` 稳定退出 | 软风控已点【我知道了】/【确定】/【重试】/【×】 |
+| `1` | 发现“未知”弹窗（未匹配软/硬模式，保守不点） | 未动 |
+| `2` | 发现硬风控（账号异常 / 封禁 / 验证码 / 滑块） | 未动（调者应停、等用户） |
+
+### 哪些算“软” / “硬”（脚本内部正则，2026-09-14 实测命中）
+
+- **软风控（自动点【我知道了】等）**：操作过于频繁 / 太频繁 / 过频繁 / 稍后再试 / 请稍后 / 网络异常/不给力/超时 / 加载失败 / 点此重试 / 系统繁忙 / 请求失败 / 服务异常 / 广告屏蔽/拦截/过滤插件 / 浏览器版本过低 / 内容正在审核 / 页面没有响应 / 重新尝试后 +（刷新/重试）。一般只含【我知道了】/【确定】/【重试】按钮。
+- **硬风控（不点，停下来等用户）**：账号异常 / 被封禁 / 违规 / 实名认证 / 申诉 / Security Verification / 人机验证 / 滑块验证 / 登录异常/失效 / cookie 失效 / 网站登录 / 页面不存在 / 页面不见了 / Sorry。一般含【我要申诉】/【反馈】按钮。
+- **未知**：既不匹配软也不匹配硬的弹窗不点，输出文案与按钮列表供人工判断。
+
+### 实战配方
+
+- 手动抓取流程中加“前置检 + 失败中补检”：
+
+  ```bash
+  BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-dismiss-softblock.mjs $TAB --dry-run
+  # 如果上面看到 软风控>0，跑这个处理：
+  BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-dismiss-softblock.mjs $TAB
+  # 然后再走 xhs-search-inpage / xhs-note-full / extract-xhs-comments
+  ```
+- 走后台保护时，另起一个进程，在循环内嵌：
+
+  ```bash
+  while :; do node <skill 目录>/scripts/xhs-dismiss-softblock.mjs $TAB --loop --interval-ms 3000 --stable-rounds 2 || exit $?; sleep 5; done
+  ```
+  返回 0=干净、1=出现未知弹窗、2=硬风控（主流程应立即停并报告用户）。
+- 被脚本识为“未知”的弹窗：不要盲信分类，加新的文案到脚本顶部 `SOFT_PATTERNS` / `HARD_PATTERNS`（按你看到的实际文案加）；文案的玄学可以造个 PR 里的实测补充。
 
 ## 核心规约
 
+0. **禁止自己写小红书抓取脚本（强制）**：本专项的 `scripts/*.mjs` 内置了小红书风控防护——限速与随机抖动、单 tab 内操作、验证码页（`website-login/captcha`）/「Security Verification」/404 自动拦截退出、`tabs.prepare` 静默注入、受控组件正确 setter。**自己临时写的裸脚本（拼 HTTP、自己 `page.evaluate` 遍历 DOM、为每条笔记开新 tab、无脑 `sleep` 循环滚动）没有这些防护，几轮就会触发风控**，且报错常被误判成「选择器不对」而继续重试，进一步加重限制。
+   - 需求不匹配时：**先改参数**（`--max-scrolls` / `--max-results` / `--channel` / `--filter` / `--card`），再考虑改脚本；
+   - 确实缺功能才自己写，且必须**以本目录 `scripts/` 中同类脚本为模板复制改写**，继承其限速与拦截检测，并在交付说明里注明「基于 `scripts/X.mjs` 改写，因缺少 Y」。禁止从零手写。
 1. **展开评论区为强制动作**：只要进入小红书笔记，必须完整向下滚动评论容器加载一级评论，并**逐一点击展开所有「展开 X 条回复」/「展开更多回复」**，尽量搜集全部评论信息给下游分析。
 2. **免手写，优先使用内置专属脚本**：已内置开箱即用的自动化抓取脚本 `extract-xhs-comments.mjs`。
 
@@ -18,13 +78,13 @@ description: agent-browser-bridge 的子技能——小红书（Xiaohongshu）�
 
 ```bash
 # 自动寻找小红书标签页，全量滚动触底并递归展开所有二级回复，输出完整格式化评论树
-BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node ~/.agents/skills/agent-browser-bridge/scripts/extract-xhs-comments.mjs
+BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/extract-xhs-comments.mjs
 
 # 指定标签页 ID 与最大滚动轮数，并保存完整 JSON
-node ~/.agents/skills/agent-browser-bridge/scripts/extract-xhs-comments.mjs <tabId> --max-scrolls 35 --out xhs_comments.json
+node <skill 目录>/scripts/extract-xhs-comments.mjs <tabId> --max-scrolls 35 --out xhs_comments.json
 
 # 若在搜索结果列表页，自动打开第 0 张卡片并抓取全量评论
-node ~/.agents/skills/agent-browser-bridge/scripts/extract-xhs-comments.mjs <tabId> --card 0
+node <skill 目录>/scripts/extract-xhs-comments.mjs <tabId> --card 0
 ```
 
 脚本内置拦截：检测到验证码页 / Security Verification / 404 时自动退出并提示，不会继续滚动请求。
@@ -34,7 +94,7 @@ node ~/.agents/skills/agent-browser-bridge/scripts/extract-xhs-comments.mjs <tab
 优先用页面内搜索框搜索，不要用 URL 打开新的 search_result 标签页。一键脚本：
 
 ```bash
-BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node ~/.agents/skills/agent-browser-bridge/scripts/xhs-search-inpage.mjs <tabId> "<关键词>" [--max-results N] [--channel 全部|图文|视频|用户] [--filter "分组:选项;分组:选项"]
+BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-search-inpage.mjs <tabId> "<关键词>" [--max-results N] [--channel 全部|图文|视频|用户] [--filter "分组:选项;分组:选项"]
 ```
 
 支持的筛选分组（实测普通版 search_result 页可用，与右侧筛选面板一致；**AI 新版搜索页无筛选按钮，会自动跳过**）：
@@ -50,7 +110,7 @@ BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node ~/.agents/skills/agent-bro
 示例：搜「瑞士 一天 往返 意大利」，只看一周内的最新视频笔记：
 
 ```bash
-BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node ~/.agents/skills/agent-browser-bridge/scripts/xhs-search-inpage.mjs <tabId> "瑞士 一天 往返 意大利" --channel 视频 --filter "排序依据:最新;发布时间:一周内;笔记类型:视频" --max-results 20
+BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-search-inpage.mjs <tabId> "瑞士 一天 往返 意大利" --channel 视频 --filter "排序依据:最新;发布时间:一周内;笔记类型:视频" --max-results 20
 ```
 
 示例：看「未看过」的「最多评论」笔记：
@@ -89,10 +149,10 @@ BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node ~/.agents/skills/agent-bro
 
 ```bash
 # 笔记详情页直接抓
-BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node ~/.agents/skills/agent-browser-bridge/scripts/xhs-note-full.mjs <tabId> [--max-scrolls 30] [--out note.json]
+BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-note-full.mjs <tabId> [--max-scrolls 30] [--out note.json]
 
 # 在搜索/列表页，用页面内弹窗点开第 N 张卡片再抓（不新开 tab）
-BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node ~/.agents/skills/agent-browser-bridge/scripts/xhs-note-full.mjs <tabId> --card 0 --out note.json
+BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-note-full.mjs <tabId> --card 0 --out note.json
 
 # 输出结构化 JSON（默认是易读文本）
 ... --format json
@@ -116,7 +176,7 @@ BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node ~/.agents/skills/agent-bro
 
 ```bash
 # 默认 text 可读输出
-BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node ~/.agents/skills/agent-browser-bridge/scripts/xhs-ask-diandian.mjs <tabId> "瑞士 一天 往返 意大利"
+BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-ask-diandian.mjs <tabId> "瑞士 一天 往返 意大利"
 
 # 输出纯 markdown 回答正文（可直接投喂下游）
 ... --format markdown --out diandian.md
@@ -138,7 +198,7 @@ BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node ~/.agents/skills/agent-bro
 小红书搜索页支持搜用户（「用户」频道）。脚本：输入关键词 → Enter → 切「用户」频道 → 读用户卡片（姓名/小红书号/粉丝/笔记数/最近更新/主页链接）。
 
 ```bash
-BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node ~/.agents/skills/agent-browser-bridge/scripts/xhs-search-user.mjs <tabId> "囍欢" [--max-results 10]
+BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-search-user.mjs <tabId> "囍欢" [--max-results 10]
 ```
 
 实测要点（2026-09-10 验证通过）：
@@ -152,7 +212,7 @@ BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node ~/.agents/skills/agent-bro
 从用户主页拉取该用户发布的全部笔记列表（作者名 + 笔记 ID + 标题 + 赞数 + 封面 + 带 xsec_token 的详情链接），自动滚动加载。
 
 ```bash
-BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node ~/.agents/skills/agent-browser-bridge/scripts/xhs-user-notes.mjs <tabId> [--max-scrolls 20] [--out user_notes.json] [--format json|text]
+BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-user-notes.mjs <tabId> [--max-scrolls 20] [--out user_notes.json] [--format json|text]
 ```
 
 实测要点（2026-09-10 验证通过）：
@@ -168,17 +228,17 @@ BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node ~/.agents/skills/agent-bro
 BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) TAB=<tabId>
 
 # 1) 搜用户，拿到主页链接
-node ~/.agents/skills/agent-browser-bridge/scripts/xhs-search-user.mjs $TAB "山姆" --max-results 5
+node <skill 目录>/scripts/xhs-search-user.mjs $TAB "山姆" --max-results 5
 #    → users[].href 形如 https://www.xiaohongshu.com/user/profile/<uid>
 
 # 2) 同 tab 导航到该用户主页（用 page.navigate，勿改 location.href）
 #    然后拉全部笔记
-node ~/.agents/skills/agent-browser-bridge/scripts/xhs-user-notes.mjs $TAB --max-scrolls 20 --out user_notes.json --format json
+node <skill 目录>/scripts/xhs-user-notes.mjs $TAB --max-scrolls 20 --out user_notes.json --format json
 #    → notes[].noteId
 
 # 3) 同 tab 导航到笔记详情页（https://www.xiaohongshu.com/explore/<noteId>）
 #    逐条全量抓取（正文 + 图片 + 全部评论含楼中楼）
-node ~/.agents/skills/agent-browser-bridge/scripts/xhs-note-full.mjs $TAB --max-scrolls 30 --out note_1.json --format json
+node <skill 目录>/scripts/xhs-note-full.mjs $TAB --max-scrolls 30 --out note_1.json --format json
 ```
 
 ## 批量跨笔记抓取（多关键词 → 一次性拿全，实测补充 2026-09-10）
