@@ -61,10 +61,18 @@ async function main() {
       break;
     }
     case "open": {
+      // 默认走 tabs.resolve：复用「用户没在看」的同类 tab，没有才静默新开后台 tab。
+      // 想无条件新开用 `open <url> --new`，想激活新开的 tab 加 --active。
       const url = rest[0];
-      if (!url) return die(new Error("用法: cli open <url>"));
-      const t = await bridge.create(url);
-      console.log(`opened #${t.id}  ${t.url}`);
+      if (!url) return die(new Error("用法: cli open <url> [--new] [--active]"));
+      if (rest.includes("--new")) {
+        const t = await bridge.create(url, { active: rest.includes("--active") });
+        console.log(`opened #${t.id}  ${t.url}  (new tab)`);
+        break;
+      }
+      const r = await bridge.open(url);
+      if (rest.includes("--active")) await bridge.activate(r.tabId).catch(() => null);
+      console.log(`#${r.tabId}  ${r.tab.url}  ${r.reused ? (r.navigated ? "复用已有 tab" : "已在该 tab 打开") : "静默新开后台 tab"}  ${r.reason}`);
       break;
     }
     case "snap": {

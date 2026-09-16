@@ -164,11 +164,16 @@ const bridge = new Bridge();
 const status = await bridge.status();
 if (!status.extConnected) throw new Error("Chrome extension is not connected");
 
-const tabs = await bridge.list();
-const target = tabs.find((tab) => tab.active);
+// To open a URL: prefer `open()` — it reuses an INACTIVE same-site tab and otherwise
+// opens a silent background tab, so it never hijacks the page the user is looking at.
+const opened = await bridge.open("https://example.com");
+const tabId = opened.tabId;   // { tab, tabId, reused, navigated, reason }
+
+// Reading whatever the user is currently viewing is fine; navigating it away is not.
+const target = await bridge.active();
 if (!target) throw new Error("No active tab");
 
-const snapshot = await bridge.snapshot(target.id, { mode: "a11y" });
+const snapshot = await bridge.snapshot(tabId, { mode: "a11y" });
 console.log(snapshot.title, snapshot.url);
 ```
 

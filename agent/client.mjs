@@ -88,6 +88,9 @@ export class Bridge {
   async active() { const r = await this.rpc("tabs.active"); return r.tab; }
   async get(tabId) { const r = await this.rpc("tabs.get", { tabId }); return r.tab; }
   async create(url, opts = {}) { const r = await this.rpc("tabs.create", { url, ...opts }); return r.tab; }
+  // 打开 URL 的首选入口：复用「用户没在看」的同类 tab，否则静默新开后台 tab。
+  // 返回 { tab, tabId, reused, navigated, reason }（不是裸 tab，注意取 .tabId）
+  async open(url, opts = {}) { return this.rpc("tabs.resolve", { url, ...opts }); }
   async activate(tabId) { const r = await this.rpc("tabs.activate", { tabId }); return r.tab; }
   // 静默准备：注入 content script + 防后台冻结，不切激活 tab / 不聚焦窗口
   async prepare(tabId) { return this.rpc("tabs.prepare", { tabId }); }

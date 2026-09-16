@@ -106,7 +106,8 @@ CLI="$ROOT/agent/cli.mjs"                                # 下文的 <cli>
 
 node "$CLI" status              # host 状态 + 扩展连接
 node "$CLI" tabs                # 列出所有标签页（拿 tabId，用户操作会变，用前必查）
-node "$CLI" open <url>          # ⚠️ 慎用：新标签页打开。优先在现有 tab 内 page.navigate；确需新开时用完立即 tabs.close
+node "$CLI" open <url>          # 打开网址首选：复用「用户没在看」的同类 tab，没有才静默新开后台 tab（不抢焦点）
+node "$CLI" open <url> --new    # 无条件新开（等同 tabs.create）；再加 --active 才切到该 tab
 node "$CLI" eval <tabId> "<js>" # 在页面执行 JS（同步求值）
 node "$CLI" wait <tabId> ready|url|selector <match|选择器> [timeoutMs]  # 增强等待（v0.3.3+，取代固定 sleep）
 node "$CLI" click <tabId> <css选择器>
@@ -138,7 +139,10 @@ await bridge.rpc("page.waitForUrl", { tabId, match: "search_result", timeoutMs: 
 await bridge.rpc("page.waitForSelector", { tabId, selector: ".card", timeoutMs: 30000 });
 await bridge.rpc("tabs.prepare", { tabId });  // 静默准备：注入 content script + 防后台冻结，不切激活 tab / 不聚焦窗口（v0.3.0+）
 await bridge.rpc("tabs.list");
-await bridge.rpc("page.navigate", { tabId, url });
+const opened = await bridge.open(url);    // 打开网址走这个：复用用户没在看的同类 tab，否则静默新开后台 tab
+const tabId = opened.tabId;               // 返回 { tab, tabId, reused, navigated, reason }
+// 已有 tab 且目标页就在上面时 reused=true / navigated=false，不要重复 navigate（会整页刷新）
+if (!opened.reused || opened.navigated) await bridge.rpc("page.navigate", { tabId, url });
 await bridge.rpc("page.evaluate", { tabId, expression: "..." , awaitPromise: false });
 await bridge.rpc("page.click", { tabId, selector: "..." });
 await bridge.rpc("page.type", { tabId, selector: "...", text: "..." });
@@ -197,6 +201,41 @@ grep "tab=<id>" host.log | grep -E "TIMEOUT|note=dispatch" | head -20           
 ## 静默模式（后台操作不抢焦点，扩展 v0.3.0+）
 
 默认情况下，桥的读/写/点击/截图都**不会**把浏览器窗口拉到前台、也不会切换激活 tab——用户在用别的应用时不会被抢焦点。需要用户眼睛的步骤（登录、验证码、扫码、选文件、最终核对）才由 Agent 显式 `tabs.activate` / `page.focus` / `page.activateAndShot`。
+
+### 打开网址：`tabs.resolve`（v0.3.9+，首选入口）
+
+**收到一个网址要打开时，用这个，不要自己 `tabs.list` 里挑 tab 再 `page.navigate`。**
+
+规则：优先复用同类标签页，但**永不抢占用户正在看的页面**——聚焦窗口的活动标签页被排除在候选外；没有可用候选就**静默新开后台标签页**（`active:false`，不切标签、不聚焦窗口）。
+
+- 调用：`POST /rpc`，体 `{"method":"tabs.resolve","params":{"url":"https://..."},"timeoutMs":45000}`
+- 别名：`tabs.openUrl` / `page.open`（同一个实现）。`tabs.open` / `tabs.new` 是「无条件新开」的老别名，日常不要用。
+- 参数：
+
+  | 参数 | 类型 | 默认 | 说明 |
+  |---|---|---|---|
+  | url | string | 必填 | 目标网址（缺协议自动补 `https://`） |
+  | match | `"host"`\|`"origin"`\|`"exact"` | `host` | 同类判定：同域名 / 同 origin / URL 完全相同 |
+  | reuseActive | boolean | false | true 才允许复用用户正在看的活动 tab（一般不要开） |
+  | includePinned | boolean | false | 是否允许复用固定标签页（默认跳过，避免动用户的常驻页） |
+  | windowId | number | 不限 | 限定在某个窗口内复用/新开 |
+  | waitLoad | boolean | true | 是否等页面加载完成 |
+  | timeoutMs | number | 45000 | 导航等待超时 |
+
+- 返回：`{ tab, tabId, reused, navigated, reason }`
+  - `reused:true, navigated:false, reason:"reuse-existing-url"` → 目标页已在该 tab 打开，**不要重复 navigate**（会整页刷新、丢状态）
+  - `reused:true, navigated:true` → 复用了后台同类 tab 并已跳转
+  - `reused:false` → 静默新开后台 tab；`reason` 说明为什么没复用（最常见的就是「唯一同类标签页是用户正在看的」）
+- 最小可用示例：
+
+  ```js
+  const r = await b.rpc("tabs.resolve", { url: "https://www.xiaohongshu.com/search_result?keyword=xx" }, 45000);
+  const tabId = r.tabId;                       // 后续 page.* 全用这个
+  if (r.navigated) await b.rpc("page.waitForReady", { tabId, timeoutMs: 30000 });
+  ```
+
+  CLI：`node "$CLI" open <url>`（等价调用，输出复用/新开原因）；`open <url> --new` 才无条件新开。
+- **版本要求**：扩展 v0.3.9+。旧版返回 `UNKNOWN_METHOD` 时降级：`tabs.create({url, active:false})` 新开后台 tab（宁可多开一个，也不要去动用户当前页）。
 
 ### 操作前准备：`tabs.prepare`
 
@@ -340,6 +379,8 @@ const hasHScroll = de.scrollWidth > de.clientWidth;   // 真正的判据
 1. **遇到风控/安全验证 → 立即停止，禁止疯狂重试**：页面跳转到验证码页（如小红书 `website-login/captcha` /「Security Verification」）、滑块验证、人机校验，或大量 404 /「页面不见了」时，**立即停止该站点的所有后续请求**。不要换参数重试、不要加大滚动轮数、不要重新批量打开页面、不要换个 tab 再试。停下来向用户说明，等待用户手动完成验证或风控解除后再继续。疯狂重试会加重风控，导致账号/会话被更长时间限制。桥本身（host/扩展）几乎从不是这类问题的原因：先 `/status` 确认 `extConnected:true`，桥正常则归因于站点侧风控。
    - **例外：小红书「`.reds-alert` 软风控弹窗」不算入本条**（2026-09-14 补充）。这类弹窗（`操作太频繁，请稍后再试` / `网络异常点此重试` / `系统繁忙` / `广告屏蔽插件提示` 等）只有「我知道了」按钮，点一下就过，**不是**需要人验的硬风控。识别与一键关掉工具：`xhs/scripts/xhs-dismiss-softblock.mjs`（软风控退出码 0；硬风控退出码 2 才停下来等用户）。详见 `xhs/SKILL.md`「软风控弹窗一键处理」与 `KNOWN_ISSUES.md` 约束一·例外。
 2. **优先页面内跳转/点开，少开标签页**：目标站点的内容本身就能在页面内点开（如小红书每个笔记都是可点开的页面内弹窗），**优先在当前 tab 内 `page.navigate` 跳转或直接点开内容，不要为每条内容新开标签页**。确需新开时，用完立即 `tabs.close`。同一任务同时打开的 tab 控制在个位数，确需保留的只有搜索/列表页本身。大量并发 tab = 大量并发请求 = 更容易触发风控，也让快照/截图/tab 管理混乱。
+3. **不抢占用户正在看的标签页**：拿到一个网址要打开时走 `tabs.resolve`（见上方「打开网址」一节），它会复用**非活动**的同类 tab，没有就静默新开后台 tab。**禁止把「聚焦窗口的活动 tab」拿来 `page.navigate`**——那是用户正在看的页面，跳走就是直接把人家的页面顶掉。判断依据用 `tabs.list` 返回的 `active` 字段（或 `tabs.active`），不要凭「最后一个 tab」之类的猜测。真需要在用户当前页上操作时，先向用户说明。
+   - 脚本里不要写「找不到匹配 tab 就 fallback 到 active tab」——这条 fallback 正是抢页面的元凶。宁可静默新开后台 tab。
 
 ## 专项实战：子技能详解
 

@@ -125,11 +125,12 @@ async function resolveTargetTab() {
   if (tabId) return tabId;
   const res = await rpc("tabs.list");
   const tabs = Array.isArray(res) ? res : (res?.tabs || []);
-  const xhsTab = tabs.find(t => t.url && t.url.includes("xiaohongshu.com"));
+  // 只复用「用户没在看」的同类 tab：活动 tab 是用户正在浏览的页面，不能拿来 navigate。
+  // 没有可用候选时交给 tabs.resolve 静默新开后台 tab。
+  const xhsTab = tabs.find(t => t.url && t.url.includes("xiaohongshu.com") && !t.active);
   if (xhsTab) return xhsTab.id;
-  const activeTab = tabs.find(t => t.active);
-  if (activeTab) return activeTab.id;
-  if (tabs.length > 0) return tabs[0].id;
+  const r = await rpc("tabs.resolve", { url: "https://www.xiaohongshu.com/explore" }, 45000);
+  if (r && r.tabId) return r.tabId;
   throw new Error("未找到任何可用 Chrome 标签页");
 }
 

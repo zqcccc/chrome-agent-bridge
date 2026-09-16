@@ -40,6 +40,7 @@
 - 截图默认 CDP 静默；CDP 失败不再自动激活窗口（报 `SCREENSHOT_FAILED`），需要时显式 `allowActivate:true` 或 `page.activateAndShot`。
 - BOSS 薪资 OCR 走 macOS 窗口截图，需要 Chrome 窗口可见：静默模式下该步先 `tabs.activate` 再截。
 - 旧版扩展（无 `tabs.prepare`，返回 `UNKNOWN_METHOD`）：脚本里的 `try{...}catch{}` 会吞掉，`page.*` 内容调用自带 `ensureInjected` 自动注入，流程仍可跑；只有防冻结不生效。
+- **打开网址走 `tabs.resolve`（v0.3.9+），不要自己挑 tab**（2026-09 补充）。过去脚本里的 `tabs.find(t => t.url.includes(站点)) || tabs.find(t => t.active)` 有个坏 fallback：找不到匹配 tab 就拿用户当前正在看的页面去 `page.navigate`，直接把人家看的页面顶掉。`tabs.resolve` 把这条规则收进扩展：只复用**非活动**的同类 tab（排除聚焦窗口的活动页、pinned、discarded），没有就 `active:false` 静默新开后台 tab。**自己写脚本时也不要再写「fallback 到 active tab」这句。**
 
 ## 已知状态：后台 tab 节流（静默模式的代价）
 

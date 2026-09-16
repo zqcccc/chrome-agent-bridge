@@ -423,6 +423,11 @@ async function dispatch(method, params, caller) {
     case "tabs.close": return tabsClose(params.tabId);
     case "tabs.reload": return tabsReload(params.tabId, params);
     // 别名：文档/调用方常用名，统一映射到既有实现，避免 UNKNOWN_METHOD
+    // 打开 URL 的首选入口：复用「用户没在看」的同类标签页，否则静默新开后台标签页。
+    // tabs.create/别名只做「无条件新开」，日常不应用它打开网址。
+    case "tabs.resolve":
+    case "tabs.openUrl":
+    case "page.open": return tabsResolve(params);
     case "tabs.open":
     case "tabs.new": return tabsCreate({ url: params.url, ...params });
     case "tabs.claim":
@@ -607,6 +612,87 @@ async function tabsActivate(tabId) {
   await chrome.tabs.update(tabId, { active: true });
   try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (e) { /* noop */ }
   return { tab: serializeTab(tab) };
+}
+// 打开一个 URL：优先复用同类「用户没在看」的标签页，绝不抢占用户正在浏览的页面。
+//
+// 复用候选默认排除：聚焦窗口的活动标签页（= 用户正在看，navigate 它会把人家的页面顶掉）、
+// pinned、discarded、非 http(s)/file。没有可用候选时静默新开后台标签页
+// （active:false，不切标签、不聚焦窗口）。
+//
+// 参数：{ url, match: "host"|"origin"|"exact", reuseActive, includePinned, windowId, waitLoad, timeoutMs }
+// 返回：{ tab, tabId, reused, navigated, reason }
+async function tabsResolve(params) {
+  let url = params && params.url;
+  if (!url) throw { code: "BAD_PARAMS", message: "缺少 url" };
+  if (!/^(https?|file):\/\//i.test(url)) url = "https://" + url;
+  const match = (params && params.match) || "host";
+  const reuseActive = !!(params && params.reuseActive);
+  const includePinned = !!(params && params.includePinned);
+  const windowId = params && params.windowId;
+  const waitLoad = !(params && params.waitLoad === false);
+  const timeoutMs = (params && params.timeoutMs) || NAV_TIMEOUT_MS;
+
+  // 「用户正在看」= 聚焦窗口的活动标签页。未聚焦窗口的 active tab 不打扰用户，可复用。
+  const protectedIds = new Set();
+  if (!reuseActive) {
+    let focusedWindowId = null;
+    try { const w = await chrome.windows.getLastFocused({}); focusedWindowId = w && w.id; } catch (e) { /* noop */ }
+    const all = await chrome.tabs.query(windowId !== undefined ? { windowId } : {});
+    for (const t of all) {
+      if (!t.active) continue;
+      if (focusedWindowId == null || t.windowId === focusedWindowId) protectedIds.add(t.id);
+    }
+  }
+
+  const allTabs = await chrome.tabs.query(windowId !== undefined ? { windowId } : {});
+  const sameKind = allTabs.filter((t) => urlMatches(t.url || "", url, match));
+  const protectedSameKind = sameKind.filter((t) => protectedIds.has(t.id)).length;
+  const candidates = sameKind
+    .filter((t) => !protectedIds.has(t.id))
+    .filter((t) => includePinned || !t.pinned)
+    .filter((t) => !t.discarded)
+    .filter((t) => /^(https?|file):/.test(t.url || ""))
+    .sort((a, b) => b.index - a.index);   // 优先最近打开的（靠右）
+
+  let lastErr = null;
+  for (const cand of candidates) {
+    try {
+      await tabsPrepare(cand.id);   // 静默注入 + 防后台冻结
+      if (cand.url === url) {
+        // 目标页已在该 tab 打开：不重复导航（会整页刷新，丢状态且多发一次请求）
+        const t = await chrome.tabs.get(cand.id);
+        return { tab: serializeTab(t), tabId: cand.id, reused: true, navigated: false, reason: "reuse-existing-url" };
+      }
+      const r = await pageNavigate(cand.id, url, { waitLoad, timeoutMs });
+      return { tab: r.tab, tabId: cand.id, reused: true, navigated: true, reason: "reuse-inactive-tab" };
+    } catch (e) {
+      lastErr = e;
+      // 换下一个候选；全部失败则落到新建
+    }
+  }
+
+  const props = { url, active: false };   // 静默：不切激活标签、不聚焦窗口
+  if (windowId !== undefined) props.windowId = windowId;
+  const created = await chrome.tabs.create(props);
+  try { await chrome.tabs.update(created.id, { autoDiscardable: false }); } catch (e) { /* noop */ }
+  if (waitLoad) await waitForLoad(created.id, timeoutMs).catch(() => null);
+  const t = await chrome.tabs.get(created.id);
+  return {
+    tab: serializeTab(t), tabId: created.id, reused: false, navigated: true,
+    reason: candidates.length
+      ? `同类标签页不可用，已静默新开（最后一个错误 ${normalizeErrCode(lastErr)}）`
+      : (protectedSameKind ? `同类标签页只有 ${protectedSameKind} 个且正在被用户看，已静默新开` : "无同类标签页，已静默新开"),
+  };
+}
+function urlMatches(tabUrl, targetUrl, mode) {
+  if (mode === "exact") return tabUrl === targetUrl;
+  try {
+    const a = new URL(tabUrl), b = new URL(targetUrl);
+    if (mode === "origin") return a.origin === b.origin;
+    return a.hostname === b.hostname;   // 默认 host：同域名即视为同类（含子域不同端口）
+  } catch (e) {
+    return tabUrl === targetUrl;
+  }
 }
 // 静默准备：保证 content script 已注入 + 目标 tab 不会被后台冻结/回收。
 // 全程不切 active tab、不聚焦窗口——用户在用别的应用时不会被抢焦点。

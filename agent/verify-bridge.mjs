@@ -40,8 +40,9 @@ for (const m of ["page.waitForReady", "page.waitForUrl", "page.waitForSelector"]
 }
 
 // 2. 文档里写了但没实现的别名
-for (const m of ["tabs.open", "tabs.new", "page.reload", "tabs.claim", "tabs.release"]) {
-  const r = await rpc(m, { tabId: 1, url: "https://example.com", timeoutMs: 1 });
+for (const m of ["tabs.resolve", "tabs.openUrl", "page.open", "tabs.open", "tabs.new", "page.reload", "tabs.claim", "tabs.release"]) {
+  // active:false —— 别名探测只是验证「方法已注册」，别把浏览器切到新 tab（污染用户当前页）
+  const r = await rpc(m, { tabId: 1, url: "https://example.com", active: false, timeoutMs: 1 });
   const isUnknown = r.error?.code === "UNKNOWN_METHOD";
   check(`别名 ${m} 已兼容`, !isUnknown, isUnknown ? "UNKNOWN_METHOD" : `返回 ${r.error?.code || "ok"}`);
 }
