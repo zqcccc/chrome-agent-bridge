@@ -1,234 +1,206 @@
 # Agent Browser Bridge
 
-> macOS + Google Chrome 的本地 Agent 浏览器桥。面向开发者和 Agent 基础设施使用，不是隔离浏览器或安全沙箱。
+**一句话：你在 Chrome 里能做的事，让 AI 替你做。**
 
-[Security model](SECURITY.md) · [MIT License](LICENSE)
+装上它之后，你的 AI 助手（Claude Code / Codex / 任何支持 Skill 的 Agent）就能直接操作你正在用的 Chrome：打开网页、读内容、点击、填表、截图、抓取登录后才能看到的数据——用的是**你自己的浏览器和登录态**，不是无头模拟器。
 
-通用浏览器桥：让本地 Agent 通过安全通道接管你日常使用的 Chrome——列出/管理标签页、导航、读取页面、点击、输入、滚动、截图。
+[安全说明](SECURITY.md) · [给 AI Agent 的接入指南](docs/AI-INTEGRATION.md) · [MIT License](LICENSE)
 
-## 给 AI Agent 的一句话接入指令
+---
 
-把下面这句话直接复制给你的 AI Agent：
+## 装完能干什么
 
-```text
-请从 https://github.com/zqcccc/chrome-agent-bridge.git 克隆 Agent Browser Bridge，并阅读仓库中的 docs/AI-INTEGRATION.md、SECURITY.md 和 skills/agent-browser-bridge/SKILL.md，按照接入指南完成 macOS + Google Chrome 的本地配置。请在执行任何修改系统、Chrome 设置或网页不可逆操作前先向我说明并获得确认；不要输出或提交 ~/.chrome-agent-bridge/token。最后用 /status 和 agent/cli.mjs tabs 验证连接，并告诉我还需要我手动完成哪些步骤。
+| 你想做的事 | 直接跟 AI 说 |
+|---|---|
+| 查资料 | 「去小红书搜 XX 的口碑，把评论区吐槽整理出来」 |
+| 抓数据 | 「把 BOSS 直聘上这个筛选条件下前 20 个岗位的 JD 抓成表格」 |
+| 读登录后的页面 | 「打开我公众号后台，看看昨天那篇的数据」 |
+| 填表 / 提交 | 「帮我在这个后台把这条记录的状态改成已审核」 |
+| 看页面长什么样 | 「截个图给我看看这个页面现在渲染成什么样」 |
+
+普通 AI 工具打不开的页面（要扫码登录、有验证码、反爬、内容动态渲染），它都能进——因为那就是你在用的真实 Chrome。
+
+**反过来，什么时候别用它**：任务不需要登录态、通用搜索/抓取工具就能拿到结果时，用通用工具更快，也不打扰你的浏览器。
+
+---
+
+## 30 秒安装
+
+### 第 1 步：装 Chrome 扩展
+
+1. 下载本仓库：`git clone https://github.com/zqcccc/chrome-agent-bridge.git`
+2. 打开 `chrome://extensions`，右上角开「开发者模式」
+3. 点「加载已解压的扩展程序」，选仓库里的 `extension/` 目录
+4. 复制卡片上显示的**扩展 ID**（32 位字母，每人不同）
+
+### 第 2 步：注册本地桥（一条命令）
+
+```bash
+cd chrome-agent-bridge/relay
+bash install-host.sh <刚才复制的扩展ID>
 ```
 
-设计与 Codex（ChatGPT for Chrome）、Claude（Claude in Chrome）插件的做法一致：**装进你日常使用的 Chrome 里**，直接操作真实浏览器、真实登录态，而不是像 Playwright 那样另起一个无头浏览器。本项目的通道设计、页面感知与视觉指示器均参考了两家官方扩展的实现。
+然后**完全退出 Chrome 再重新打开**（不是关窗口，是 Cmd+Q）。
 
-## 架构
+这条命令会做两件事：告诉 Chrome「这个扩展可以跟我本机的桥通信」，并首次启动时在 `~/.chrome-agent-bridge/token` 生成一个本地密钥。
 
-```
-┌─────────────┐   Native Messaging (stdio, 4字节长度+JSON)    ┌──────────────────┐
-│  你的 Chrome │ ◄────────────────────────────────────────────►│                  │
-│  (Chrome profile)│          或 WebSocket (ws://127.0.0.1)      │  本地桥 host      │
-│             │                                                │  relay/host.js   │
-│  Agent      │                                                │  :8778           │
-│  Browser    │                                                │                  │
-│  Bridge 扩展 │                                                │  HTTP /rpc       │
-│  (MV3)      │                                                │  WS /agent       │
-└─────────────┘                                                │  WS /bridge      │
-                                                               └────────┬─────────┘
-                                                                        │ HTTP /rpc (Bearer token)
-                                                                        ▼
-                                                               ┌──────────────────┐
-                                                               │ Agent 客户端      │
-                                                               │ agent/cli.mjs    │
-                                                               │ agent/client.mjs │
-                                                               └──────────────────┘
+### 第 3 步：验证
+
+```bash
+curl -s http://127.0.0.1:8778/status
 ```
 
-- **扩展（extension/）**：MV3 后台脚本 + 页面注入脚本。负责连接本地桥（Native Messaging 优先，失败自动回退 WebSocket）、RPC 分发、标签页管理、页面快照与操作、截图、导航等待。Native 连接建立后会先发送 hello 握手消息。
-- **本地桥（relay/）**：既是 Native Messaging host 进程，又是 HTTP/WS 服务端。单进程双角色：Chrome 通过 native 或 ws 连进来，Agent 通过 HTTP/WS 连进来，两边消息转发。
-- **Agent 客户端（agent/）**：给 Agent 用的 JS 客户端与命令行工具，内置 Agent 身份标识。
+看到 `"extConnected":true` 就装好了。
+
+### 第 4 步（可选）：让 AI 知道怎么用它
+
+装配套 Skill，AI 才会主动用这个桥：
+
+```bash
+clawhub install agent-browser-bridge
+```
+
+装完之后，你直接跟 AI 说「去小红书搜 XX」就行，不用教它。
+
+> 不用 ClawHub 也行：把这句丢给你的 AI 即可（它会自己读文档完成配置）：
+>
+> ```text
+> 请从 https://github.com/zqcccc/chrome-agent-bridge.git 克隆 Agent Browser Bridge，
+> 并阅读仓库中的 docs/AI-INTEGRATION.md、SECURITY.md 和 skills/agent-browser-bridge/SKILL.md，
+> 按照接入指南完成 macOS + Google Chrome 的本地配置。
+> 请在执行任何修改系统、Chrome 设置或网页不可逆操作前先向我说明并获得确认；
+> 不要输出或提交 ~/.chrome-agent-bridge/token。
+> 最后用 /status 和 agent/cli.mjs tabs 验证连接。
+> ```
+
+---
+
+## 更新
+
+三个部件分开更新，各管各的：
+
+| 部件 | 怎么更新 | 频率 |
+|---|---|---|
+| **Skill**（AI 的操作手册） | `clawhub update` | 最勤，跟着功能走 |
+| **扩展**（Chrome 里那个） | `git pull` 后在 `chrome://extensions` 点一下刷新（或 `node agent/cli.mjs reload-ext`） | 有新能力时 |
+| **本地桥 host** | `git pull` 后重跑 `bash install-host.sh <扩展ID>`，重启 Chrome | 跟扩展一起 |
+
+扩展因为没上架 Chrome 商店，不会自动更新。**该不该更新、更新了什么**，写在 skill 里的 [`skills/agent-browser-bridge/CHANGELOG.md`](skills/agent-browser-bridge/CHANGELOG.md)——用之前让 AI 查一下当前版本对不对。
+
+查自己装的扩展版本：
+
+```bash
+export BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token)
+node agent/cli.mjs verify
+# ✓ 扩展版本 >= 0.3.3（已加载修复后的代码）  → 实际 0.3.9
+```
+
+---
+
+## 常见问题
+
+**`/status` 里 `extConnected:false`**
+扩展没连上。看 `~/.chrome-agent-bridge/host.log` 里的报错码：
+
+```bash
+grep -o "code=[A-Z_]*" ~/.chrome-agent-bridge/host.log | sort | uniq -c | sort -rn
+```
+
+最常见的两个原因：一是 `install-host.sh` 里的扩展 ID 填错了（扩展重新加载后 ID 会变，要重跑一次脚本）；二是 Chrome 没重启。
+
+**页面操作报 `PAGE_CONTEXT_TIMEOUT`**
+扩展刷新后旧标签页里的脚本实例失效了。刷新那个页面，或对它先跑一次 `node agent/cli.mjs` 的注入。
+
+**`chrome://` 开头的页面操作不了**
+正常，Chrome 不允许往这类页面注入脚本。
+
+**会遇到验证码 / 登录墙吗**
+会。这是设计的一部分：AI 不会替你登录、不会绕过验证。它停下来告诉你「需要你手动登录一下」，你登完它继续。
+
+**安全吗**
+本地桥只监听 `127.0.0.1`，不对外网开放；调用要带 token；密码、验证码这类字段在页面快照里会自动打码，不会进 AI 的上下文。详见 [SECURITY.md](SECURITY.md)。
+
+---
+
+## 它是怎么工作的
+
+```
+你的 Chrome（真实登录态）
+    │  Native Messaging
+    ▼
+本地桥 host（127.0.0.1:8778）
+    │  HTTP / WS + Bearer token
+    ▼
+你的 AI 助手
+```
+
+- **扩展**（`extension/`）：装在 Chrome 里，负责读页面、点击、输入、截图
+- **本地桥**（`relay/`）：本机 Node 进程，转发 AI 和扩展之间的消息
+- **AI 客户端**（`agent/`）：给 AI 用的命令行和 JS 库
+- **Skill**（`skills/agent-browser-bridge/`）：教 AI 怎么用这套东西、哪些坑要避开
+
+跟 ChatGPT for Chrome、Claude in Chrome 的思路一样：**装进你日常用的浏览器**，而不是另开一个无头浏览器。
+
+### 命令行用法
+
+```bash
+export BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token)
+
+node agent/cli.mjs status              # 状态和连接
+node agent/cli.mjs tabs                # 列出所有标签页（拿 tabId）
+node agent/cli.mjs open <url>          # 打开网址（不抢你正在看的标签页）
+node agent/cli.mjs snap <tabId>        # 页面快照
+node agent/cli.mjs shot <tabId>        # 截图
+node agent/cli.mjs click <tabId> "button[type=submit]"
+node agent/cli.mjs type <tabId> "input#q" "要输入的话"
+node agent/cli.mjs wait <tabId> selector ".result"   # 等元素出现
+node agent/cli.mjs verify              # 回归自检，改完代码跑一次
+```
+
+### 代码调用
+
+```js
+import { Bridge } from "./agent/client.mjs";
+const bridge = new Bridge({ port: 8778, token: process.env.BRIDGE_TOKEN });
+await bridge.rpc("tabs.list");
+await bridge.rpc("page.snapshot", { mode: "a11y" });
+await bridge.rpc("page.click", { selector: "#submit" });
+```
+
+完整的 RPC 清单、错误码、多 Agent 并行与 Tab 租约、CDP 直通等，见 [docs/AI-INTEGRATION.md](docs/AI-INTEGRATION.md) 和 [`skills/agent-browser-bridge/SKILL.md`](skills/agent-browser-bridge/SKILL.md)。
+
+---
 
 ## 目录结构
 
 ```
 chrome-agent-bridge/
-├── extension/            # Chrome MV3 扩展
-│   ├── manifest.json     # v0.2.0
-│   ├── background.js     # 双通道连接管理、RPC 分发、截图、导航等待
-│   ├── content.js        # 页面感知（a11y 树/元素清单）+ 操作 + 敏感字段遮蔽
-│   ├── indicator.js      # 幽灵光标 + 点击涟漪 + 停止按钮（视觉指示器）
-│   ├── popup.html/js     # 工具栏弹窗
-│   ├── options.html/js   # 设置页（通道 / host / token）
-│   └── icons/            # 16/32/48/128 图标
-├── relay/
-│   ├── host.js           # 本地桥（native host + HTTP/WS 服务）
-│   ├── ws-server.js      # 零依赖 WebSocket 服务端（支持大帧截图）
-│   ├── host.sh           # node 发现 + 启动包装
-│   ├── install-host.sh   # 注册 native host 到 Chrome（需扩展 ID）
-│   ├── generate-icons.js # 图标生成
-│   └── test.js           # 集成测试
-├── agent/
-│   ├── client.mjs        # Bridge 客户端类
-│   └── cli.mjs           # 命令行工具
-├── docs/
-│   └── AI-INTEGRATION.md    # 给 AI Agent 的接入与操作指南
-├── skills/
-│   └── agent-browser-bridge/ # 配套 Agent Skill（可选）
-├── SECURITY.md
-├── LICENSE
-└── README.md
+├── extension/               # Chrome MV3 扩展
+├── relay/                   # 本地桥（native host + HTTP/WS 服务）
+├── agent/                   # AI 客户端（cli.mjs / client.mjs）
+├── docs/AI-INTEGRATION.md   # 给 AI Agent 的接入与操作指南
+└── skills/
+    └── agent-browser-bridge/  # 配套 Skill（含 xhs/ boss/ chatgpt/ notebooklm/ 子技能）
 ```
 
-## 安装
-
-当前项目面向 macOS + Google Chrome。`skills/agent-browser-bridge/` 是可选的 Agent 使用说明和辅助脚本，不参与 relay/extension 的运行时依赖。
-
-如果你希望让 AI Agent 使用本项目，请同时阅读 [AI Agent 接入指南](docs/AI-INTEGRATION.md)。它把“扩展、relay、Token、RPC、Skill”这些概念和接入步骤拆成了可执行的检查清单。
-
-### 1. 加载扩展
-
-1. 打开 `chrome://extensions`，右上角开启「开发者模式」
-2. 点「加载已解压的扩展程序」，选择 `extension/` 目录
-3. 记下扩展卡片上显示的 ID（每个本地安装的 ID 可能不同）
-
-### 2. 启动本地桥
-
-> 如果使用推荐的 Native 模式，请跳过本节，先完成下一节的 Native Messaging 注册。Native 模式不需要手动运行 `npm start`。
+## 发布 Skill
 
 ```bash
-cd relay
-npm start                # 等价于 node host.js --standalone
-# 首次启动生成 token，保存在 ~/.chrome-agent-bridge/token，日志在 ~/.chrome-agent-bridge/host.log
+clawhub login
+clawhub publish ./skills/agent-browser-bridge \
+  --slug agent-browser-bridge --version 0.3.9 \
+  --tags latest,browser,chrome --changelog "见 CHANGELOG.md"
 ```
-
-端口默认 `8778`，可用 `--port` 修改。
-
-### 3. 注册 Native Messaging Host（可选，推荐）
-
-```bash
-cd /path/to/chrome-agent-bridge/relay
-bash install-host.sh <你的扩展ID>
-```
-
-注意：`install-host.sh` 是 Shell 脚本，使用 `bash` 执行，不要使用 `node install-host.sh`。
-
-注册后完全退出并重新打开 Chrome，或重新加载扩展。Native Messaging 与 ChatGPT/Claude 插件同款通道，无需 HTTP 端口暴露给扩展。
-
-> **两种运行模式（二选一，推荐 Native）**
-> - **Native 模式（推荐）**：不启动 standalone host。Chrome 通过 Native Messaging 按需拉起 `host.js`，该进程自己监听 8778；Agent 连 8778 即是同一进程。Chrome 关闭连接时进程自动退出，无需常驻。`/status` 返回 `mode:native`。
-> - **standalone WS 模式**：手动启动 `npm start`（host 常驻 8778），扩展通过 `ws://127.0.0.1:8778/agent` 连接。`/status` 返回 `mode:standalone`。
-> - **两种模式不要同时运行**：standalone 占着 8778 时，native 拉起的进程会因端口占用自动退出，扩展 `auto` 通道会回退到 WS（已内置该逻辑，但不透明）。推荐只用 Native。
-> - 不要把可靠性建立在“手动反复重启 host”上：Native 模式下 Chrome 关闭即退出、重连即拉起新进程；standalone 模式下进程异常会在 `/status` 体现为 `extConnected:false`。
-
-### 4. 配置扩展连接
-
-打开扩展设置页：`chrome-extension://<扩展ID>/options.html`
-
-- 通道：默认 `auto`（优先 Native Messaging，失败回退 WebSocket）
-- Relay 端口：`8778`
-- Token：粘贴 `~/.chrome-agent-bridge/token` 的内容
-- 点「保存并重连」
-
-连接成功后设置页会显示「已连接」，host 状态接口也会显示 `extConnected: true`。
-
-## 用法
-
-### 状态检查
-
-```bash
-curl http://127.0.0.1:8778/status
-# {"ok":true,"name":"com.agentbrowser.bridge","version":"0.2.0","channel":"disconnected","extConnected":false,...}
-```
-
-### Agent CLI（node agent/cli.mjs <cmd>）
-
-| 命令 | 说明 |
-|---|---|
-| `status` | 显示 host 状态与扩展连接 |
-| `tabs` | 列出所有标签页 |
-| `active` | 当前激活标签页 |
-| `open <url>` | 新标签页打开 URL |
-| `snap [tabId]` | 页面快照（a11y 树 + 元素清单） |
-| `shot [tabId]` | 页面截图（保存到当前目录） |
-| `eval <js>` | 在页面执行 JS |
-| `click <sel>` | 点击元素（CSS 选择器） |
-| `type <sel> <text>` | 输入文本 |
-| `press <key>` | 按键（Enter/Tab/Escape/...） |
-| `scroll <sel> <dir>` | 滚动 |
-| `cursor on/off` | 显示/隐藏幽灵光标 |
-| `listen` | 订阅页面事件 |
-
-示例：
-
-```bash
-export BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token)
-node agent/cli.mjs tabs
-node agent/cli.mjs open https://example.com
-node agent/cli.mjs snap
-node agent/cli.mjs click "button[type=submit]"
-node agent/cli.mjs shot
-```
-
-### 编程调用（agent/client.mjs）
-
-```js
-import { Bridge } from "./agent/client.mjs";
-const bridge = new Bridge({ port: 8778, token: "...", agentId: "research-agent" });
-await bridge.register("research-agent");
-const tabs = await bridge.list();
-await bridge.claimTab(tabs[0].id); // 可选：声明 Tab 所有权
-await bridge.rpc("tabs.list");
-await bridge.rpc("page.snapshot", { mode: "a11y" });
-await bridge.rpc("page.click", { selector: "#submit" });
-await bridge.rpc("page.screenshot");
-await bridge.releaseTab(tabs[0].id);
-```
-
-## 通道协议
-
-### 扩展 ↔ 本地桥（Native Messaging）
-
-- 请求：`{"type":"request","requestId":N,"method":"...","params":{...}}`，前加 4 字节小端长度
-- 响应：`{"type":"response","responseToRequestId":N,"payload":...|"error":...}`
-
-### Agent ↔ 本地桥（HTTP/WS，JSON-RPC）
-
-- HTTP POST `/rpc`：`{"method":"...","params":{...},"timeoutMs":...}` + `Authorization: Bearer <token>`
-- WS `/bridge`：`{"id":N,"method":"...","params":{...}}` → `{"id":N,"ok":true,"result":...}`；事件 `{"type":"event","event":"...","payload":...}`
-
-## 能力清单
-
-- **标签页**：list / active / open / activate / close / update
-- **页面感知**：a11y 树（role 推断、可读名、敏感字段遮蔽为 `[value redacted]`）、元素清单、全文、完整 DOM
-- **页面操作**：click / type / press / scroll / hover / focus / select / waitFor
-- **截图**：CDP `Page.captureScreenshot`（支持整页）→ 兜底 `tabs.captureVisibleTab`
-- **导航等待**：`webNavigation.onCommitted` + 轮询兜底，默认 45s 超时；另提供 `page.waitForUrl`/`page.waitForReady`/`page.waitForSelector` 按条件等待（BOSS 重型 SPA 不依赖固定 sleep）
-- **导航安全**：导航必须用 `page.navigate`（`chrome.tabs.update`），**禁止用 `page.evaluate` 改 `location.href`**（会销毁执行上下文导致 RPC 无法返回）
-- **多 Agent 并行与租约**：多个 Agent 可同时连接；不同 Tab 并行；可用 Tab lease 明确分配所有权，避免同一 Tab 的业务流程互相干扰
-- **同 tab 串行**：同一 tab 的 `page.*`/`session.*` 请求在 host 端严格串行，跨 tab 并行；单个请求超时不级联
-- **错误码**：`TIMEOUT`/`EXT_DISCONNECTED`/`NAV_TIMEOUT`/`PAGE_CONTEXT_TIMEOUT`/`CONTENT_TIMEOUT`/`TAB_BUSY`，含 method/tabId/channel/耗时，日志不含 token 与页面内容
-- **接管状态与视觉指示器**：Agent 对页面发出控制请求时，Chrome 标签标题会加上 `● Agent 接管中` 前缀，扩展工具栏图标显示蓝色 `ON` 徽标，页面右上角也显示「Agent 接管中」；连续 12 秒没有新的控制请求时自动切换为「Agent 已放开」，点击「停止 Agent」也会立即放开并清除标记。另保留幽灵光标、点击涟漪和停止按钮（页面内 `agent-bridge-cursor` / `agent-bridge-stop`）。
-- **事件订阅**：页面事件实时推送（导航、点击、输入等）
-- **Agent 身份与 Tab 租约**：`Bridge` 默认使用 `AGENT_ID` 或 `agent-<pid>`；可调用 `register()`、`claimTab()`、`releaseTab()`。租约默认 120 秒自动过期，最长 1 小时；其他 Agent 访问被占用 Tab 时返回 `TAB_LEASED`。
-
-## 安全
-
-- 本地桥只监听 `127.0.0.1`，不对外网暴露
-- Agent 调用需 Bearer token（首次启动随机生成，0600 权限）
-- 敏感字段（密码、hidden、信用卡、验证码等）在页面快照中自动遮蔽，不进入 Agent 上下文
-- 停止按钮可随时打断 Agent 的页面操作
 
 ## 测试
 
 ```bash
-cd relay && npm test               # 集成 + 单元 + send-chat helper
-node relay/test.js                 # 集成测试（鉴权、RPC 转发、错误传播、事件广播）
-node relay/test-unit.js            # 单元测试（frame parser、tab 队列、超时/pending 清理、WS error 不崩）
-node --test relay/test-verify.mjs  # send-chat 送达验证 helper（6 种情形）
+cd relay && npm test
 ```
 
+## 已知边界
 
-已知边界：
-- `chrome://` 等受保护页面禁止内容注入（快照/操作不可用），截图需 `activeTab` 授权（点击一次扩展图标即可）
-- 超长页面整页截图（`captureBeyondViewport:true`）可能较慢，默认视口截图（秒级）
-- 截图默认静默（v0.3.0+）：CDP 截图后台 tab 也可用、不抢焦点；CDP 失败时不再自动激活窗口，需要时显式 `page.activateAndShot` 或传 `allowActivate:true`。被 OneTab / 浏览器丢弃冻结的标签仍须先 `tabs.activate` 唤醒（激活即重载）
-- 扩展 MV3 service worker 会周期性休眠导致 WS 短暂断开：host 已内置"等待扩展重连（≤12s）再转发请求"，Agent 无感知
-
-## 后续规划
-
-- 更多页面事件类型与用户确认护栏
-- 打包 .crx 分发与自动更新
+- 只支持 macOS + Google Chrome
+- `chrome://` 等受保护页面不能注入脚本
+- 超长页面整页截图较慢，默认只截视口
+- 扩展 MV3 的 service worker 会周期性休眠，导致短暂断连（host 已内置自动等待重连，AI 无感知）

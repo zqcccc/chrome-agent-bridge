@@ -82,6 +82,9 @@ description: 驱动用户的真实 Chrome 浏览器（本地扩展 + 本地桥�
    - **standalone WS 模式（二选一）**：`cd "$ROOT/relay" && npm start`（`$ROOT` 见下方「快速开始」）,host 常驻 8778，扩展用 `ws://127.0.0.1:8778/agent` 连入。`status` 返回 `mode:standalone`。
    - **两种模式不要同时运行**：standalone 占着 8778 时，native 拉起的进程会因端口占用退出，扩展 `auto` 通道会回退到 WS（不透明）。推荐只用 Native。
 3. **扩展已连上 host**：status 输出 `extConnected:true`。扩展 reload 或 Chrome 重启后几秒内自动重连。
+4. **扩展版本够新**：拿 `bridge.status` 的 `result.version` 与 [`CHANGELOG.md`](CHANGELOG.md) 的「当前版本」比对。
+   - **扩展不会自动更新**（未上架商店）。**拿到 `UNKNOWN_METHOD` 第一反应就该查版本**——它不是站点问题、也不是脚本 bug，就是扩展版本不够新。症状与最低版本的对照表在 `CHANGELOG.md` 末尾。
+   - 版本落后时：向用户说明要更新到哪个版本、为什么（例如「你要用的 `tabs.resolve` 需要 0.3.9，现在是 0.3.8」），**得到同意后再执行** `git pull` + `install-host.sh` + `reload-ext`。不要自己动用户的 Chrome。
 
 ## 快速开始（CLI）
 
