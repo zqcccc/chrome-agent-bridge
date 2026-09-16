@@ -298,10 +298,26 @@ export class Rpc {
    * 历史教训：agent 自己从 tabs.list 里挑 tab，挑中一个 status:"loading" 的 SPA，
    * 于是在上面盲试了 155 次 PAGE_CONTEXT_TIMEOUT。这里把「选 tab + 验可用」合并成一步。
    */
-  async withPage(url, fn, { match = "host", timeoutMs = 45000, probe = true } = {}) {
+  /**
+   * 在指定 url 上开工：复用/新开 tab → 等就绪 → 自检可注入 → 跑 fn → **默认关掉自己开的 tab**。
+   * 这是「不要自己挑 tab」的推荐入口：避免了选到 discarded / chrome:// / 永远 loading 的页。
+   *
+   * 历史教训 1：agent 自己从 tabs.list 里挑 tab，挑中一个 status:"loading" 的 SPA，
+   * 于是在上面盲试了 155 次 PAGE_CONTEXT_TIMEOUT。这里把「选 tab + 验可用」合并成一步。
+   * 历史教训 2：跑完不关 tab，反复跑测试会攒下一堆垃圾页（实测攒了 21 个 example.com）。
+   * 所以默认 cleanup:true —— 只关**本次新建**的 tab，复用用户已有的 tab 绝不关。
+   *
+   * @param {object} opts
+   * @param {boolean} [opts.cleanup=true] 结束时是否关闭本次新建的 tab
+   * @param {boolean} [opts.keepOpen] 等价于 cleanup:false（保留页面供人工查看）
+   */
+  async withPage(url, fn, { match = "host", timeoutMs = 45000, probe = true, cleanup = true, keepOpen = false } = {}) {
     const opened = await openUrl(this, url, { match, waitLoad: true, timeoutMs });
     const tabId = opened.tabId || (opened.tab && opened.tab.id);
     if (!tabId) throw new BridgeRpcError("NO_TAB", `无法为目标 url 拿到 tab: ${url}`);
+
+    // 只有「不是复用来的」才归我们关。复用用户已有的 tab 时关掉会破坏他的工作区。
+    const shouldClose = (cleanup && !keepOpen) && opened.reused === false;
 
     if (probe) {
       // 探一下能否注入；失败就报清楚原因，而不是让后续每步各超时一次
@@ -309,6 +325,7 @@ export class Rpc {
         await this.call("tabs.prepare", { tabId }, 15000);
         await this.ev(tabId, "1");
       } catch (e) {
+        if (shouldClose) await this.closeQuietly(tabId);
         throw new BridgeRpcError(
           "TAB_NOT_INJECTABLE",
           `tab #${tabId} 无法注入（${e.code}）。该页可能是受保护协议 / 已被丢弃 / 永远 loading。`,
@@ -320,6 +337,17 @@ export class Rpc {
       return await fn(tabId, opened);
     } finally {
       await this.detach(tabId);
+      if (shouldClose) await this.closeQuietly(tabId);
+    }
+  }
+
+  /** 关 tab，失败不抛（收尾步骤不应影响主流程结果）。 */
+  async closeQuietly(tabId) {
+    try {
+      await this.call("tabs.close", { tabId }, 10000);
+      return true;
+    } catch (e) {
+      return false;
     }
   }
 

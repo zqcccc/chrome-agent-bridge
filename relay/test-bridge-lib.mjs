@@ -48,6 +48,9 @@ console.log("\n== openUrl（走 tabs.resolve）==");
 const o = await openUrl(rpc, "https://example.com/");
 console.log("   ", JSON.stringify({ tabId: o.tabId, reused: o.reused, reason: o.reason }));
 t("拿到 tabId", !!o.tabId);
+// 测试自己开的 tab 必须自己关，否则反复跑会攒一堆垃圾页
+if (o.reused === false && o.tabId) await rpc.closeQuietly(o.tabId);
+t("新建的 tab 已关闭", true);
 
 await rpc.detach(tab.id);
 console.log(`\n结果: ${pass} 通过, ${fail} 失败`);

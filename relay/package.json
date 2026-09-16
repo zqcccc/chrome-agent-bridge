@@ -8,12 +8,13 @@
     "install-host": "bash install-host.sh",
     "icons": "node generate-icons.js",
     "version-guard": "node version-guard.js",
-    "test": "node version-guard.js && node test.js && node test-unit.js && node --test test-verify.mjs test-bridge-lib.mjs test-tab-health.mjs",
+    "test": "node version-guard.js && node test.js && node test-unit.js && node --test test-verify.mjs test-bridge-lib.mjs test-tab-health.mjs && node test-tab-cleanup.mjs",
     "test:integration": "node test.js",
     "test:unit": "node test-unit.js",
     "test:verify": "node --test test-verify.mjs",
     "test:lib": "node test-bridge-lib.mjs",
-    "test:health": "node test-tab-health.mjs"
+    "test:health": "node test-tab-health.mjs",
+    "test:cleanup": "node test-tab-cleanup.mjs"
   },
   "engines": {
     "node": ">=18"

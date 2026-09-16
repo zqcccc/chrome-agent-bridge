@@ -24,8 +24,9 @@ console.log("\n== clearStrikes 可恢复 ==");
 rpc.clearStrikes(DEAD);
 t("清零后不再标记 unhealthy", !rpc.isUnhealthy(DEAD));
 
-console.log("\n== withPage：选 tab + 验可注入 一步到位 ==");
+console.log("\n== withPage：选 tab + 验可注入 + 自动关 tab 一步到位 ==");
 try {
+  // withPage 默认 cleanup:true —— 自己新建的 tab 跑完会自动关（复用的不动）
   const r = await rpc.withPage("https://example.com/", async (tabId) => {
     const title = await rpc.ev(tabId, "document.title");
     const ready = await rpc.ev(tabId, "document.readyState");
@@ -33,6 +34,10 @@ try {
   });
   console.log("    ", JSON.stringify(r));
   t("withPage 拿到可用 tab 并求值成功", !!r.title);
+  // 确认 tab 真的被关掉了（这是本次修的 bug：之前会留下垃圾页）
+  let stillThere = false;
+  try { await rpc.call("tabs.get", { tabId: r.tabId }, 8000); stillThere = true; } catch (e) { /* 预期：已关 */ }
+  t("withPage 结束后 tab 已自动关闭", !stillThere);
 } catch (e) {
   t("withPage 正常", false, e.message);
 }

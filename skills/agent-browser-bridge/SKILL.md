@@ -31,12 +31,13 @@ import { Rpc, openUrl, waitReady, sleep } from "./scripts/lib/bridge.mjs";
 const rpc = new Rpc({ agentName: "MyTask" });
 await rpc.preflight();                       // 版本 + 能力一次拿全
 
-// 推荐入口：选 tab + 等就绪 + 验可注入 + 自动 detach，一步到位
+// 推荐入口：选 tab + 等就绪 + 验可注入 + 自动 detach + **自动关掉自己开的 tab**
 await rpc.withPage("https://example.com/", async (tabId) => {
   const title = await rpc.ev(tabId, "document.title");   // CDP 求值，绕过 CSP，自动解包
   await rpc.clickReal(tabId, x, y);                      // 真实鼠标事件
   await rpc.clickEl(tabId, "document.querySelector('#x')"); // 某些按钮只认 el.click()
 });
+// 需要保留页面查看时传 { keepOpen: true }；复用的用户 tab 永不会被关。
 ```
 
 它解决的正是反复踩的四类坑：**返回值解包层数不一致**、**点击方式二选一**、**异常漏 detach 拖死 host**、**在坏 tab 上盲试**。
