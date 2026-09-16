@@ -16,7 +16,22 @@ const os = require("os");
 const path = require("path");
 const { attachWsServer, WSConnection } = require("./ws-server");
 
-const VERSION = "0.3.0";
+// 版本号：单一事实来源是 extension/manifest.json（扩展才是提供 RPC 能力的一方）。
+// host 与扩展同属一个发布单元，共用一个版本号，不再各自维护——
+// 历史上 host 的 VERSION 停在 0.3.0 不动，而扩展已到 0.3.9，导致 agent
+// 从 /status 读到的数字与实际能力对不上（误判 tabs.resolve 等能力不可用）。
+const VERSION = (() => {
+  try {
+    const mf = path.join(__dirname, "..", "extension", "manifest.json");
+    const v = JSON.parse(fs.readFileSync(mf, "utf8")).version;
+    if (v) return String(v);
+  } catch (e) {
+    // 读不到 manifest（如 skill 被单独拷贝）时退回一个明确值，不静默假装成功
+    // 注意：此处不能用 log()，它在下方才定义
+    console.error(`[host] warn: 读不到 extension/manifest.json（${e.message}），版本号回退为 unknown`);
+  }
+  return "unknown";
+})();
 const HOST_NAME = "com.agentbrowser.bridge";
 const STATE_DIR = path.join(os.homedir(), ".chrome-agent-bridge");
 const TOKEN_FILE = path.join(STATE_DIR, "token");
@@ -117,6 +132,13 @@ function isSerialMethod(method) {
 
 function nativeReady() { return !!(nativePort && nativePort.ready); }
 function extReady() { return nativeReady() || !!(extWs && !extWs.closed); }
+
+// 扩展自报的版本（native hello 与 WS hello 都会带）。
+// 正常情况下应与 VERSION 一致；不一致说明扩展目录被单独更新过，
+// 这时以扩展自报的为准（它才是实际跑着的那份代码）。
+let extVersionCache = null;
+function extVersion() { return extReady() ? extVersionCache : null; }
+function noteExtVersion(v) { if (v) extVersionCache = String(v); }
 function currentChannel() {
   if (nativeReady()) return "native";
   if (extWs && !extWs.closed) return "ws";
@@ -358,6 +380,7 @@ function handleNativeMessage(msg) {
       onDisconnect: () => { nativePort = null; },
     };
     log("extension connected via native messaging:", msg.name || msg.client, msg.version || "");
+    noteExtVersion(msg.version);
     writeNative({
       type: "hello",
       host: HOST_NAME,
@@ -410,9 +433,14 @@ function httpServer() {
       send(200, {
         ok: true,
         name: HOST_NAME,
+        // 统一版本号：host 与扩展同属一个发布单元，共用 extension/manifest.json 里的版本。
+        // agent 直接用这个值判断能力是否可用（见 CHANGELOG 的症状对照表）。
         version: VERSION,
         channel: currentChannel() || "disconnected",
         mode: STANDALONE ? "standalone" : "native",
+        // 扩展自报的版本。正常情况下与 version 相同；不同说明扩展目录被单独更新过，
+        // 此时以这个值为准（它才是实际在跑的那份代码）。
+        reportedExtensionVersion: extVersion(),
         extConnected: extReady(),
         pending: pending.size,
         tabQueues: tabQueues.size,
@@ -502,7 +530,8 @@ function httpServer() {
         ws.on("message", (text) => {
           let msg;
           try { msg = JSON.parse(text); } catch (e) { return; }
-          if (msg.type === "hello" || msg.type === "ping" || msg.type === "pong") return;
+          if (msg.type === "hello") { noteExtVersion(msg.version); return; }
+          if (msg.type === "ping" || msg.type === "pong") return;
           if (msg.type === "event") {
             broadcastToAgent(msg.event, msg.payload);
             return;
@@ -582,7 +611,14 @@ function httpServer() {
     log("http server error:", e.message);
     if (e.code === "EADDRINUSE") {
       log(`端口 ${PORT} 已被占用（可能 host 已在运行）`);
+      // native 模式：Chrome 拉起了第二个 host，说明已有 host 在服务，静默退出即可。
+      // standalone 模式：这是明确的启动失败，必须非零退出——
+      //   否则调用方（如集成测试）会把端口上「别的服务」当成 host 就绪，
+      //   拿到一堆莫名其妙的 404（历史踩坑：test.js 曾硬编码 8899，
+      //   而 8899 是 whistle 的默认代理端口——开着 whistle 时集成测试会假失败）。
       if (!STANDALONE) process.exit(0);
+      console.error(`[host] FATAL: 端口 ${PORT} 已被占用，standalone 启动失败（EADDRINUSE）`);
+      process.exit(3);
     }
   });
 }

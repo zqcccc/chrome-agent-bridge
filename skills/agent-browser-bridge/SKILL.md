@@ -5,6 +5,90 @@ description: 驱动用户的真实 Chrome 浏览器（本地扩展 + 本地桥�
 
 # Agent Browser Bridge —— 让 Agent 操作日常 Chrome
 
+## 开工前必读（三件事，按顺序）
+
+**这三步是硬性前置，跳过它们会重复踩已知的坑。**
+
+### 1. 先读 `KNOWN_ISSUES.md`（同目录）
+
+它记录了**已知问题与行为约束**，很多「看起来像 bug」的现象在那里有现成答案（CSP 拦截、`PAGE_CONTEXT_TIMEOUT`、`DEBUGGER_BUSY`、风控识别等）。**不要凭猜重试。**
+
+### 2. 查版本（判断能力是否可用）
+
+```bash
+curl -s http://127.0.0.1:8778/status | python3 -c 'import json,sys;d=json.load(sys.stdin);print("version:",d.get("version"),"| connected:",d.get("extConnected"))'
+```
+
+版本号是**统一的**：host 与扩展同属一个发布单元，共用 `extension/manifest.json` 里的版本。直接看 `version` 就行。
+
+- `version` 为 `unknown` 时表示 host 读不到 `extension/manifest.json`（一般只在 skill 被单独拷贝时发生）；此时可调 `bridge.status` 拿扩展自报的版本。
+- `UNKNOWN_METHOD` 一律是「版本不够新」，不是站点问题也不是脚本 bug——对照 `CHANGELOG.md` 末尾的症状表。
+
+### 3. 多步流程用 `scripts/lib/bridge.mjs`，不要手写解包
+
+```js
+import { Rpc, openUrl, waitReady, sleep } from "./scripts/lib/bridge.mjs";
+const rpc = new Rpc({ agentName: "MyTask" });
+await rpc.preflight();                       // 版本 + 能力一次拿全
+
+// 推荐入口：选 tab + 等就绪 + 验可注入 + 自动 detach，一步到位
+await rpc.withPage("https://example.com/", async (tabId) => {
+  const title = await rpc.ev(tabId, "document.title");   // CDP 求值，绕过 CSP，自动解包
+  await rpc.clickReal(tabId, x, y);                      // 真实鼠标事件
+  await rpc.clickEl(tabId, "document.querySelector('#x')"); // 某些按钮只认 el.click()
+});
+```
+
+它解决的正是反复踩的四类坑：**返回值解包层数不一致**、**点击方式二选一**、**异常漏 detach 拖死 host**、**在坏 tab 上盲试**。
+
+**坏 tab 熔断（重要）**：同一个 tab 上连续 3 次「上下文/标签页级」错误（`PAGE_CONTEXT_TIMEOUT` / `TAB_GONE` / `UNSUPPORTED_URL` 等）后，`rpc.ev()` 会直接抛 `TAB_UNHEALTHY` 并**毫秒级失败**，不再每轮白等几十秒。
+> 为什么加这个：host.log 实测某个 `status:"loading"` 的 SPA 上，agent 盲试了 **155 次** `PAGE_CONTEXT_TIMEOUT`（evaluate 失败 → prepare 失败 → 再 evaluate），把一个简单任务拖成了事故。
+> 看到这个错误就**换 tab**（用 `tabs.resolve` / `rpc.withPage`），不要原地重试。
+
+---
+
+## 开工体检：`scripts/preflight.mjs`（建议每次任务开头跑一次）
+
+一条命令拿到「桥是否可用 + 扩展能力缺不缺 + 哪些 tab 可用」：
+
+```bash
+node scripts/preflight.mjs                 # 人类可读
+node scripts/preflight.mjs --json          # 机器可读
+TAB=$(node scripts/preflight.mjs --pick github)   # 直接拿到可用 tab 的 id
+```
+
+它会**明确标出「不要选这些」**的 tab，并给出原因：
+
+| 标记 | 含义 |
+|---|---|
+| `uninjectable` | `chrome://` 等受保护页，桥无法注入 |
+| `discarded` | 已被浏览器丢弃，需 `tabs.activate` 唤醒（会重载页面） |
+| `non-http` | 非网页（扩展页、about: 等） |
+| `loading` | 长期 `status:"loading"` 的 SPA，注入易失败 |
+
+> **为什么值得跑**：host.log 里 `PAGE_CONTEXT_TIMEOUT` 162 次、`UNSUPPORTED_URL` 53 次、`TAB_GONE` 33 次（近 24h）——绝大部分是「一开始就选错了 tab」，而这些在开工前一次性就能判定。
+> `--pick` 匹配不到时会**报错退出（码 3）而不是静默给个不相干的 tab**——给错 tab 比不给更坑。
+
+---
+
+## 本文件之外的必读文档（同目录）
+
+| 文件 | 什么时候读 |
+|---|---|
+| **`KNOWN_ISSUES.md`** | **开工前必读**。已知问题、行为约束、风控处理规则 |
+| `CHANGELOG.md` | 拿到 `UNKNOWN_METHOD`、或要确认某能力的最低版本 |
+| `debug/SKILL.md` | 页面行为异常（取不到内容 / 数量不对 / 疑似风控），先探查再下结论 |
+| `AGENTS.md`（仓库根） | **只有改 bridge 代码时读**。改扩展/修 bug 的开发流程 |
+
+---
+
+## 三条最容易踩的硬约束（摘要，完整版见 `KNOWN_ISSUES.md`）
+
+1. **变更类操作必须回读验证**。删除/保存/提交之后，重新加载列表页确认状态真的变了。
+   > 历史教训：脚本打印了 `✓ 已删除`，回到列表页记录还在——按钮点了，请求没发出去。**不得以脚本自己打印的 ✓ 作为成功依据。**
+2. **遇到风控/安全验证立即停止，不要重试**。疯狂重试会加重风控。识别特征与例外（小红书软风控弹窗不算）见 `KNOWN_ISSUES.md` 约束一。
+3. **少开标签页**。优先在当前 tab 内跳转/点开，用完关掉。大量并发 tab = 更容易触发风控。
+
 架构：Chrome 扩展（MV3）↔ 本地桥 host（relay/host.js，:8778）↔ Agent 客户端（HTTP/WS JSON-RPC）。
 
 ```
@@ -51,7 +135,7 @@ description: 驱动用户的真实 Chrome 浏览器（本地扩展 + 本地桥�
 | **NotebookLM**（新建笔记本、上传来源、提问、Studio 产物） | `notebooklm/SKILL.md` | `notebooklm/upload.mjs`、`notebooklm/ask.mjs`、`notebooklm/scripts/*.mjs`、`scripts/cdp-upload.mjs` |
 | **任何站点：页面异常 / 结构陌生 / 交付前验证** | `debug/SKILL.md` | `browser-debug.mjs`（首选仍是插件内置 `page.inspect` / `page.record`） |
 
-> 通用能力也可复用：`scripts/cdp-eval.mjs`（强 CSP 站点求值）、`scripts/cdp-upload.mjs`（注入文件上传）、`scripts/type-text.mjs`（受控组件输入）。
+> 通用能力也可复用：`scripts/lib/bridge.mjs`（**统一封装：解包 / CDP 求值 / 点击双模式 / 坏 tab 熔断**）、`scripts/preflight.mjs`（开工体检）、`scripts/cdp-eval.mjs`（强 CSP 站点求值）、`scripts/cdp-upload.mjs`（注入文件上传）、`scripts/type-text.mjs`（受控组件输入）。
 
 ## 路径约定（读本 skill 任何命令前先看这里）
 
@@ -164,7 +248,18 @@ await bridge.rpc("page.record.stop", { tabId });         // 停止记录
 await bridge.rpc("page.record.clear", { tabId });        // 清空时间线
 ```
 
-HTTP 直调：`POST http://127.0.0.1:8778/rpc`，头 `Authorization: Bearer <token>`，体 `{"method":"...","params":{...},"timeoutMs":20000}` → `{"ok":true,"result":{...}}`。注意 **page.evaluate 的返回值在 `result.result` 里是 JSON 字符串**，需要再 JSON.parse 一次。
+HTTP 直调：`POST http://127.0.0.1:8778/rpc`，头 `Authorization: Bearer <token>`，体 `{"method":"...","params":{...},"timeoutMs":20000}` → `{"ok":true,"result":{...}}`。
+
+> ⚠️ **返回值解包层数随调用路径变化**，这是最容易踩的坑（实测三条路径三个层数）：
+>
+> | 调用路径 | 取值位置 |
+> |---|---|
+> | 裸 HTTP `POST /rpc` | `json.result.result.value` |
+> | `client.mjs` 的 `bridge.rpc()` | `r.result.value` |
+> | `client.mjs` 的 `bridge.evaluate()` | 返回 `{type, value}`，还要 `.value` |
+>
+> **别自己写解包。** 用 `scripts/lib/bridge.mjs` 的 `rpc.ev()` / `unwrap()`——它自适应三种层数并自动 `JSON.parse` 字符串结果。
+> 历史教训：按错层数取到 `undefined`，连查三轮才发现不是页面问题。
 
 ## 报错排查：先看 host.log，别看 chrome://extensions
 
@@ -184,6 +279,8 @@ grep "tab=<id>" host.log | grep -E "TIMEOUT|note=dispatch" | head -20           
 
 ## 实战踩坑清单（务必先读）
 
+> 下面第 11~16 条是**代价最高的六个坑**（都真实卡住过整个流程），优先看。完整已知问题见 `KNOWN_ISSUES.md`。
+
 1. **host 可能随时死**：开工前、长流程中途，都 `curl /status` 确认；死了就重启，token 不变。
 2. **刚 reload 扩展前的旧标签页 content script 不注入**：`page.evaluate` 报 "Cannot access contents of the page"。解决：先 `tabs.prepare`（静默注入，不抢焦点）再操作，见下方「静默模式」。只有**被 OneTab 冻结 / 被浏览器丢弃（discarded）的标签**才必须 `tabs.activate` 唤醒（激活会自动重载页面）。
 3. **`chrome://` 等受保护页面**不能注入/截图（需 activeTab 授权，点一次扩展图标即可）。
@@ -200,6 +297,18 @@ grep "tab=<id>" host.log | grep -E "TIMEOUT|note=dispatch" | head -20           
 8. **导航等待**：导航必须用 `page.navigate`（走 `chrome.tabs.update`），**禁止用 `page.evaluate` 改 `location.href`/`location.assign`/`history.go`**——后者会销毁执行上下文，导致 RPC 无法返回、Host 超时。`page.navigate` 后可调 `page.waitForUrl`/`page.waitForSelector`/`page.waitForReady` 按条件等待，不要用固定 sleep。
 9. **视觉指示器**：Agent 操作时页面会显示幽灵光标 + 点击涟漪 + 「停止 Agent」按钮（默认开启）。用户可随时点停止打断。
 10. **停止按钮实现**：background 的 dispatch() 只对真实交互操作（click/type/press/scroll/hover/focusEl/select/waitFor）显示停止按钮；只读/导航（navigate/info/evaluate/snapshot/waitLoad/waitForUrl/waitForSelector/waitForReady）不被 indicator 阻塞，indicator 失败也不影响主 RPC。如需默认关闭改 background.js 的 INTERACTIVE_METHODS。
+11. **返回值解包层数不一致** → 用 `scripts/lib/bridge.mjs` 的 `ev()`/`unwrap()`，别手写。详见「编程调用」一节的表格。
+12. **`el.click()` 与真实鼠标事件不等价，同一流程可能两种都要用**：
+    - 菜单/展开类、部分 React 按钮：需要 CDP 真实鼠标事件（`rpc.clickReal`）。
+    - 另一些按钮（如 LinkedIn「删除项目」）：CDP 点了毫无反应，**只认 `el.click()`**（`rpc.clickEl`）。
+    - 两者都试过再下结论；点完必须回读验证（见第 14 条）。
+13. **同名按钮必须限定作用域**：表单底部和确认弹窗里可能都有「删除」。不要用 `[...buttons].filter(t==='删除').pop()` 靠顺序猜——要用 `closest('dialog')` + 弹窗文本特征（如 `/确定要删除/`）双重限定。
+14. **变更类操作必须回读验证**：删除/保存/提交之后，**重新加载列表页**确认状态真的变了。
+    > 历史教训：脚本打印 `✓ done`，回列表页记录还在——按钮点了，请求根本没发。**不得以脚本自己打印的 ✓ 作为成功依据。**
+15. **`session.attach`/`detach` 会打断 CDP 点击序列**：`mousePressed` 与 `mouseReleased` 之间插入 detach/attach 会让点击静默失效（页面无变化且不报错）。一次点击的 down/up 必须在同一会话内完成；用 `rpc.withSession()` 或 `rpc.clickReal()` 规避。
+16. **异常路径漏 detach 会拖死整个 host**：一次 60s TIMEOUT 之后 host 直接 `CONNECTION_REFUSED`，因为 debugger 会话没释放。所有 `attach` 都要配 `finally detach`——用 `rpc.withSession(tabId, fn)` 自动保证。
+17. **站点表单 URL 没有统一规律，不要猜**：从页面抓 `href` 或 `aria-label`。例：LinkedIn 经历是 `/edit/forms/position/<id>/`、项目是 `/details/projects/edit/forms/<id>/`、技能是 `/skills/edit/forms/new/`；猜出来的路径会 404。
+18. **版本号是统一的**：`/status` 的 `version` 就是扩展版本（host 与扩展共用 `extension/manifest.json`），不需要区分两个字段。
 
 ## 静默模式（后台操作不抢焦点，扩展 v0.3.0+）
 

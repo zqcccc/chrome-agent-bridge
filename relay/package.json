@@ -1,16 +1,19 @@
 {
   "name": "agent-browser-bridge",
-  "version": "0.2.0",
+  "version": "0.3.9",
   "description": "Agent Browser Bridge - Chrome 扩展 + 本地桥（Native Messaging / WebSocket）",
   "private": true,
   "scripts": {
     "start": "node host.js --standalone",
     "install-host": "bash install-host.sh",
     "icons": "node generate-icons.js",
-    "test": "node test.js && node test-unit.js && node --test test-verify.mjs",
+    "version-guard": "node version-guard.js",
+    "test": "node version-guard.js && node test.js && node test-unit.js && node --test test-verify.mjs test-bridge-lib.mjs test-tab-health.mjs",
     "test:integration": "node test.js",
     "test:unit": "node test-unit.js",
-    "test:verify": "node --test test-verify.mjs"
+    "test:verify": "node --test test-verify.mjs",
+    "test:lib": "node test-bridge-lib.mjs",
+    "test:health": "node test-tab-health.mjs"
   },
   "engines": {
     "node": ">=18"

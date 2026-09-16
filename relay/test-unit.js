@@ -16,8 +16,33 @@ const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 
-const PORT = 8901;
+// 测试端口：优先用环境变量，否则让内核分配空闲端口。
+// 不要硬编码——端口被别的服务（如 whistle 默认占 8899）占用时，
+// 「轮询到 200」会把别人的服务误判为 host 就绪，造成假失败。
+let PORT = Number(process.env.BRIDGE_TEST_PORT) || 0;
 const TOKEN_FILE = path.join(os.homedir(), ".chrome-agent-bridge", "token");
+
+/** 让内核分配一个空闲端口。 */
+function pickFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = require("net").createServer();
+    srv.on("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const p = srv.address().port;
+      srv.close(() => resolve(p));
+    });
+  });
+}
+
+/** 确认该端口上跑的是我们的 host，而不是恰好占用该端口的别的服务。 */
+async function isOurHost(port) {
+  try {
+    const s = await httpReq(port, "GET", "/status");
+    return s.status === 200 && s.body && s.body.name === "com.agentbrowser.bridge";
+  } catch (e) {
+    return false;
+  }
+}
 function readToken() {
   return fs.existsSync(TOKEN_FILE) ? fs.readFileSync(TOKEN_FILE, "utf8").trim() : "test-token";
 }
@@ -146,17 +171,23 @@ async function main() {
   }
 
   // ---------- 启动 standalone host 做黑盒测试 ----------
+  if (!PORT) PORT = await pickFreePort();
   const host = spawn(process.execPath, [path.join(__dirname, "host.js"), "--standalone", "--port", String(PORT)], {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, AGENT_BRIDGE_PORT: String(PORT) },
   });
+  hostRef = host; // 供 process.on("exit") 兜底清理
   let hostOut = "";
   host.stdout.on("data", (d) => { hostOut += d; });
   host.stderr.on("data", (d) => { hostOut += d; });
 
+  let hostExited = null;
+  host.on("exit", (code) => { hostExited = code; });
+
   let ready = false;
   for (let i = 0; i < 40; i++) {
-    try { const s = await httpReq(PORT, "GET", "/status"); if (s.status === 200) { ready = true; break; } } catch (e) {}
+    if (hostExited !== null) break;
+    if (await isOurHost(PORT)) { ready = true; break; }
     await sleep(250);
   }
   ok("host 启动并监听 /status", ready);
@@ -266,11 +297,19 @@ async function main() {
 }
 
 // 全局超时兑底：避免任何 await 永久挂起卡死测试进程
+let hostRef = null;
 const GUARD = setTimeout(() => {
   console.error("\n!! 测试全局超时（30s），强制退出");
-  try { host && host.kill("SIGKILL"); } catch (e) {}
+  try { hostRef && hostRef.kill("SIGKILL"); } catch (e) {}
   process.exit(2);
 }, 30000);
 GUARD.unref();
+
+// 任何异常退出路径都要收掉子进程，不留残留（残留进程会占端口，污染下次运行）
+process.on("exit", () => {
+  if (hostRef && hostRef.exitCode === null && hostRef.signalCode === null) {
+    try { hostRef.kill("SIGKILL"); } catch (e) { /* noop */ }
+  }
+});
 
 main().catch((e) => { console.error("测试异常:", e); process.exit(1); });

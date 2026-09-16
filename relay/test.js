@@ -7,8 +7,34 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const PORT = 8899; // 测试用独立端口，避免与正式 host 冲突
+// 测试端口：优先用环境变量指定，否则让内核分配一个空闲端口。
+// 不用硬编码端口——8899 是 whistle 的默认代理端口，两者会撞：
+// 开着 whistle 时，测试轮询到 whistle 的 404 响应，会把「别的服务」误判为 host 未就绪，
+// 导致 4 项断言假失败（而且报错信息完全看不出是端口冲突）。
+let PORT = Number(process.env.BRIDGE_TEST_PORT) || 0;
 const TOKEN_FILE = path.join(os.homedir(), ".chrome-agent-bridge", "token");
+
+/** 让内核分配一个空闲端口（先占用再释放，拿到端口号）。 */
+function pickFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = require("net").createServer();
+    srv.on("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const p = srv.address().port;
+      srv.close(() => resolve(p));
+    });
+  });
+}
+
+/** 探测某端口上跑的是不是我们的 host（而不是恰好占用该端口的别的服务）。 */
+async function isOurHost(port) {
+  try {
+    const s = await httpReq(port, "GET", "/status");
+    return s.status === 200 && s.body && s.body.name === "com.agentbrowser.bridge";
+  } catch (e) {
+    return false;
+  }
+}
 
 // token 在 host 首次启动时生成，因此延迟到 host 就绪后读取
 function readToken() {
@@ -115,6 +141,10 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 async function main() {
   console.log("== Agent Browser Bridge 集成测试 ==");
 
+  // 0. 选一个空闲端口（除非外部指定）
+  if (!PORT) PORT = await pickFreePort();
+  console.log(`  （测试端口 ${PORT}）`);
+
   // 1. 启动 host（standalone）
   const host = spawn(process.execPath, [path.join(__dirname, "host.js"), "--standalone", "--port", String(PORT)], {
     stdio: ["pipe", "pipe", "pipe"],
@@ -123,17 +153,26 @@ async function main() {
   hostOut = "";
   host.stdout.on("data", (d) => { hostOut += d; });
   host.stderr.on("data", (d) => { hostOut += d; });
+  hostRef = host; // 供 process.on("exit") 兜底清理
 
-  // 等端口就绪
+  let hostExited = null;
+  host.on("exit", (code) => { hostExited = code; });
+
+  // 等端口就绪：必须确认是「我们的 host」而不是别的服务
   let ready = false;
   for (let i = 0; i < 40; i++) {
-    try {
-      const s = await httpReq(PORT, "GET", "/status");
-      if (s.status === 200) { ready = true; break; }
-    } catch (e) { /* retry */ }
+    if (hostExited !== null) break;          // host 已退出，不必再等
+    if (await isOurHost(PORT)) { ready = true; break; }
     await sleep(250);
   }
   ok("host 启动并监听 /status", ready);
+  if (!ready) {
+    console.log(`  （host 退出码 ${hostExited}，端口 ${PORT}）`);
+    console.log("--- host 输出 ---\n" + hostOut.slice(-1500));
+    console.log("\n提示：若报 EADDRINUSE，说明该端口被占用；不传 BRIDGE_TEST_PORT 时会自动选空闲端口。");
+    try { host.kill(); } catch (e) { /* noop */ }
+    process.exit(1);
+  }
   const token = readToken();
 
   // 2. 鉴权：敏感 API 必须携带正确 token
@@ -177,7 +216,7 @@ async function main() {
 
   extWs.close();
   agentWs.close();
-  host.kill();
+  await stopHost(host);
 
   console.log(`\n结果: ${passed} 通过, ${failed} 失败`);
   if (failed > 0) {
@@ -185,5 +224,32 @@ async function main() {
     process.exit(1);
   }
 }
+
+/**
+ * 可靠地停掉测试 host。
+ * 不能只 host.kill() 后直接 process.exit()——子进程可能来不及退出，
+ * 残留进程会占着端口，下次测试就会把它的 404 当成 host 未就绪（假失败）。
+ */
+function stopHost(host) {
+  return new Promise((resolve) => {
+    if (host.exitCode !== null || host.signalCode !== null) return resolve();
+    const done = () => resolve();
+    host.once("exit", done);
+    try { host.kill("SIGTERM"); } catch (e) { /* noop */ }
+    // 宽限期后强杀，避免挂死
+    setTimeout(() => {
+      try { host.kill("SIGKILL"); } catch (e) { /* noop */ }
+      resolve();
+    }, 3000);
+  });
+}
+
+// 任何异常退出路径都要收掉子进程，不留残留
+let hostRef = null;
+process.on("exit", () => {
+  if (hostRef && hostRef.exitCode === null && hostRef.signalCode === null) {
+    try { hostRef.kill("SIGKILL"); } catch (e) { /* noop */ }
+  }
+});
 
 main().catch((e) => { console.error("测试异常:", e); process.exit(1); });

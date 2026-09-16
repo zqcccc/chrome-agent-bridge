@@ -3,6 +3,14 @@
 > 本文件是给**所有使用本 skill 的 Agent** 的行为约束，不只是故障记录。
 > 使用本桥操作任何网站前，先读本文件；违反约束会被视为执行错误。
 
+## 约束零之前：变更类操作必须回读验证
+
+**删除 / 保存 / 提交 / 发布之后，必须重新加载列表页或详情页，确认目标状态真的变了。**
+
+- **不得以脚本自己打印的 `✓ 已删除` / `✓ 已保存` 作为成功依据。** 按钮被点到 ≠ 请求发出去了。
+- 为什么单独立一条：这个坑最隐蔽——脚本无报错、日志显示成功，但业务状态没变；不主动回读就会带着错误结论继续往下走（“删了重复项”其实没删、“保存了”其实没保存）。
+- 可用 `scripts/lib/bridge.mjs` 的 `rpc.mutateAndVerify(mutate, verify)` 强制这个模式。
+
 ## 约束零：先查子技能、优先用现成脚本，不自己重造
 
 - 根 `SKILL.md`「第一原则：先查子技能，用现成脚本（禁止重造）」列出了子技能索引。任务站点命中索引（小红书 / BOSS 直聘 / ChatGPT / NotebookLM）时，**必须先读对应子技能 `SKILL.md`，优先直接跑它给的 `scripts/*.mjs`**。
@@ -101,11 +109,7 @@
 - 注意：CDP attach 期间 Chrome 会在该 tab 顶部显示「正在调试此浏览器」条，扩展用完立即 detach。
 - 不受影响的 RPC：`page.click/type/press/scroll/waitForSelector/waitForUrl/waitForReady/waitLoad`、`page.snapshot/inspect/screenshot`、`tabs.*`。
 
-
-- 现象：`page.evaluate` 报 `EVAL_ERROR: Evaluating a string as JavaScript violates the following Content Security Policy...`，且 `world:"ISOLATED"` 同样被拦（Chrome 83+ 内容脚本隔离世界也受页面 CSP 约束）。
-- 原因：桥的 `page.evaluate` 内部是 `eval(expression)` 字符串求值；chatgpt.com 的 `script-src` 不含 `'unsafe-eval'`。
-- 解决：走 CDP。`session.attach` + `session.send { method: "Runtime.evaluate", params: { expression, returnByValue:true, awaitPromise } }`（DevTools 协议不受页面 CSP 约束）。已封装为 `scripts/cdp-eval.mjs`，ChatGPT 专项（`chatgpt/SKILL.md`）已按此实现全部求值。
-- 不受影响的 RPC：`page.click/type/press/scroll/waitForSelector/waitForUrl/waitForReady/waitLoad`、`page.snapshot/inspect/screenshot`、`tabs.*`、`session.*`（它们不依赖字符串 eval）。
+> **直接可用的封装**：`scripts/lib/bridge.mjs` 的 `rpc.ev(tabId, expr)` 已经走 CDP `Runtime.evaluate`，自动绕过页面 CSP，并把返回值解包好。多步流程优先用它，不要自己拼 `session.attach` / `session.send` / `detach`。
 
 ## 已知状态：导航超时后该 tab 会连续超时（扩展 v0.3.3 起快速失败）
 

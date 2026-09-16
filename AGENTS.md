@@ -43,7 +43,7 @@ curl -s -X POST http://127.0.0.1:8778/rpc -H "Authorization: Bearer $BRIDGE_TOKE
 
 两个易踩的坑：
 
-- host `/status` 的 `version` 是**进程启动时的缓存**，重载扩展后不变；改 `manifest.json` 版本号也要重启 host 才看得到。**判重载以方法调用为准。**
+- **版本号现在统一了**：`relay/host.js` 启动时读 `extension/manifest.json`，`/status` 的 `version` 即扩展版本（不再有独立的 host 版本号）。它仍是**进程启动时的快照**，所以改 `manifest.json` 后要重启 host 才看得到新值（`pkill -f "chrome-agent-bridge/relay/host.js"`）。**判重载以方法调用为准**，不要只看版本号。
 - 重载后**旧标签页会失效**（content script 实例已销毁），操作报 `PAGE_CONTEXT_TIMEOUT`。对这些 tab 先 `tabs.prepare` 重新注入，或 `tabs.reload` 刷新页面。
 
 ### 排查报错：看 host.log，别看 chrome://extensions

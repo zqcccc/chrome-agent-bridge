@@ -17,11 +17,39 @@
 
 ## 当前版本
 
-| 部件 | 版本 | 位置 |
+**版本号是统一的**：host 与扩展同属一个发布单元，共用 `extension/manifest.json` 里的版本。
+`relay/host.js` 启动时读该文件，所以 `/status` 的 `version` 就是扩展版本，不需要区分两个字段。
+
+| 部件 | 版本 | 版本号来源 |
 |---|---|---|
-| 扩展 | **0.3.9** | `extension/manifest.json` |
-| 本地桥 host | 0.3.0 | `relay/host.js` 的 `VERSION` |
+| 扩展 | **0.3.9** | `extension/manifest.json`（唯一事实来源） |
+| 本地桥 host | 同扩展 | 启动时读 `extension/manifest.json`（不单独维护） |
 | 本 skill | 随 ClawHub 发布 | — |
+
+> 历史提醒：0.3.9 之前 host 自己维护了一个 `VERSION = "0.3.0"` 且从不跟着涨，导致 `/status`
+> 报的版本与实际能力对不上（agent 会误判 `tabs.resolve` 等能力不可用）。现已改为单一来源。
+
+## 版本号维护（改代码的人看这里）
+
+**版本号只有一个事实来源：`extension/manifest.json` 的 `version`。**
+
+`relay/host.js` 启动时读它，所以 `/status` 的 `version` 就是扩展版本，不存在「两个版本号」。
+
+改完代码、准备发版时：
+
+```bash
+# 1. 改 manifest.json 的 version（唯一需要手改的地方）
+# 2. 让其它位置自动跟上（README 发布命令、package.json、本文件的当前版本表）
+node relay/version-guard.js --fix
+# 3. 确认一致（也作为 npm test 的第一步自动跑）
+node relay/version-guard.js
+```
+
+`version-guard` 会检查这三处是否与 manifest 一致，不一致就报错（`--fix` 可自动修正）。
+它**不会**动「某能力从 vX 开始支持」这类历史标注——那些描述的是过去，改了反而错。
+
+> 为什么需要这个工具：0.3.9 之前 host 自己维护 `VERSION = "0.3.0"` 且从不跟着涨，
+> 导致 agent 从 `/status` 读到 0.3.0、误判 `tabs.resolve` 等能力不可用。手工维护多处版本号必然漏改。
 
 ## 更新步骤（让用户执行，或经用户同意后代跑）
 

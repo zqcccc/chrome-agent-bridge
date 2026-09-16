@@ -7,10 +7,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = import.meta.dirname || dirname(fileURLToPath(import.meta.url));
-const helpersUrl = pathToFileURL(join(__dirname, "test-fixtures", "verify-helpers.mjs")).href;
-// 复用 skills 里的 helper（任务要求 helper 可测且与脚本一致）
-const skillHelpersUrl = pathToFileURL(join(process.env.HOME, ".agents/skills/boss-zhipin-apply/scripts/verify-helpers.mjs")).href;
-const { analyzeDelivery, decideOutcome, isBlocked, matchDelivery } = await import(skillHelpersUrl);
+// helper 是 skill 的一部分，从仓库内引用，保证 skill 自包含（见仓库 AGENTS.md）。
+// 不要指向 ~/.agents/skills/... —— 那是安装后的路径，换个机器/换个人就不存在。
+const helpersUrl = pathToFileURL(
+  join(__dirname, "..", "skills", "agent-browser-bridge", "scripts", "boss-verify-helpers.mjs")
+).href;
+const { analyzeDelivery, decideOutcome, isBlocked, matchDelivery } = await import(helpersUrl);
 
 const SENT = "您好！我是张三，5年前端 React 经验，住海淀大钟寺。简历：https://resume.onlylike.work 期待沟通！";
 
