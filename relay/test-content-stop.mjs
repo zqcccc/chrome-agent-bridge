@@ -233,8 +233,7 @@ test("indicator.js: 停止按钮点击不带全局 tabId（范围由 background 
 // 源码契约：两处闸门必须存在，且 details 不被吞
 // =====================================================================
 
-test("契约: content.js 的停止闸门在动作分发之前", () => {
-  const src = fs.readFileSync(path.join(EXT, "content.js"), "utf8");
+test("契约: content.js 的停止闸门在动作分发之前", () => {  const src = fs.readFileSync(path.join(EXT, "content.js"), "utf8");
   const gateIdx = src.indexOf("if (stoppedAt && MUTATING_ACTIONS.has(action)) throw stoppedError(action);");
   const switchIdx = src.indexOf("switch (action) {", gateIdx === -1 ? 0 : gateIdx);
   assert.ok(gateIdx !== -1, "content.js 必须有动作级停止闸门");
@@ -257,4 +256,65 @@ test("契约: background.js 用 sender.tab.id 决定停止范围（按钮只停�
   const src = fs.readFileSync(path.join(EXT, "background.js"), "utf8");
   assert.match(src, /sender && sender\.tab && sender\.tab\.id/,
     "必须用 sender.tab.id 判定范围，避免页面按钮触发全局停止");
+});
+
+// =====================================================================
+// 契约：会做写操作的 skill 脚本必须处理 AGENT_STOPPED
+// =====================================================================
+// 背景：v0.3.11 起「停止 Agent」会真的拦住写操作。脚本若把桥错误静默吞掉，
+// 「用户叫停」就会被误报成「元素不存在 / 未送达」，而且重试循环会继续点下去。
+// 这不是理论风险——BOSS 脚本实测踩过（`evalResult` 把 ok:false 变成 `{}`，
+// 且从不释放租约）。这里把契约固化，防止改动时静默退化。
+
+const SCRIPTS = path.join(__dirname, "..", "skills", "agent-browser-bridge", "scripts");
+
+test("契约: BOSS 脚本显式抛出桥错误（不再静默吞成 {}）", () => {
+  for (const f of ["boss-send-chat.mjs", "boss-batch-apply.mjs"]) {
+    const src = fs.readFileSync(path.join(SCRIPTS, f), "utf8");
+    assert.match(src, /function assertOk\(/, `${f} 必须有 assertOk() 守卫桥错误`);
+    assert.match(src, /throw new AgentStoppedError|code === "AGENT_STOPPED"/,
+      `${f} 必须把 AGENT_STOPPED 单独识别出来`);
+    // 旧写法：把 ok:false 静默变成 null/{}
+    assert.doesNotMatch(src, /resp\?\.ok === false \? null/,
+      `${f} 不得再把桥错误静默吞成 null（旧 bug）`);
+  }
+});
+
+test("契约: BOSS 脚本把 AGENT_STOPPED 映射为退出码 3（不与其他失败混淆）", () => {
+  const send = fs.readFileSync(path.join(SCRIPTS, "boss-send-chat.mjs"), "utf8");
+  assert.match(send, /EXIT_STOPPED = 3/, "send-chat 必须定义退出码 3");
+  assert.match(send, /process\.exit\(EXIT_STOPPED\)/, "用户叫停必须用退出码 3 退出");
+
+  const batch = fs.readFileSync(path.join(SCRIPTS, "boss-batch-apply.mjs"), "utf8");
+  assert.match(batch, /process\.exit\(3\)/, "batch-apply 用户叫停必须用退出码 3 退出");
+});
+
+test("契约: BOSS 脚本在写操作前检查停止状态", () => {
+  const batch = fs.readFileSync(path.join(SCRIPTS, "boss-batch-apply.mjs"), "utf8");
+  assert.match(batch, /async function checkStop\(/, "batch-apply 必须有 checkStop()");
+  assert.match(batch, /await checkStop\("发送消息前"\)/, "发消息前必须检查停止");
+  // 重试循环里也要查：否则用户叫停后还会继续导航/点击
+  assert.match(batch, /await checkStop\("重试投递前"\)/, "重试前必须检查停止（这是旧代码继续点下去的地方）");
+
+  const send = fs.readFileSync(path.join(SCRIPTS, "boss-send-chat.mjs"), "utf8");
+  assert.match(send, /await checkStop\("写入输入框前"\)/, "send-chat 必须在写输入框前检查");
+  assert.match(send, /await checkStop\("点击发送前"\)/, "send-chat 必须在点击发送前检查");
+});
+
+test("契约: BOSS 脚本主动释放 Tab 租约（否则锁 120 秒）", () => {
+  for (const f of ["boss-send-chat.mjs", "boss-batch-apply.mjs"]) {
+    const src = fs.readFileSync(path.join(SCRIPTS, f), "utf8");
+    assert.match(src, /async function releaseLease\(/, `${f} 必须有 releaseLease()`);
+    assert.match(src, /tabs\/release/, `${f} 必须真的调 /tabs/release`);
+    // 异常路径也要释放：顶层 await 的 reject 走 uncaughtException（不是 unhandledRejection）
+    assert.match(src, /process\.on\("unhandledRejection",/, `${f} 必须接管 unhandledRejection`);
+    assert.match(src, /process\.on\("uncaughtException",/, `${f} 必须接管 uncaughtException（顶层 await 走这条）`);
+  }
+});
+
+test("契约: 停止状态查询走只读方法 agent.stopStatus（停止期间也允许）", () => {
+  for (const f of ["boss-send-chat.mjs", "boss-batch-apply.mjs"]) {
+    const src = fs.readFileSync(path.join(SCRIPTS, f), "utf8");
+    assert.match(src, /agent\.stopStatus/, `${f} 必须用 agent.stopStatus 查停止状态`);
+  }
 });

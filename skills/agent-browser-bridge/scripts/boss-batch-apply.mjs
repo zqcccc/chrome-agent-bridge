@@ -43,13 +43,58 @@ async function rpc(method, params) {
     },
     body: JSON.stringify({ method, params, timeoutMs: 25000 }),
   }).then((r) => r.json());
-  return resp;
+  return assertOk(resp, method);
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// page.evaluate 返回值在 result.result 里（可能是 JSON 字符串），统一解析
+// ---------- 桥调用守卫（重要） ----------
+// 桥的错误必须**显式抛出**，不能让 evalResult 静默吞掉：
+//   · 旧写法 `resp.ok === false ? null : ...` 会把失败变成 `{}`，上层看到的是
+//     「元素不存在 / 未送达」，而真实原因（用户按了停止、租约被占、超时）被掩盖。
+//   · `AGENT_STOPPED` 是「用户明确叫停」，**绝不可重试**：必须立刻终止整个脚本，
+//     否则重试循环会继续导航、继续点「立即沟通」——用户以为停了，页面还在动。
+class AgentStoppedError extends Error {
+  constructor(message, details) {
+    super(message);
+    this.name = "AgentStoppedError";
+    this.code = "AGENT_STOPPED";
+    this.details = details || {};
+  }
+}
+function assertOk(resp, method) {
+  if (resp && resp.ok !== false) return resp;
+  const e = (resp && resp.error) || {};
+  const code = e.code || "RPC_ERROR";
+  const msg = `${method} 失败: [${code}] ${e.message || "未知错误"}`;
+  if (code === "AGENT_STOPPED") throw new AgentStoppedError(msg, e.details);
+  const err = new Error(msg);
+  err.code = code;
+  err.details = e.details;
+  throw err;
+}
+// 本脚本用顶层 await：顶层 await 的 reject 走的是 **uncaughtException**（不是
+// unhandledRejection——已实测确认）。两个都注册，否则用户叫停时打出的是 Node 堆栈，
+// 退出码也不是约定的 3，调用方无法区分「被用户停了」和「真出错了」。
+function onFatal(e) {
+  // 先释放租约再退出（见 releaseLease 注释）
+  return releaseLease().then(() => {
+    if (e && e.code === "AGENT_STOPPED") {
+      console.error(`✗ 用户已停止 Agent，本批已终止：${e.message}`);
+      console.error("  不要自动重试：用户刚明确要求停下来。用 agent.resume 恢复后重新决定。");
+      process.exit(3);
+    }
+    console.error("✗ " + ((e && e.code) ? `[${e.code}] ` : "") + (e && e.message ? e.message : String(e)));
+    process.exit(1);
+  });
+}
+process.on("unhandledRejection", onFatal);
+process.on("uncaughtException", onFatal);
+
+// page.evaluate 返回值在 result.result 里（可能是 JSON 字符串），统一解析。
+// 注意：到这里 resp.ok 已保证为真（rpc() 已校验），所以这里的 `{}` 只代表
+// 「表达式返回空」，不再掩盖桥层错误。
 function evalResult(resp) {
-  const raw = resp?.ok === false ? null : resp?.result?.result;
+  const raw = resp?.result?.result;
   if (raw === undefined || raw === null) return {};
   if (typeof raw === "string") {
     try { return JSON.parse(raw); } catch { return { raw }; }
@@ -57,6 +102,31 @@ function evalResult(resp) {
   return raw;
 }
 
+// ---------- 停止检测 ----------
+// 用户随时可能在页面上按「停止 Agent」。停止**不是**「元素找不到」这类可重试的失败，
+// 而是「用户明确要求停下来」——必须立刻终止整批，不能继续导航/点「立即沟通」。
+//
+// 检测用 agent.stopStatus（只读，停止期间也允许），所以在任何位置调用都安全。
+let stoppedInfo = null;
+let leased = false;
+async function checkStop(where) {
+  let st;
+  try {
+    st = await rpc("agent.stopStatus", { tabId: TAB });
+  } catch (e) {
+    if (e.code === "AGENT_STOPPED") throw e;
+    return;   // 查询失败（如旧版扩展没这个方法）不阻断主流程
+  }
+  const r = st && st.result;
+  if (r && r.applicable) {
+    stoppedInfo = r.stop || { reason: "user" };
+    const scope = r.scope === "tab" ? `tab ${TAB}` : "全局";
+    throw new AgentStoppedError(
+      `用户已停止 Agent（${scope}，reason=${stoppedInfo.reason || "user"}）于 ${where}，本批已终止`,
+      { ...stoppedInfo, resumeWith: "agent.resume" }
+    );
+  }
+}
 async function claimTab() {
   const resp = await fetch("http://127.0.0.1:8778/tabs/claim", {
     method: "POST",
@@ -64,6 +134,21 @@ async function claimTab() {
     body: JSON.stringify({ tabId: TAB, agentId, ttlMs: 120000 }),
   }).then((r) => r.json());
   if (!resp.ok) throw new Error(`无法获取 Tab 租约: ${resp.error?.code || "LEASE_FAILED"} ${resp.error?.message || ""}`);
+  leased = true;
+}
+// 租约必须**主动释放**：否则脚本退出后该 tab 会被锁住 120 秒，
+// 下一个 Agent 拿到 TAB_LEASED 却不知道是谁占的（实测踩过：残留 3 个租约）。
+// 异常退出（含用户叫停）也要释放，所以 onFatal 里也调。
+async function releaseLease() {
+  if (!leased) return;
+  leased = false;
+  try {
+    await fetch("http://127.0.0.1:8778/tabs/release", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, "X-Agent-Id": agentId },
+      body: JSON.stringify({ tabId: TAB, agentId }),
+    });
+  } catch (e) { /* 释放失败不掩盖原始错误；host 侧租约会自然过期 */ }
 }
 await claimTab();
 console.log(`tab ${TAB} leased by ${agentId}`);
@@ -85,6 +170,8 @@ async function readSession() {
 // 点「立即沟通」并等待聊天页就绪：.chat-input 出现 + 选中会话文本匹配职位。最多轮询 ~12s，失败重试一次。
 async function openChat(job) {
   for (let attempt = 0; attempt < 2; attempt++) {
+    // 重试前先查停止状态：用户叫停后不得再导航、再点「立即沟通」
+    await checkStop("重试投递前");
     // 导航必须用 page.navigate（chrome.tabs.update），禁止用 page.evaluate 改 location.href（会销毁执行上下文）
     await rpc("page.navigate", { tabId: TAB, url: job.url, timeoutMs: 30000 });
     await sleep(4000);
@@ -94,6 +181,8 @@ async function openChat(job) {
       sess = await readSession();
       if (sess && sess.chatInput && sess.url.indexOf("/chat") >= 0 && sess.sel && job.check.test(sess.sel)) return sess;
       await sleep(500);
+      // 轮询期间也要能发现停止（否则要等下一次写操作才会撞上）
+      if (i % 6 === 5) await checkStop("等待聊天页就绪时");
     }
     console.log("会话未就绪/不匹配，重试...");
   }
@@ -102,6 +191,7 @@ async function openChat(job) {
 
 // 发送一条消息：受控输入 → 轮询发送按钮可用（≤3s）→ 只点一次 → 轻量验证（拦截文案 + 输入框已清空）
 async function sendText(text) {
+  await checkStop("发送消息前");   // 不可逆操作：发送前必须确认用户没叫停
   const safe = JSON.stringify(text);
   const typed = evalResult(await rpc("page.evaluate", { tabId: TAB, expression: `(()=>{
     const el=document.querySelector('.chat-input');
@@ -149,6 +239,8 @@ const messages = [
 
 for (const j of jobs) {
   console.log(`\n===== ${j.name} =====`);
+  // 每个职位开始前先确认没有被用户叫停（停一次就整批退出，不继续骚扰）
+  await checkStop("开始下一个职位前");
   const sess = await openChat(j);
   if (!sess) { console.log("✗ 会话未就绪/不匹配，跳过（投递记录标记 not_sent）"); continue; }
   console.log("会话:", sess.sel);
@@ -161,4 +253,5 @@ for (const j of jobs) {
     await sleep(500);
   }
 }
+await releaseLease();
 console.log("\n===== 完成 =====");

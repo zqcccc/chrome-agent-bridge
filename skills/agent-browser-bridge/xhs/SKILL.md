@@ -68,6 +68,15 @@ BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs
 
 ## 核心规约
 
+0.5 **用户叫停（`AGENT_STOPPED`）必须当成终止信号**（v0.3.11+）：
+   用户在页面上随时可能点「停止 Agent」。此时写操作（`page.click`/`page.type`/`navigate`/CDP 的 `Input.*`）
+   会返回 `AGENT_STOPPED`，而不是选择器错误。
+   - **不要重试、不要换选择器、不要换 tab 继续**——用户是明确要求停下来，不是页面出问题。
+   - 恢复需要显式 `agent.resume`（错误里 `details.resumeWith` 就是这个值，`details.scope` 是 `tab`/`all`）。
+   - 只读操作（`page.info`/`snapshot`/`evaluate`）**不受影响**：你仍可以看页面来向用户汇报当前进度。
+   - 与「软风控」区分：软风控是点一下【我知道了】就能继续（上文）；`AGENT_STOPPED` 是人叫停，
+     必须停并交给用户决定。
+
 0. **禁止自己写小红书抓取脚本（强制）**：本专项的 `scripts/*.mjs` 内置了小红书风控防护——限速与随机抖动、单 tab 内操作、验证码页（`website-login/captcha`）/「Security Verification」/404 自动拦截退出、`tabs.prepare` 静默注入、受控组件正确 setter。**自己临时写的裸脚本（拼 HTTP、自己 `page.evaluate` 遍历 DOM、为每条笔记开新 tab、无脑 `sleep` 循环滚动）没有这些防护，几轮就会触发风控**，且报错常被误判成「选择器不对」而继续重试，进一步加重限制。
    - 需求不匹配时：**先改参数**（`--max-scrolls` / `--max-results` / `--channel` / `--filter` / `--card`），再考虑改脚本；
    - 确实缺功能才自己写，且必须**以本目录 `scripts/` 中同类脚本为模板复制改写**，继承其限速与拦截检测，并在交付说明里注明「基于 `scripts/X.mjs` 改写，因缺少 Y」。禁止从零手写。

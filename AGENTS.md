@@ -96,9 +96,17 @@ host.log 只记 host 侧的 RPC 收发，**不含扩展内部的 `console.error`
 修法：`normalizeToken()` 在读取和写入两端都做归一（含 `%xx` 才解码，解码失败保留原值）。**凡是 token 进出配置，都过一遍 `normalizeToken`。**
 
 ### 回归自检：`node agent/cli.mjs verify`
-
 改完扩展跑一次，验证各修复项是否生效（脚本在 `agent/verify-bridge.mjs`）。改坏东西能立刻发现，不用等用户反馈。
-全量回归是 `cd relay && npm test`（含版本守卫、集成、单元、lib、tab 健康、冻结自愈）。
+
+全量回归分两层（`npm test` = 两层串联，**会跑真实浏览器**）：
+
+```bash
+cd relay && npm run test:unit-all   # 纯离线：版本守卫 + 单元 + 各 .mjs 断言，不碰用户浏览器
+cd relay && npm run test:e2e        # 真机：需要扩展已加载、host 存活
+```
+
+**普通 CI 只跑 `test:unit-all`**——`test:e2e` 依赖用户本机 Chrome 状态（登录态、已装扩展、活动标签页），
+在 CI 里必然假红。`test-hardening.mjs` / `test-content-stop.mjs` 属离线层，`test-stop-e2e.mjs` 属真机层。
 
 写这类自检脚本有两条教训（都是我自己踩出来的假红）：
 

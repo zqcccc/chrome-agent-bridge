@@ -198,5 +198,33 @@ node <skill 目录>/scripts/boss-batch-apply.mjs <tabId>
 - `scripts/boss-send-chat.mjs`：单条消息发送+验证（输入→点发送→验证送达），使用 `scripts/boss-verify-helpers.mjs` 的 `analyzeDelivery`/`decideOutcome`/`matchDelivery`/`isBlocked` 做结构化判定。
 - `scripts/boss-verify-helpers.mjs`：送达验证纯逻辑模块（不依赖浏览器，可单测）。
 - `scripts/boss-batch-apply.mjs`：多职位批量投递模板（打开详情→立即沟通→发 3 条→轻量验证），复制后改 `jobs` 数组即可。
+
+### 退出码与「用户叫停」（v0.3.11+ 必须处理）
+
+两个脚本都会在发送前后检查停止状态，并在退出时**主动释放 Tab 租约**：
+
+| 退出码 | 含义 |
+|---|---|
+| `0` | send-chat：已确认送达/已读 |
+| `1` | 失败 / 未定论（UNKNOWN 时**不自动重发**，交人工核对） |
+| `2` | 平台拦截（BLOCKED） |
+| `3` | **用户点了页面上的「停止 Agent」** |
+
+退出码 `3` 是「用户明确叫停」，不是普通失败：
+
+- 脚本会**立即终止整批**（batch-apply 不再导航、不再点「立即沟通」；send-chat 不点发送）。
+- **不得自动重试、不得自动补发**。要恢复得显式 `agent.resume`（`details.resumeWith` 就是这个值）。
+- 停止只拦**写**操作（`page.click`/`page.type`/`navigate`/CDP 的 `Input.*`）。
+  本目录脚本的「输入」走 `page.evaluate`（只读方法，不被 host 闸门拦），
+  所以脚本**自己调 `agent.stopStatus` 检查**——改这些脚本时不要把这个检查删了。
+
+> 历史坑（v0.3.11 修）：旧的 `evalResult()` 写成 `resp.ok === false ? null : ...`，
+> 把桥层错误静默变成 `{}`，于是「用户叫停 / 租约被占 / 超时」全被误报成
+> 「元素不存在 / 未送达」，而 `openChat()` 的重试循环还会继续点下去。
+> 现在桥错误由 `assertOk()` 显式抛出，`AGENT_STOPPED` 直接终止进程。
+
+> 租约泄漏（v0.3.11 修）：旧脚本拿到租约后从不释放，异常退出会把该 tab 锁 120 秒，
+> 下一个 Agent 拿到 `TAB_LEASED` 却不知道是谁占的（实测残留 3 个）。
+> 现在所有退出路径（含 `unhandledRejection` / `uncaughtException`）都先 `releaseLease()`。
 - `state/applied-jobs.jsonl`：已投递岗位的追加式去重与审计记录；开始任务前读取，成功发送后写入。
 - `state/quota-blocked-pending.jsonl`：被每日沟通上限截断、**尚未发送**的有效岗位队列。下次继续且额度恢复后，先消费此队列再扩展新关键词；补投前仍按 jobId 去重。

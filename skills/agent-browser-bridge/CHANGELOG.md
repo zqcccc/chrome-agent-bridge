@@ -188,7 +188,7 @@ host.log 全量统计里 `PAGE_CONTEXT_TIMEOUT` 433 次居首，`tabs.prepare` �
 - **`lib/bridge.mjs` 超时错误码不再伪装成 `CONNECTION_REFUSED`**：`req.destroy(err)` 触发的
   `error` 事件会把我们自己的 `BridgeRpcError("TIMEOUT")` 也包装一遍，于是「页面上下文超时」
   被报成「无法连接本地桥」，把人引向错误排查方向。现在 `instanceof BridgeRpcError` 原样透传。
-- 新增回归测试 `relay/test-freeze-recovery.mjs`（已接入 `npm test`）：用 CDP 手动冻结渲染器复现，
+- 新增回归测试 `relay/test-freeze-recovery.mjs`（属 `npm run test:e2e` 真机层）：用 CDP 手动冻结渲染器复现，
   **不依赖等它自然冻结**，覆盖自愈成功、自愈后恢复毫秒级、二次冻结仍能自愈、真·连不上仍报
   `CONNECTION_REFUSED`。
 - 修掉 `relay/test-tab-health.mjs` 的一个假红：它写死 `https://example.com/` 并断言「withPage
@@ -279,7 +279,7 @@ await rpc.scrollLoad(tabId, { y: 99999, expectGrowth: true });
 
 这样 Agent 不写判断也能用，且不会在无关场景（选择器写错、真到底）打扰用户前台。
 
-新增回归测试 `relay/test-foreground-rendering.mjs`（已接入 `npm test`）：本地起一个靠
+新增回归测试 `relay/test-foreground-rendering.mjs`（属 `npm run test:e2e` 真机层）：本地起一个靠
 **IntersectionObserver 懒加载**的页面确定性复现（不依赖外网站点、不需要登录、不会因站点改版失效），
 覆盖：后台 rAF=0、后台滚动不加载 → 报 `SCROLL_NO_GROWTH`、`ensureActive` 后 rAF 恢复且
 懒加载推进、幂等（已在渲染不重复激活）、显式与空闲自动还原、

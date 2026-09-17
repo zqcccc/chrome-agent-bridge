@@ -56,11 +56,32 @@ await bridge.rpc("page.record.stop", { tabId });
 ## 何时使用
 
 - 页面行为异常：404、风控页、验证码、空数据、取不到内容
+- 写操作报错但页面看着正常（先按原则 0 排除 `AGENT_STOPPED`：那是用户叫停，不是页面问题）
 - 需要理解陌生页面结构：类名、链接、滚动容器、弹窗、懒加载
 - 交付前验证：图片数量、URL 可访问性、正则匹配、评论是否加载全
 - 任何"第一版提取/操作没按预期工作"的场景
 
 ## 核心原则（每一条都是实测教训）
+
+0. **先分清「页面错了」和「用户叫停」（v0.3.11+ 新增，排在最前）**：
+   如果写操作返回 `AGENT_STOPPED`，那不是选择器/风控/页面问题——**是用户在页面上按了「停止 Agent」**。
+   这时候去 dump DOM、换选择器、换 tab 重试都是错的，而且会让「已经停下来的页面继续被操作」。
+   判定方式（不要解析 message 文本）：
+
+   ```js
+   catch (e) {
+     if (e.code === "AGENT_STOPPED") {
+       // 用户叫停：停止一切写操作，向用户汇报当前进度，等指示
+       e.detail("resumeWith"); // "agent.resume"
+       e.detail("scope");      // "tab" | "all"
+       return;
+     }
+     // 其余才进入正常排查（dump DOM / 看 host.log）
+   }
+   ```
+
+   只读操作（`page.info`/`snapshot`/`evaluate`/`page.inspect`）**不受停止影响**，
+   所以排查仍可以继续，只是不能再做写操作。
 
 1. **先探查后假设**：写任何选择器/点击逻辑前，先 `page.inspect`（或兜底 `browser-debug.mjs`）dump 目标区域。不猜类名——SPA 的类名多是编译后的哈希（`data-v-xxx`），猜不中很正常，dump 一次全看见。
 2. **全量 dump 关键信息**：链接要带**可见性**（`display:none` 的链接 click() 会触发风控/404）、图片要带 `currentSrc/src/data-src` + `naturalWidth`（懒加载图 naturalWidth=0 不能过滤）、滚动要确认容器。

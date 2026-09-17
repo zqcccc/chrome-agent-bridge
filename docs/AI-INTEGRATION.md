@@ -145,13 +145,28 @@ await bridge.releaseTab(tabs[0].id);
 
 桥接层错误结构化返回，包含 `code`/`method`/`tabId`/`channel`/`elapsedMs`，日志不含 token 与页面内容：
 
-- `TIMEOUT`：扩展响应超时（返回 method/tabId/耗时）。
+- `TIMEOUT`：超时。**排队时间计入 `timeoutMs`**（v0.3.11+），排队/等重连/执行共用一个预算；
+  `details.phase` 说明超在哪一段（`queued` / `waiting-ext` / `executing`）。
+  排到队时预算已耗尽就直接失败，**不会**在你放弃后才把操作发出去。
 - `EXT_DISCONNECTED`：扩展通道断开；断连时所有 pending 请求确定结局，不无限挂起。
 - `NAV_TIMEOUT`：导航或等待 URL/ready/selector 超时。
 - `PAGE_CONTEXT_TIMEOUT`：页面上下文销毁/无法注入 content（导航中、chrome://、上下文崩溃）。
 - `CONTENT_TIMEOUT`：content 调用（click/type 等）超时。
 - `TAB_BUSY`：同 tab 串行队列占用（一般等待而非报错）。
-- `TAB_LEASED`：Tab 已由另一个 Agent 租用。
+- `TAB_LEASED`：Tab 已由另一个 Agent 租用。租约在**派发前会重新校验**，排队期间易主会被拒绝。
+- `AGENT_STOPPED`：**用户在页面上点了「停止 Agent」**（v0.3.11+）。只拦写操作
+  （`page.click`/`type`/`navigate`/CDP 的 `Input.*`），只读操作不受影响。
+  不要重试；`details.resumeWith` = `"agent.resume"`，`details.scope` = `"tab"` / `"all"`。
+
+结构化细节一律在 `error.details`（客户端库用 `e.detail(key)` 读），**不要解析 message 文本**：
+如 `SCROLL_NO_GROWTH` 的 `recoverable`/`atBottom`、`AGENT_STOPPED` 的 `resumeWith`/`scope`。
+
+> 超时与断连是两回事：`TIMEOUT` 是请求发出后超时，`CONNECTION_REFUSED` 才是连不上本地桥
+> （v0.3.11 前客户端把本地超时也包成了 `CONNECTION_REFUSED`，会把人引向「请启动桥」）。
+
+**取消语义**（v0.3.11+）：HTTP 连接断开 / WS 关闭时，同 Agent **尚未派发**的排队请求会被取消。
+对点击、输入、发消息、提交表单这类**不可逆**操作，这是防止「调用方以为失败、实际稍后执行」的关键；
+已派发到扩展的无法撤回，停止响应里会用 `inFlight` 如实报告数量。
 
 HTTP 客户端可通过 `X-Agent-Id` 标识身份；WS 客户端在 `/bridge?...&agentId=<id>` 中传递身份。
 
