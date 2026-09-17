@@ -57,21 +57,139 @@ function log(...parts) {
 }
 
 // ---------- Token ----------
+// token 是本地桥唯一的凭据。**读不到就必须拒绝启动**，绝不能降级成可猜测的固定值。
+//
+// 历史 bug：catch 里 `return "dev"`。于是 STATE_DIR 权限异常 / 磁盘满 / 只读挂载时，
+// 桥会用一个写死在源码里的密码启动。这等于把「读 token 失败」静默变成
+// 「任何知道这个默认值的人都能接管你的浏览器」。
+//
+// 「只监听 127.0.0.1」不是省略这层保护的理由：本机上的任意进程都能访问这个端口
+// （被投毒的 npm postinstall、别的用户账户、以及恶意页面借 DNS rebinding 打到 127.0.0.1）。
+const TOKEN_MIN_LENGTH = 16;
+
+function tokenFailure(message, hint) {
+  const err = new Error(message);
+  err.code = "TOKEN_UNAVAILABLE";
+  err.hint = hint;
+  return err;
+}
+
+// 显式指定 token 的逃生通道（文件坏掉时仍能启动，且不必把 token 写进源码）。
+// 优先级：环境变量 > 命令行。命令行会出现在 `ps` 输出里，所以只作为次选并明确告警。
+function explicitToken() {
+  const env = String(process.env.AGENT_BRIDGE_TOKEN || "").trim();
+  if (env) return { token: env, source: "env:AGENT_BRIDGE_TOKEN", warn: null };
+  const i = args.findIndex((a) => a === "--token");
+  const v = i !== -1 ? String(args[i + 1] || "").trim() : "";
+  if (v && v !== "auto") {
+    return { token: v, source: "argv --token", warn: "命令行传入的 token 会出现在 `ps` 输出里，生产环境请改用环境变量 AGENT_BRIDGE_TOKEN" };
+  }
+  return null;
+}
+
+function validateToken(token, source) {
+  if (!token) throw tokenFailure(`token 为空（来源: ${source}）`, "显式提供的 token 不能为空");
+  if (token.length < TOKEN_MIN_LENGTH) {
+    throw tokenFailure(
+      `token 过短（${token.length} < ${TOKEN_MIN_LENGTH}，来源: ${source}）：弱凭据等于没有凭据`,
+      `请删除 ${TOKEN_FILE} 后重启 host 以重新生成随机 token，或提供一个长度 ≥ ${TOKEN_MIN_LENGTH} 的值`
+    );
+  }
+  return token;
+}
+
 function ensureToken() {
   try {
-    fs.mkdirSync(STATE_DIR, { recursive: true });
-    if (fs.existsSync(TOKEN_FILE)) {
-      const t = fs.readFileSync(TOKEN_FILE, "utf8").trim();
-      if (t) return t;
-    }
-    const token = crypto.randomBytes(24).toString("hex");
-    fs.writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
-    return token;
+    fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   } catch (e) {
-    return "dev";
+    throw tokenFailure(
+      `无法创建状态目录 ${STATE_DIR}（${e.code || e.message}）`,
+      `确认该路径可写：mkdir -p ${STATE_DIR} && chmod 700 ${STATE_DIR}；若曾被 sudo 运行过，需 chown 回当前用户`
+    );
+  }
+
+  let exists = false;
+  try { exists = fs.existsSync(TOKEN_FILE); } catch (e) {
+    throw tokenFailure(`无法检查 token 文件 ${TOKEN_FILE}（${e.code || e.message}）`, `chmod 700 ${STATE_DIR}`);
+  }
+
+  if (exists) {
+    let raw;
+    try {
+      raw = fs.readFileSync(TOKEN_FILE, "utf8");
+    } catch (e) {
+      throw tokenFailure(
+        `无法读取 token 文件 ${TOKEN_FILE}（${e.code || e.message}）`,
+        `chmod 600 ${TOKEN_FILE}（目录 700）；或设置 AGENT_BRIDGE_TOKEN 显式提供 token`
+      );
+    }
+    const token = raw.trim();
+    if (!token) {
+      // 空文件 = 没有任何可用凭据（通常是上一次写入中途崩溃）。重新生成是安全的：
+      // 新值仍然是 24 字节随机数，不引入可猜测性。但必须留下明确记录，不静默处理。
+      log(`warn: token 文件为空（${TOKEN_FILE}），重新生成`);
+    } else {
+      validateToken(token, TOKEN_FILE);
+      ensureTokenFileMode();
+      return token;
+    }
+  }
+
+  const token = crypto.randomBytes(24).toString("hex");
+  try {
+    fs.writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
+  } catch (e) {
+    throw tokenFailure(
+      `无法写入 token 文件 ${TOKEN_FILE}（${e.code || e.message}）`,
+      `确认目录可写且未满：chmod 700 ${STATE_DIR}；或设置 AGENT_BRIDGE_TOKEN 显式提供 token`
+    );
+  }
+  // 回读校验：磁盘满 / 只读挂载时 writeFileSync 可能「成功」但内容不对，
+  // 那样 host 会拿一个自己以为写下去了、实际没生效的 token 去要求客户端。
+  let back = "";
+  try { back = fs.readFileSync(TOKEN_FILE, "utf8").trim(); } catch (e) {
+    throw tokenFailure(`token 写入后无法回读 ${TOKEN_FILE}（${e.code || e.message}）`, `chmod 700 ${STATE_DIR}`);
+  }
+  if (back !== token) {
+    throw tokenFailure(`token 写入未生效（回读不匹配，${TOKEN_FILE}）`, "磁盘可能已满或为只读挂载；修复后重启 host");
+  }
+  return token;
+}
+
+// 权限收紧：token 文件必须只有属主可读（600）。
+// 别的本地用户能读 token 就等于能接管浏览器，所以这里不只是「建议」。
+function ensureTokenFileMode() {
+  try {
+    const st = fs.statSync(TOKEN_FILE);
+    if ((st.mode & 0o077) !== 0) {
+      fs.chmodSync(TOKEN_FILE, 0o600);
+      log(`warn: token 文件权限过宽（${(st.mode & 0o777).toString(8)}）→ 已收紧为 600`);
+    }
+  } catch (e) {
+    log(`warn: 无法收紧 token 文件权限（${e.code || e.message}），请手工 chmod 600 ${TOKEN_FILE}`);
   }
 }
-const TOKEN = ensureToken();
+
+const TOKEN = (() => {
+  try {
+    const explicit = explicitToken();
+    if (explicit) {
+      if (explicit.warn) log(`warn: ${explicit.warn}`);
+      log(`token 来源: ${explicit.source}`);
+      return validateToken(explicit.token, explicit.source);
+    }
+    return ensureToken();
+  } catch (e) {
+    // 必须在这里终结，而不是把异常抛到模块顶层：抛出去会打印一大段 Node 堆栈，
+    // 真正的诊断（code=TOKEN_UNAVAILABLE + 修复建议）会被淹没在堆栈里。
+    // fatal() 是函数声明（已提升），可以在此安全调用。
+    return fatal(e);
+  }
+})();
+// TOKEN_UNAVAILABLE 必须在**监听端口之前**终结进程（fail-closed）。
+// 若改为延迟到第一次请求时才报错，桥会先以「看似就绪」的状态接受连接，
+// 客户端拿到的是一个不可用的服务——比启动失败更难诊断。
+// fatal() 是函数声明（已提升），可以在这里安全调用。
 
 // ---------- 扩展通道抽象 ----------
 // 优先 native port，fallback 到 WS(/agent)
@@ -162,70 +280,314 @@ function rpcLog(level, ctx) {
   log("rpc " + line);
 }
 
+// ---------- 客户端断开：取消尚未派发的请求 ----------
+// 起因：「调用方以为失败」绝不能变成「稍后偷偷执行」。对 page.click / page.type /
+// 发送消息 / 提交表单这类**不可逆**操作，这是最危险的失败模式：HTTP 客户端已经
+// 超时返回并告诉了用户「失败」，而 host 还在队列里等，一会儿照样把点击发出去。
+class ClientGoneError extends Error {
+  constructor() { super("客户端已断开，尚未派发的请求已取消"); this.code = "CLIENT_GONE"; }
+}
+
+// ---------- 统一预算：排队 + 等重连 + 执行共用一个截止时间 ----------
+// 历史 bug（已隔离复现）：计时器在请求**真正发出后**才启动，排队时间完全不计入，
+// 于是「超时 10ms」的请求排队 52ms 后仍被发送。
+function makeBudget(timeoutMs) {
+  const total = Math.max(1, Number(timeoutMs) || 60000);
+  const deadline = Date.now() + total;
+  return {
+    total,
+    deadline,
+    remaining() { return deadline - Date.now(); },
+    expired() { return Date.now() >= deadline; },
+  };
+}
+
+function err(code, message, extra) { return Object.assign({ code, message }, extra || {}); }
+
+function budgetExpiredError(method, tabId, budget, note) {
+  return err("TIMEOUT", `请求超时(${budget.total}ms)：${method}${note ? " · " + note : ""}`, {
+    method, tabId, elapsedMs: Date.now() - (budget.deadline - budget.total),
+    details: { phase: note || "dispatch", budgetMs: budget.total },
+  });
+}
+
+// ---------- 停止状态（用户点「停止 Agent」） ----------
+// 历史问题：agent.stop 只是**通知**——广播给订阅者、页面隐藏按钮——但 host 不清空
+// 待执行队列，也不拦后续 RPC。通过 HTTP 调用、没订阅事件的 Agent 根本不知道用户
+// 按了停止，排队的点击/输入会继续执行，而界面已经显示「已放开」。
+// 现在停止是一个**可查询、会拒绝新请求、会取消未派发请求**的状态；只有显式
+// agent.resume 才解除。已经完成的页面动作无法撤销，响应里会如实说明这一点。
+const STOP_DEFAULT_TTL_MS = 300000; // 5 分钟：够长到不会被误当「已恢复」，又不是永久
+const stopState = new Map();        // "*" | tabId -> { at, reason, by, tabId, expiresAt }
+const inflight = new Set();         // 已受理但可能尚未派发的请求（用于取消）
+
+function stopKey(tabId) { return tabId === undefined || tabId === null ? "*" : String(tabId); }
+function clearExpiredStops() {
+  const now = Date.now();
+  for (const [k, v] of stopState) if (v.expiresAt <= now) stopState.delete(k);
+}
+function activeStop(tabId) {
+  clearExpiredStops();
+  // tab 级停止优先于全局停止
+  return (tabId != null ? stopState.get(String(tabId)) : null) || stopState.get("*") || null;
+}
+// 停止/恢复类方法自身必须能穿过停止闸门，否则停止无法解除。
+function isStopMethod(method) {
+  return method === "agent.stop" || method === "agent.resume" || method === "agent.stopStatus";
+}
+
+// 停止会拦哪些方法：**只拦真正改变页面/浏览器状态的写操作**。
+//
+// 不拦三类（这条边界很重要，别随手加）：
+//   1. **观察类**（tabs.list / page.info / page.snapshot / bridge.status）：
+//      Agent 必须能看当前状态才能决定「该等用户、还是该恢复」，全拦等于把它盲住；
+//      而且 /extension/reload 流程自己会轮询 bridge.status，拦了会把桥卡死。
+//   2. **释放类**（tabs.close / session.detach）：停止不能把资源泄漏变成新问题。
+//      拦住 detach 会留下未释放的 debugger 会话，之后每个 page.* 都 attach 不上——
+//      「停止」比不停更糟。
+//   3. **恢复类**（agent.resume / session.attach）：不能自锁。
+//      attach 本身不改页面内容（只是开 CDP 通道），危险动作在 session.send。
+//
+// ⚠ 这份清单必须与 extension/background.js 的 SIDE_EFFECT_METHODS **逐字一致**：
+//   host 拦「还没派发的」，扩展拦「已派发但还没落到页面上的」。两边不一致就会出现
+//   「host 放行、扩展拒绝」这类难以定位的行为。test-hardening.mjs 有契约测试防止漂移。
+const SIDE_EFFECT_METHODS = new Set([
+  "page.click", "page.type", "page.press", "page.select", "page.scroll",
+  "page.hover", "page.focusEl", "page.navigate", "page.back", "page.forward",
+  "page.reload", "page.waitFor", "page.activateAndShot", "page.ensureActive",
+  "tabs.create", "tabs.reload", "tabs.activate",
+]);
+
+// session.send 是个“包罗万象”的 CDP 通道：既能 Input.dispatchMouseEvent（真点击），
+// 也能 Runtime.evaluate / Page.captureScreenshot（纯读取）。一刀切拦掉会把 Agent 的
+// 观察能力一起封死（skill 的 ev/attach 全走 CDP），所以按 **CDP method** 细分：
+//   · 输入/导航类（Input.*、Page.navigate、Page.reload…）→ 拦（这就是“点击/输入”）；
+//   · 其余（Runtime.*、DOM.*、Network.*、Page.captureScreenshot…）→ 放行。
+const BLOCKED_CDP_PREFIXES = ["Input."];
+const BLOCKED_CDP_METHODS = new Set([
+  "Page.navigate", "Page.reload", "Page.navigateToHistoryEntry",
+  "Page.setDocumentContent", "DOM.setAttributeValue", "DOM.setOuterHTML",
+]);
+function isBlockedCdpCall(cdpMethod) {
+  const m = String(cdpMethod || "");
+  if (BLOCKED_CDP_METHODS.has(m)) return true;
+  return BLOCKED_CDP_PREFIXES.some((p) => m.startsWith(p));
+}
+
+function isBlockedByStop(method, params) {
+  if (typeof method !== "string" || isStopMethod(method)) return false;
+  if (method.startsWith("page.indicator.")) return false;   // 指示器只是视觉，不拦
+  if (method === "session.send") return isBlockedCdpCall(params && params.method);
+  return SIDE_EFFECT_METHODS.has(method);
+}
+function stoppedError(st, method, tabId) {
+  return err("AGENT_STOPPED", `用户已停止 Agent（${st.reason}${st.tabId != null ? ` · tab ${st.tabId}` : " · 全部"}），本请求未执行`, {
+    method, tabId: tabId != null ? tabId : st.tabId,
+    details: { stoppedAt: st.at, reason: st.reason, scope: st.tabId != null ? "tab" : "all", resumeWith: "agent.resume" },
+  });
+}
+
+/**
+ * 取消**尚未派发**的请求。已派发到扩展的无法撤回（如实返回 cancelled 与 note）。
+ * pred(entry) 决定哪些请求受影响。
+ */
+function cancelInflight(pred, reason) {
+  let n = 0;
+  for (const e of inflight) {
+    if (e.dispatched) continue;         // 已发出的请求无法撤销
+    if (!pred(e)) continue;
+    e.cancelled = reason;
+    if (typeof e.rejectNow === "function") e.rejectNow(reason);
+    n++;
+  }
+  return n;
+}
+
+/**
+ * 设置停止状态。返回 { stop, cancelledQueued, inFlight }。
+ * 注意语义边界：已经执行的页面动作不能撤销，返回值里必须说清楚。
+ */
+function setStop(tabId, opts = {}) {
+  const key = stopKey(tabId);
+  const ttl = Math.max(1000, Math.min(Number(opts.ttlMs) || STOP_DEFAULT_TTL_MS, 3600000));
+  const st = {
+    at: Date.now(),
+    reason: opts.reason || "user",
+    by: opts.by || "user",
+    tabId: tabId === undefined || tabId === null ? null : tabId,
+    expiresAt: Date.now() + ttl,
+  };
+  stopState.set(key, st);
+  const cancelledQueued = cancelInflight(
+    (e) => st.tabId === null || String(e.tabId) === String(st.tabId),
+    err("AGENT_STOPPED", `用户已停止 Agent（${st.reason}），排队中的请求已取消`)
+  );
+  let inFlight = 0;
+  for (const e of inflight) {
+    if (st.tabId !== null && String(e.tabId) !== String(st.tabId)) continue;
+    if (e.dispatched) inFlight++;
+  }
+  log(`agent.stop scope=${st.tabId === null ? "all" : "tab=" + st.tabId} reason=${st.reason} cancelledQueued=${cancelledQueued} inFlight=${inFlight}`);
+  return { stop: st, cancelledQueued, inFlight };
+}
+
+function clearStop(tabId) {
+  const key = stopKey(tabId);
+  const had = stopState.delete(key);
+  if (tabId === undefined || tabId === null) stopState.clear();
+  return had;
+}
+
 // 向扩展发一个 RPC，返回 Promise。同一 tab 的串行方法排队串行执行。
-async function requestExtension(method, params, timeoutMs = 60000, agentId = "anonymous", agentName = "") {
+async function requestExtension(method, params, timeoutMs = 60000, agentId = "anonymous", agentName = "", opts = {}) {
   const tabId = tabIdOf(method, params);
+  // 预算从**入口**开始计，排队、等重连、执行共用它。
+  const budget = makeBudget(timeoutMs);
   touchAgent(agentId, agentName);
   const agentInfo = agents.get(agentId) || { name: agentName || "agent" };
   const effectiveAgentName = agentName || agentInfo.name || "agent";
+
+  // 停止/恢复/查询停止状态：**在 host 本地处理，不转发给扩展**。
+  //
+  // 为什么必须拦在这里（端到端踩到的坑）：客户端可能用两条路发同一个意图——
+  // HTTP 的 /agent/stop 路由，或者普通 RPC `agent.resume`。如果只实现前者，
+  // 用 RPC 发 resume 的客户端会只清掉扩展侧的停止，host 的 stopState 仍然是停的，
+  // 于是「明明 resume 成功了，写操作还是被拦」——两边状态分叉。
+  // 统一在这里收敛：host 是停止状态的事实来源，扩展只是把同一个意图下发给页面。
+  if (method === "agent.stop") return agentStop(params, { agentId, agentName: effectiveAgentName });
+  if (method === "agent.resume") return agentResume(params, { agentId, agentName: effectiveAgentName });
+  if (method === "agent.stopStatus") return agentStopStatus(params);
+
+  // 停止状态：拒绝新的**写**操作（不是只广播一条事件）。
+  if (isBlockedByStop(method, params)) {
+    const st = activeStop(tabId);
+    if (st) throw stoppedError(st, method, tabId);
+  }
 
   const denied = tabId != null ? checkLease(tabId, agentId) : null;
   if (denied) throw denied;
   const serial = isSerialMethod(method) && tabId != null;
 
-  // tab unhealthy 恢复窗口：上次请求超时/断连后给一点恢复时间，避免雪崩
-  if (serial && tabId != null) {
-    const until = tabUnhealthy.get(tabId);
-    if (until && Date.now() < until) {
-      await new Promise((r) => setTimeout(r, until - Date.now()));
-    } else if (until) {
-      tabUnhealthy.delete(tabId);
-    }
-  }
-
-  const exec = () => sendExtensionRequest(method, params, timeoutMs, tabId, agentId, effectiveAgentName);
-  if (!serial) return exec();
-
-  // per-tab 串行队列
-  let q = tabQueues.get(tabId);
-  if (!q) { q = { running: false, queue: [] }; tabQueues.set(tabId, q); }
-  return new Promise((resolve, reject) => {
-    const run = () => exec().then(resolve, reject).finally(() => {
-      if (q.queue.length) {
-        const next = q.queue.shift();
-        next.run();
-      } else {
-        q.running = false;
-        // 空闲一段时间后清理队列结构，避免长期持有已关闭 tab
-        const cleanup = setTimeout(() => {
-          if (tabQueues.get(tabId) === q && !q.running && q.queue.length === 0) {
-            tabQueues.delete(tabId);
-          }
-        }, 60000);
-        if (cleanup.unref) cleanup.unref();
+  const entry = {
+    method, tabId, agentId, agentName: effectiveAgentName,
+    dispatched: false,        // 真正发到扩展后置 true（之后不可取消）
+    cancelled: null,          // 取消原因（错误对象）
+    budget, agentWss: opts.clientWs || null,
+  };
+  inflight.add(entry);
+  // 排队超时计时器：**这是「排队时间计入超时」真正生效的地方**。
+  // 只在派发前重查是不够的：调用方会一直等到轮到它才得知超时（实测排队 52ms +
+  // 自己的预算，客户端早已放弃）。这里到点就立刻失败。
+  const budgetTimer = setTimeout(() => {
+    if (entry.dispatched || entry.settled) return;
+    const e = budgetExpiredError(method, tabId, budget, "queued");
+    if (!entry.cancelled) entry.cancelled = e;
+    if (typeof entry.rejectNow === "function") entry.rejectNow(entry.cancelled);
+  }, Math.max(1, budget.remaining()));
+  try {
+    // tab unhealthy 恢复窗口：上次请求超时/断连后给一点恢复时间，避免雪崩
+    if (serial && tabId != null) {
+      const until = tabUnhealthy.get(tabId);
+      if (until && Date.now() < until) {
+        // 恢复窗口不能突破预算：等不完就直接失败，而不是先等再超时。
+        await new Promise((r) => setTimeout(r, Math.max(0, Math.min(until - Date.now(), budget.remaining()))));
+      } else if (until) {
+        tabUnhealthy.delete(tabId);
       }
+    }
+
+    // 排队/等待之后重新校验：预算、停止状态、租约都可能已经变了。
+    // 历史 bug：只在入队前查一次，排队期间租约易主也不会阻止派发。
+    const early = preDispatchError(entry, method, tabId, agentId, budget, "pre-dispatch", params);
+    if (early) throw early;
+
+    if (!serial) return await sendExtensionRequest(entry, params, agentId, effectiveAgentName);
+
+    // per-tab 串行队列
+    let q = tabQueues.get(tabId);
+    if (!q) { q = { running: false, queue: [] }; tabQueues.set(tabId, q); }
+    return await new Promise((resolve, reject) => {
+      // 允许「取消」立即回错，而不用等它排到队首才告诉调用方（用户按了停止，
+      // 调用方应该立刻知道；否则界面显示已停止、Agent 还在傻等）。
+      entry.rejectNow = (e) => { if (!entry.settled) { entry.settled = true; reject(e); } };
+      const run = async () => {
+        try {
+          // 轮到执行时**再查一次**：这是修复「排队期间状态变了照样发」的关键位置。
+          const again = entry.cancelled || preDispatchError(entry, method, tabId, agentId, budget, "queued", params);
+          if (again) throw again;
+          const result = await sendExtensionRequest(entry, params, agentId, effectiveAgentName);
+          if (!entry.settled) { entry.settled = true; resolve(result); }
+        } catch (e) {
+          if (!entry.settled) { entry.settled = true; reject(e); }
+        } finally {
+          if (q.queue.length) {
+            const next = q.queue.shift();
+            next.run();
+          } else {
+            q.running = false;
+            // 空闲一段时间后清理队列结构，避免长期持有已关闭 tab
+            const cleanup = setTimeout(() => {
+              if (tabQueues.get(tabId) === q && !q.running && q.queue.length === 0) {
+                tabQueues.delete(tabId);
+              }
+            }, 60000);
+            if (cleanup.unref) cleanup.unref();
+          }
+        }
+      };
+      if (q.running) q.queue.push({ run, entry });
+      else { q.running = true; run(); }
     });
-    if (q.running) q.queue.push({ run });
-    else { q.running = true; run(); }
-  });
+  } finally {
+    clearTimeout(budgetTimer);
+    inflight.delete(entry);
+  }
 }
 
-async function sendExtensionRequest(method, params, timeoutMs, tabId, agentId, agentName) {
+/**
+ * 派发前的统一闸门：取消 / 停止 / 租约 / 预算 / 客户端存活。
+ * 返回 null 表示可以派发，否则返回应抛出的错误对象。
+ */
+function preDispatchError(entry, method, tabId, agentId, budget, phase, params) {
+  if (entry.cancelled) return entry.cancelled;
+  if (isBlockedByStop(method, params)) {
+    const st = activeStop(tabId);
+    if (st) return stoppedError(st, method, tabId);
+  }
+  const denied = tabId != null ? checkLease(tabId, agentId) : null;
+  if (denied) return denied;
+  if (budget.expired()) return budgetExpiredError(method, tabId, budget, phase);
+  return null;
+}
+
+async function sendExtensionRequest(entry, params, agentId, agentName) {
+  const { method, tabId, budget } = entry;
   if (!extReady()) {
+    // 等重连也**消耗同一个预算**（历史 bug：这里固定 12s，与 timeoutMs 无关）。
+    // 而且必须能被取消立刻打断：否则用户按了停止，请求还要在「等重连」里再挂满 12s。
     const waited = await new Promise((resolve) => {
-      const start = Date.now();
+      const startedWaiting = Date.now();
+      let cancelTimer = null;
+      const finish = (ok) => { clearInterval(t); if (cancelTimer) clearTimeout(cancelTimer); resolve(ok); };
       const t = setInterval(() => {
-        if (extReady()) { clearInterval(t); resolve(true); }
-        else if (Date.now() - start > 12000) { clearInterval(t); resolve(false); }
+        if (extReady()) finish(true);
+        else if (budget.expired() || entry.cancelled || Date.now() - startedWaiting > 12000) finish(false);
       }, 250);
+      cancelTimer = setTimeout(() => finish(false), Math.max(1, budget.remaining()));
+      if (cancelTimer.unref) cancelTimer.unref();
     });
     if (!waited) {
-      throw { code: "EXT_DISCONNECTED", message: "扩展未连接（请确认扩展已加载并开启）" };
+      if (entry.cancelled) throw entry.cancelled;
+      if (budget.expired()) throw budgetExpiredError(method, tabId, budget, "waiting-ext");
+      throw err("EXT_DISCONNECTED", "扩展未连接（请确认扩展已加载并开启）", { method, tabId });
     }
   }
   const requestId = genRequestId();
   const channel = currentChannel();
   const startedAt = Date.now();
+  const remaining = budget.remaining();
+  if (remaining <= 0) throw budgetExpiredError(method, tabId, budget, "pre-send");
+  entry.dispatched = true;   // 此后不可取消：已经交给扩展了
   rpcLog("info", { method, tabId, channel, reqId: requestId, note: "dispatch" });
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -234,10 +596,13 @@ async function sendExtensionRequest(method, params, timeoutMs, tabId, agentId, a
       pending.delete(requestId);
       // 标记 tab unhealthy，阻止后续同 tab 请求立刻雪崩；给恢复窗口
       if (tabId != null) tabUnhealthy.set(tabId, Date.now() + TAB_BUSY_RECOVERY_MS);
-      rpcLog("warn", { method, tabId, channel, reqId: requestId, elapsedMs: timeoutMs, code: "TIMEOUT" });
-      reject({ code: "TIMEOUT", message: `扩展响应超时(${timeoutMs}ms): ${method}`, method, tabId, channel, elapsedMs: timeoutMs });
-    }, timeoutMs);
-    pending.set(requestId, { resolve, reject, timer, method, tabId, channel, startedAt });
+      rpcLog("warn", { method, tabId, channel, reqId: requestId, elapsedMs: Date.now() - startedAt, code: "TIMEOUT" });
+      reject(err("TIMEOUT", `扩展响应超时(${Math.round(remaining)}ms): ${method}`, {
+        method, tabId, channel, elapsedMs: Date.now() - startedAt,
+        details: { phase: "executing", budgetMs: budget.total, queuedMs: startedAt - (budget.deadline - budget.total) },
+      }));
+    }, Math.max(1, remaining));
+    pending.set(requestId, { resolve, reject, timer, method, tabId, channel, startedAt, agentWss: entry.agentWss });
 
     const reqPayload = { type: "request", requestId, method, params: params || {}, agentId, agentName };
     try {
@@ -249,13 +614,13 @@ async function sendExtensionRequest(method, params, timeoutMs, tabId, agentId, a
         clearTimeout(timer);
         pending.delete(requestId);
         rpcLog("warn", { method, tabId, channel, reqId: requestId, code: "EXT_DISCONNECTED", note: "pre-send" });
-        reject({ code: "EXT_DISCONNECTED", message: "扩展连接在请求发出前断开，请重试", method, tabId, channel });
+        reject(err("EXT_DISCONNECTED", "扩展连接在请求发出前断开，请重试", { method, tabId, channel }));
       }
     } catch (e) {
       clearTimeout(timer);
       pending.delete(requestId);
       rpcLog("warn", { method, tabId, channel, reqId: requestId, code: "SEND_FAILED" });
-      reject({ code: "SEND_FAILED", message: String(e), method, tabId, channel });
+      reject(err("SEND_FAILED", String(e), { method, tabId, channel }));
     }
   });
 }
@@ -275,7 +640,13 @@ function rejectPending(requestId, error) {
   clearTimeout(p.timer);
   pending.delete(requestId);
   rpcLog("warn", { method: p.method, tabId: p.tabId, channel: p.channel, reqId: requestId, elapsedMs: Date.now() - p.startedAt, code: (error && error.code) || "EXT_ERROR" });
-  p.reject({ code: (error && error.code) || "EXT_ERROR", message: (error && error.message) || String(error), method: p.method, tabId: p.tabId, channel: p.channel });
+  // 透传 details（如 SCROLL_NO_GROWTH 的 atBottom/wasHidden）：调用方要能**可编程判断**，
+  // 而不是去解析 message 文本。这里不能重建对象时漏掉它（历史 bug：details 被静默丢弃）。
+  const e = err((error && error.code) || "EXT_ERROR", (error && error.message) || String(error), {
+    method: p.method, tabId: p.tabId, channel: p.channel,
+  });
+  if (error && error.details) e.details = error.details;
+  p.reject(e);
 }
 
 // 通道断开：所有 pending 标记失败，避免无限挂起
@@ -285,8 +656,71 @@ function failAllPending(code, message) {
     pending.delete(id);
     if (p.tabId != null) tabUnhealthy.set(p.tabId, Date.now() + TAB_BUSY_RECOVERY_MS);
     rpcLog("warn", { method: p.method, tabId: p.tabId, channel: p.channel, reqId: id, code: code || "EXT_DISCONNECTED" });
-    p.reject({ code: code || "EXT_DISCONNECTED", message: message || "扩展通道断开", method: p.method, tabId: p.tabId, channel: p.channel });
+    p.reject(err(code || "EXT_DISCONNECTED", message || "扩展通道断开", { method: p.method, tabId: p.tabId, channel: p.channel }));
   }
+}
+
+// ---------- agent.stop / agent.resume（本地状态，不依赖扩展在线） ----------
+// 关键设计：停止状态存在 host 里，所以「通过 HTTP 调用、没订阅事件的 Agent」也会被拦住。
+// 扩展端也维护一份同样的状态（拦截已受理但还没真正点下去的 content 动作），两边互补：
+// host 拦的是「还没派发的」，扩展拦的是「已派发但还没落到页面上的」。
+async function agentStop(params = {}, caller = {}) {
+  const tabId = params.tabId !== undefined && params.tabId !== null ? params.tabId : null;
+  const r = setStop(tabId, { reason: params.reason || "user", by: caller.agentId || "user", ttlMs: params.ttlMs });
+  // 告知扩展（拦已派发、清视觉状态）；扩展不在线也不影响 host 侧已生效的停止。
+  const forwarded = sendEventToExtension("agent.stop", { tabId, reason: r.stop.reason, at: r.stop.at });
+  const payload = {
+    stopped: true,
+    scope: tabId === null ? "all" : "tab",
+    tabId,
+    reason: r.stop.reason,
+    stoppedAt: r.stop.at,
+    expiresAt: r.stop.expiresAt,
+    resumeWith: "agent.resume",
+    cancelledQueued: r.cancelledQueued,
+    inFlight: r.inFlight,
+    forwardedToExtension: forwarded,
+    // 必须说清楚的语义边界：停止不是「回放」，已发生的页面动作无法撤销。
+    note: "已完成的页面动作无法撤销；本调用只取消尚未派发的请求并拒绝后续请求。" + (r.inFlight ? ` 有 ${r.inFlight} 个已派发请求无法撤回。` : ""),
+  };
+  broadcastToAgent("agent.stop", payload);
+  return payload;
+}
+
+async function agentResume(params = {}, caller = {}) {
+  const tabId = params.tabId !== undefined && params.tabId !== null ? params.tabId : null;
+  const had = clearStop(tabId);
+  const forwarded = sendEventToExtension("agent.resume", { tabId, at: Date.now() });
+  const payload = { stopped: false, scope: tabId === null ? "all" : "tab", tabId, wasStopped: had, forwardedToExtension: forwarded, by: caller.agentId || "user" };
+  broadcastToAgent("agent.resume", payload);
+  return payload;
+}
+
+function agentStopStatus(params = {}) {
+  clearExpiredStops();
+  const tabId = params.tabId !== undefined && params.tabId !== null ? params.tabId : null;
+  const applicable = activeStop(tabId);
+  return {
+    // stopped = 「当前有没有任何停止在生效」；applicable 才是「这个 tabId 会不会被拦」。
+    // 两个都给出来，避免调用方把「无全局停止」误读成「没被停」。
+    stopped: stopState.size > 0,
+    applicable: !!applicable,
+    scope: applicable ? (applicable.tabId != null ? "tab" : "all") : null,
+    stop: applicable || null,
+    stops: [...stopState].map(([key, st]) => ({ key, ...st })),
+    inFlight: inflight.size,
+  };
+}
+
+// 客户端（HTTP 响应流 / WS 连接）消失：取消尚未派发的请求，并让已派发的标记归属。
+// 返回被取消的排队请求数。
+function noteClientGone(agentId, clientWs) {
+  const n = cancelInflight(
+    (e) => (clientWs ? e.agentWss === clientWs : (agentId != null && e.agentId === agentId)),
+    new ClientGoneError()
+  );
+  if (n) log(`client gone: cancelled ${n} queued request(s)${agentId ? ` agent=${agentId}` : ""}`);
+  return n;
 }
 
 // 向 Agent 广播事件（ws 订阅者）
@@ -302,10 +736,14 @@ function sendEventToExtension(event, payload) {
   try {
     if (nativeReady()) {
       nativePort.postMessage({ type: "event", event, payload: payload || null });
-    } else if (extWs && !extWs.closed) {
+      return true;
+    }
+    if (extWs && !extWs.closed) {
       extWs.sendJson({ type: "event", event, payload: payload || null });
+      return true;
     }
   } catch (e) { /* noop */ }
+  return false;
 }
 
 // ---------- Native Messaging（stdio） ----------
@@ -405,8 +843,27 @@ function handleNativeMessage(msg) {
   }
   // 扩展上报事件（如 agent.stop 确认）
   if (msg.type === "event") {
+    applyHostEvent(msg.event, msg.payload);
     broadcastToAgent(msg.event, msg.payload);
     return;
+  }
+}
+
+/**
+ * 处理扩展上报的事件。**agent.stop / agent.resume 必须在这里落到 host 状态**，
+ * 而不是只广播给订阅者。
+ *
+ * 历史 bug（端到端复现过）：用户点页面上的「停止 Agent」→ 扩展发 event 给 host →
+ * host 只 broadcastToAgent，自己的 stopState 没变。结果：界面/扩展都停了，但通过
+ * HTTP 调用的 Agent 完全不受影响，排队的点击照发。这正是「按钮是通知而不是强制停止」。
+ */
+function applyHostEvent(event, payload) {
+  if (event === "agent.stop") {
+    const tabId = payload && payload.tabId !== undefined && payload.tabId !== null ? payload.tabId : null;
+    setStop(tabId, { reason: (payload && payload.reason) || "user", by: "extension" });
+  } else if (event === "agent.resume") {
+    const tabId = payload && payload.tabId !== undefined && payload.tabId !== null ? payload.tabId : null;
+    clearStop(tabId);
   }
 }
 
@@ -444,6 +901,10 @@ function httpServer() {
         extConnected: extReady(),
         pending: pending.size,
         tabQueues: tabQueues.size,
+        // 停止状态：客户端（含只走 HTTP 的）可以查询自己是否被拦。
+        stopped: stopState.size > 0,
+        stops: [...stopState].map(([key, st]) => ({ key, ...st })),
+        inFlight: inflight.size,
         agents: [...agents].map(([agentId, a]) => ({ agentId, ...a })),
         tabLeases: [...tabLeases].map(([tabId, lease]) => ({ tabId, ...lease })),
         uptimeSec: Math.round(process.uptime()),
@@ -487,6 +948,19 @@ function httpServer() {
       });
       return;
     }
+    // 停止 / 恢复：用户点页面上的「停止 Agent」或客户端主动调用。
+    // 幂等，且**不依赖扩展在线**——状态在 host 侧生效（见 setStop 注释）。
+    if (req.method === "POST" && (url.pathname === "/agent/stop" || url.pathname === "/agent/resume")) {
+      let body = ""; req.on("data", (c) => { body += c; });
+      req.on("end", async () => {
+        let p = {};
+        try { p = JSON.parse(body || "{}"); } catch (e) { /* 空 body 合法：表示全局停止 */ }
+        const agentId = String(req.headers["x-agent-id"] || p.agentId || "anonymous");
+        const result = url.pathname === "/agent/stop" ? await agentStop(p, { agentId }) : await agentResume(p, { agentId });
+        send(200, { ok: true, result });
+      });
+      return;
+    }
     if (req.method === "POST" && (url.pathname === "/tabs/claim" || url.pathname === "/tabs/release")) {
       let body = ""; req.on("data", (c) => { body += c; });
       req.on("end", () => { try { const p = JSON.parse(body || "{}"); const agentId = String(p.agentId || req.headers["x-agent-id"] || ""); const result = url.pathname.endsWith("claim") ? claimTab(p.tabId, agentId, p.ttlMs) : releaseTab(p.tabId, agentId); send(200, { ok: true, result }); } catch (e) { send(409, { ok: false, error: { code: e.code || "LEASE_FAILED", message: e.message || String(e) } }); } }); return;
@@ -507,9 +981,22 @@ function httpServer() {
         let rawAgentName = req.headers["x-agent-name"] || parsed.agentName || "";
         try { rawAgentName = decodeURIComponent(rawAgentName); } catch (e) { /* noop */ }
         const agentName = String(rawAgentName || "");
+        // 调用方（HTTP 客户端）提前断开时取消**尚未派发**的请求。
+        // 历史 bug：排队的请求会在客户端已经超时退出后照样被发出去——
+        // 「调用方以为失败」于是变成「稍后偷偷执行」。
+        let gone = false;
+        const onGone = () => { if (!gone) { gone = true; noteClientGone(agentId); } };
+        req.on("aborted", onGone);
+        res.on("close", () => { if (!res.writableEnded) onGone(); });
         requestExtension(method, params, timeoutMs, agentId, agentName)
           .then((result) => send(200, { ok: true, result: result === undefined ? null : result }))
-          .catch((e) => send(200, { ok: false, error: { code: e.code || "INTERNAL", message: e.message || String(e) } }));
+          .catch((e) => {
+            // 客户端已走：不用再写响应（写了也无人接收），但错误必须落到 host.log。
+            if (gone) { rpcLog("warn", { method, tabId: tabIdOf(method, params), code: e.code || "INTERNAL", note: "client-gone" }); return; }
+            const err = { code: e.code || "INTERNAL", message: e.message || String(e) };
+            if (e.details) err.details = e.details;   // 同上：不要丢 details
+            send(200, { ok: false, error: err });
+          });
       });
       return;
     }
@@ -533,6 +1020,7 @@ function httpServer() {
           if (msg.type === "hello") { noteExtVersion(msg.version); return; }
           if (msg.type === "ping" || msg.type === "pong") return;
           if (msg.type === "event") {
+            applyHostEvent(msg.event, msg.payload);
             broadcastToAgent(msg.event, msg.payload);
             return;
           }
@@ -555,6 +1043,11 @@ function httpServer() {
             // 通道断开：pending 请求必须确定结局，不能无限挂起
             failAllPending("EXT_DISCONNECTED", "扩展 WS 通道断开");
           }
+        });
+        // 协议错误（分片/长度/未 mask 等）：以前这些帧被静默忽略，表现为
+        // 「扩展连上了但从不响应」。现在进 host.log，可 grep。
+        ws.on("protocolerror", (e) => {
+          log(`extension ws /agent protocolerror code=${e.code} reason=${e.reason} count=${e.count}`);
         });
         ws.on("wserror", (e) => {
           log("extension ws /agent error:", e && e.code, e && e.message);
@@ -581,16 +1074,27 @@ function httpServer() {
             const timeoutMs = msg.timeoutMs || 60000;
             const callerId = msg.agentId || ws.agentId;
             const callerName = msg.agentName || ws.agentName;
-            requestExtension(msg.method, msg.params || {}, timeoutMs, callerId, callerName)
+            requestExtension(msg.method, msg.params || {}, timeoutMs, callerId, callerName, { clientWs: ws })
               .then((result) => ws.sendJson({ id: requestId, ok: true, result: result === undefined ? null : result }))
-              .catch((e) => ws.sendJson({ id: requestId, ok: false, error: { code: e.code || "INTERNAL", message: e.message || String(e) } }));
+              .catch((e) => {
+                // details 必须透传（与 HTTP 出口一致）：否则 WS 客户端比 HTTP 客户端
+                // 少一半信息，recoverable 这类判断字段就没了。
+                const errorPayload = { code: e.code || "INTERNAL", message: e.message || String(e) };
+                if (e.details) errorPayload.details = e.details;
+                ws.sendJson({ id: requestId, ok: false, error: errorPayload });
+              });
           }
         });
         ws.on("close", () => {
           agentWss = agentWss.filter((w) => w !== ws);
+          // WS 客户端断开：取消它排队中、还没派发的请求。
+          noteClientGone(agentId, ws);
         });
         ws.on("wserror", (e) => {
           log("agent ws /bridge error:", e && e.code, e && e.message);
+        });
+        ws.on("protocolerror", (e) => {
+          log(`agent ws /bridge protocolerror code=${e.code} reason=${e.reason} count=${e.count}`);
         });
         ws.on("error", () => { /* WSConnection 已处理 */ });
       },
@@ -624,8 +1128,29 @@ function httpServer() {
 }
 
 // ---------- 启动 ----------
+// 启动期致命错误（token 不可用 / 端口被占）：必须非零退出 + 给出可操作的诊断，
+// **不允许降级到弱默认值继续跑**。输出要同时满足两个读者：
+// 人（看终端里的 修复: 一行）和 Agent（从 stderr 提取 `code=XXX`）。
+function fatal(err) {
+  const code = (err && err.code) || "STARTUP_FAILED";
+  const message = (err && err.message) || String(err);
+  const lines = [
+    `[host] FATAL code=${code}`,
+    `  ${message}`,
+  ];
+  if (err && err.hint) lines.push(`  修复: ${err.hint}`);
+  // 诊断「为什么读不到 token」几乎总要翻 host.log，所以把路径一并给出。
+  lines.push(`  日志: ${LOG_FILE}`);
+  const text = lines.join("\n");
+  try { log(text); } catch (e) { /* 日志本身不可写时不再递归失败 */ }
+  console.error(text);
+  process.exit(2);
+}
+
 // 单连接异常（ECONNRESET / EPIPE 等）不应拖垮整个桥，也不应刷爆日志。
 // 这些是连接断开时的常规错误，WSConnection 已处理；这里只作兑底，避免进程崩。
+// 注意：startupDone 之前的异常走 fatal —— 半启动的桥比不启动更危险。
+let startupDone = false;
 let lastUncaughtLog = 0;
 process.on("uncaughtException", (e) => {
   const code = e && (e.code || "");
@@ -636,14 +1161,17 @@ process.on("uncaughtException", (e) => {
     if (now - lastUncaughtLog > 1000) { lastUncaughtLog = now; log("conn error (benign):", code, e && e.message); }
     return;
   }
+  if (!startupDone) return fatal(e);
   log("uncaughtException:", e && e.message, (e && e.stack || "").split("\n")[1] || "");
 });
 process.on("unhandledRejection", (e) => {
+  if (!startupDone && e && e.code === "TOKEN_UNAVAILABLE") return fatal(e);
   log("unhandledRejection:", e && e.message);
 });
 log(`host v${VERSION} start, standalone=${STANDALONE}, port=${PORT}`);
 setupNativeMessaging();
 httpServer();
+startupDone = true;
 
 // 定期清理超时 pending（超时由自身 timer 触发；此处兑底，防 timer 泄漏）
 setInterval(() => {

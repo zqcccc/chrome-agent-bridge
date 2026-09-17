@@ -19,9 +19,29 @@ function loadToken() {
 }
 
 export class BridgeError extends Error {
-  constructor(code, message) {
+  constructor(code, message, details) {
     super(message);
+    this.name = "BridgeError";
     this.code = code;
+    // 结构化细节（如 SCROLL_NO_GROWTH 的 atBottom/wasHidden/recoverable）。
+    // 历史 bug：这里只保留 code/message，于是 Agent 拿不到 recoverable，
+    // 无法判断「该重试、换 tab，还是停」，只能去猜。
+    if (details !== undefined) this.details = details;
+  }
+  /** 便捷读取：从 details 里取字段（无 details 时返回 undefined）。 */
+  detail(key) { return this.details ? this.details[key] : undefined; }
+}
+
+// 超时专用子类：让调用方可以 `e instanceof BridgeTimeoutError` 或看 code。
+// 存在的意义：Node 的 req.setTimeout 回调与 req.destroy(err) 都会走 'error' 事件，
+// 早期实现把自造的 TIMEOUT 又包成了 CONNECTION_REFUSED，把「请求超时」
+// 谎报成「请先启动桥」——排查方向被彻底带偏。
+export class BridgeTimeoutError extends BridgeError {
+  constructor(message, timeoutMs) {
+    super("TIMEOUT", message);
+    this.name = "BridgeTimeoutError";
+    this.timeoutMs = timeoutMs;
+    this.details = { phase: "client-timeout", timeoutMs };
   }
 }
 
@@ -40,8 +60,13 @@ export class Bridge {
   _request(method, body, timeoutMs) {
     return new Promise((resolve, reject) => {
       const url = this.base() + method;
+      // POST 用于所有写操作（/rpc、/agents/register、/tabs/claim|release、/agent/stop|resume）；
+      // /status 是唯一的只读 GET。
+      // 历史 bug：这里写成 `method === "/rpc" ? "POST" : "GET"`，于是 register/claim/release
+      // 全部以 GET 发出，而 host 只注册了 POST —— 调用方拿到 404 NOT_FOUND。
+      const httpMethod = method === "/status" ? "GET" : "POST";
       const req = http.request(url, {
-        method: method === "/rpc" ? "POST" : "GET",
+        method: httpMethod,
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${this.token}`,
@@ -59,15 +84,38 @@ export class Bridge {
           if (res.statusCode === 401) {
             return reject(new BridgeError("UNAUTHORIZED", "token 无效，请检查 ~/.chrome-agent-bridge/token"));
           }
+          if (res.statusCode === 404) {
+            return reject(new BridgeError("NOT_FOUND", `host 没有这个路由: ${method}`));
+          }
           if (!parsed.ok) {
-            return reject(new BridgeError(parsed.error?.code || "RPC_ERROR", parsed.error?.message || "未知错误"));
+            // details 必须透传（与 lib/bridge.mjs 的 BridgeRpcError 保持一致）——
+            // 它是「可编程判断」的载体，丢了就只剩下解析 message 文本这条路。
+            return reject(new BridgeError(parsed.error?.code || "RPC_ERROR", parsed.error?.message || "未知错误", parsed.error?.details));
           }
           // /status 等非 RPC 接口返回整个 body（无 result 字段）；/rpc 返回 result
           resolve(method === "/rpc" ? (parsed.result === undefined ? null : parsed.result) : parsed);
         });
       });
-      req.on("error", (e) => reject(new BridgeError("CONNECTION_REFUSED", `无法连接本地桥 ${this.base()}（${e.message}），请先启动: node relay/host.js --standalone`)));
-      req.setTimeout(timeoutMs || this.timeoutMs, () => { req.destroy(new BridgeError("TIMEOUT", "请求超时")); });
+      // 错误分类：只有真正的连接层失败才算 CONNECTION_REFUSED。
+      // 超时（我们自己 destroy 的）、主动中断、以及已经成型的 BridgeError 都原样透传。
+      req.on("error", (e) => {
+        if (e instanceof BridgeError) return reject(e);          // 自造的超时/中断，不要二次包装
+        if (e && e.name === "AbortError") return reject(new BridgeError("ABORTED", "请求已被取消"));
+        const code = e && e.code;
+        if (code === "ETIMEDOUT" || code === "ESOCKETTIMEDOUT") {
+          return reject(new BridgeTimeoutError(`请求超时（${e.message}）`, timeoutMs || this.timeoutMs));
+        }
+        return reject(new BridgeError(
+          "CONNECTION_REFUSED",
+          `无法连接本地桥 ${this.base()}（${e.message}），请先启动: node relay/host.js --standalone`,
+          { cause: code || null }
+        ));
+      });
+      req.setTimeout(timeoutMs || this.timeoutMs, () => {
+        // 用专属错误实例：destroy(err) 会把它交给上面的 'error' 处理器，
+        // 那里凭 instanceof 判定并原样透传，不再降级为 CONNECTION_REFUSED。
+        req.destroy(new BridgeTimeoutError(`请求超时 ${timeoutMs || this.timeoutMs}ms: ${method}`, timeoutMs || this.timeoutMs));
+      });
       if (body) req.write(JSON.stringify(body));
       req.end();
     });
@@ -80,6 +128,13 @@ export class Bridge {
   register(name = this.agentName) { return this._request("/agents/register", { agentId: this.agentId, name }); }
   claimTab(tabId, ttlMs) { return this._request("/tabs/claim", { tabId, agentId: this.agentId, ttlMs }); }
   releaseTab(tabId) { return this._request("/tabs/release", { tabId, agentId: this.agentId }); }
+
+  // ---------- 停止 / 恢复 ----------
+  // 注意：这两个走 host 的独立路由，**不是** RPC。原因：停止必须能在扩展未连接、
+  // RPC 通道不可用时也生效（否则「停止」就变成「等桥好了再说」）。
+  // tabId 省略 = 全局停止。
+  stop(tabId, opts = {}) { return this._request("/agent/stop", { tabId, reason: opts.reason, ttlMs: opts.ttlMs, agentId: this.agentId }); }
+  resume(tabId) { return this._request("/agent/resume", { tabId, agentId: this.agentId }); }
 
   // ---------- 状态 ----------
   status() { return this._request("/status"); }

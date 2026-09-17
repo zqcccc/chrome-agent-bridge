@@ -121,13 +121,19 @@ function wsConnect(port, pathname, token) {
     });
 
     const client = {
+      // 客户端→服务端的帧**必须**带 mask（RFC 6455 §5.1），真实 Chrome 一直如此。
+      // host 侧 ws-server 现在会拒绝未 mask 的帧（1002 协议错误），所以这里补齐——
+      // 之前测试能用未 mask 帧通过，只是因为服务端在静默容忍违规实现。
       send(obj) {
         const data = Buffer.from(JSON.stringify(obj), "utf8");
+        const mask = crypto.randomBytes(4);
+        const masked = Buffer.alloc(data.length);
+        for (let i = 0; i < data.length; i++) masked[i] = data[i] ^ mask[i & 3];
         let header;
-        if (data.length < 126) header = Buffer.from([0x81, data.length]);
-        else if (data.length < 65536) { header = Buffer.alloc(4); header[0] = 0x81; header[1] = 126; header.writeUInt16BE(data.length, 2); }
-        else { header = Buffer.alloc(10); header[0] = 0x81; header[1] = 127; header.writeBigUInt64BE(BigInt(data.length), 2); }
-        sock.write(Buffer.concat([header, data]));
+        if (data.length < 126) header = Buffer.from([0x81, 0x80 | data.length]);
+        else if (data.length < 65536) { header = Buffer.alloc(4); header[0] = 0x81; header[1] = 0x80 | 126; header.writeUInt16BE(data.length, 2); }
+        else { header = Buffer.alloc(10); header[0] = 0x81; header[1] = 0x80 | 127; header.writeBigUInt64BE(BigInt(data.length), 2); }
+        sock.write(Buffer.concat([header, mask, masked]));
       },
       next() { return new Promise((res) => pending.push(res)); },
       onMessage(fn) { listeners.push(fn); },

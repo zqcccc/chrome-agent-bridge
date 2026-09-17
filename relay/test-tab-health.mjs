@@ -26,12 +26,17 @@ t("清零后不再标记 unhealthy", !rpc.isUnhealthy(DEAD));
 
 console.log("\n== withPage：选 tab + 验可注入 + 自动关 tab 一步到位 ==");
 try {
+  // 用唯一 URL + match:"exact"：withPage 内部走 tabs.resolve，默认按 host 匹配，
+  // 会「复用」已存在的 example.com tab，而复用时不关 tab（那是用户的页面）。
+  // 写死 https://example.com/ 会让本测试在「已存在 example.com tab」时拿到 reused=true 而假红——
+  // 测试要自己保证前置条件，不能指望环境里没有同域 tab。
+  const uniq = `https://example.com/?withpage-test=${process.pid}`;
   // withPage 默认 cleanup:true —— 自己新建的 tab 跑完会自动关（复用的不动）
-  const r = await rpc.withPage("https://example.com/", async (tabId) => {
+  const r = await rpc.withPage(uniq, async (tabId) => {
     const title = await rpc.ev(tabId, "document.title");
     const ready = await rpc.ev(tabId, "document.readyState");
     return { tabId, title, ready };
-  });
+  }, { match: "exact" });
   console.log("    ", JSON.stringify(r));
   t("withPage 拿到可用 tab 并求值成功", !!r.title);
   // 确认 tab 真的被关掉了（这是本次修的 bug：之前会留下垃圾页）

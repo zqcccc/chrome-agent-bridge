@@ -49,6 +49,30 @@ async function main() {
       console.log(`channel: ${s.channel}   extConnected: ${s.extConnected}`);
       console.log(`port: ${s.port}  pid: ${s.pid}  uptime: ${s.uptimeSec}s`);
       console.log(`token prefix: ${s.tokenPrefix}`);
+      // 停止状态：以前只有 /status 里有，CLI 不暴露，Agent 只能去解析原始 JSON。
+      if (s.stopped) console.log(`⚠ 已停止（${s.stops.length} 个范围）：后续写操作会被拒绝，用 \`stop\` 管理`);
+      break;
+    }
+    // 停止 / 恢复：用户可在页面上点按钮，Agent 也可以主动调用。
+    // 不带 tabId = 全局；带 tabId = 只停那个标签页。
+    case "stop": {
+      const tabId = rest[0] && rest[0] !== "all" ? Number(rest[0]) : null;
+      const r = await bridge.stop(tabId, { reason: "cli" });
+      console.log(`已停止（${r.result.scope}${r.result.tabId != null ? " #" + r.result.tabId : ""}）`);
+      console.log(`  取消的排队请求: ${r.result.cancelledQueued}   已派发（无法撤回）: ${r.result.inFlight}`);
+      console.log(`  ${r.result.note}`);
+      break;
+    }
+    case "resume": {
+      const tabId = rest[0] && rest[0] !== "all" ? Number(rest[0]) : null;
+      const r = await bridge.resume(tabId);
+      console.log(r.result.wasStopped ? `已恢复（${r.result.scope}）` : "本来就没停");
+      break;
+    }
+    case "stop-status": {
+      const r = await bridge.rpc("agent.stopStatus", {});
+      console.log(`stopped: ${r.stopped}   在途请求: ${r.inFlight}`);
+      for (const s of r.stops) console.log(`  ${s.key}  reason=${s.reason}  at=${new Date(s.at).toISOString()}`);
       break;
     }
     case "tabs": {

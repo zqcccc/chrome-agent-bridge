@@ -103,6 +103,71 @@ export class Rpc {
     }
   }
 
+  /**
+   * 停止 / 恢复（用户可能在页面上随时按下「停止 Agent」）。
+   *
+   * 不带 tabId = 全局停止；带 tabId = 只停那个标签页（页面按钮就是这个语义）。
+   * 停止只拦**写**操作（click/type/navigate/…、CDP 的 Input.*），只读不受影响；
+   * 被拦时错误码为 AGENT_STOPPED，`details.resumeWith` 是 "agent.resume"。
+   * 已经落到页面上的动作无法撤销，只有尚未派发的排队请求会被取消。
+   */
+  async stop(tabId, { reason = "api", ttlMs } = {}) {
+    const body = JSON.stringify({ tabId: tabId === undefined ? null : tabId, reason, ttlMs });
+    return this._post("/agent/stop", body);
+  }
+
+  /** 解除停止。省略 tabId = 解除全局。 */
+  async resume(tabId) {
+    const body = JSON.stringify({ tabId: tabId === undefined ? null : tabId });
+    return this._post("/agent/resume", body);
+  }
+
+  /** 查询停止状态（不依赖事件订阅，HTTP-only 客户端也能用）。 */
+  async stopStatus(tabId) {
+    return this.call("agent.stopStatus", tabId === undefined ? {} : { tabId });
+  }
+
+  /** POST 一个 JSON 路由（非 RPC，但同样需要 token）。 */
+  _post(pathname, bodyStr) {
+    return new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          host: "127.0.0.1", port: this.port, path: pathname, method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.token}`,
+            "X-Agent-Id": this.agentId,
+            "X-Agent-Name": encodeURIComponent(this.agentName),
+            "Content-Length": Buffer.byteLength(bodyStr),
+          },
+        },
+        (res) => {
+          let data = "";
+          res.on("data", (c) => (data += c));
+          res.on("end", () => {
+            let json;
+            try { json = JSON.parse(data); } catch {
+              return reject(new BridgeRpcError("BAD_RESPONSE", `host 返回非 JSON: ${data.slice(0, 200)}`, pathname));
+            }
+            if (!json.ok) {
+              const e = json.error || {};
+              return reject(new BridgeRpcError(e.code || "RPC_ERROR", e.message || "未知错误", pathname, e.details));
+            }
+            resolve(json.result === undefined ? json : json.result);
+          });
+        }
+      );
+      req.on("error", (e) =>
+        e instanceof BridgeRpcError
+          ? reject(e)
+          : reject(new BridgeRpcError("CONNECTION_REFUSED", `无法连接本地桥 127.0.0.1:${this.port}（${e.message}）`, pathname))
+      );
+      req.setTimeout(this.timeoutMs || 20000, () => req.destroy(new BridgeRpcError("TIMEOUT", "请求超时", pathname)));
+      req.write(bodyStr);
+      req.end();
+    });
+  }
+
   /** 原始 RPC。返回已解包的值；失败抛 BridgeRpcError。 */
   call(method, params = {}, timeoutMs = 20000) {
     return new Promise((resolve, reject) => {
@@ -133,14 +198,19 @@ export class Rpc {
               const e = json.error || {};
               const code = e.code || "RPC_ERROR";
               if (params && params.tabId) this._noteFailure(params.tabId, code);
-              return reject(new BridgeRpcError(code, e.message || "未知错误", method));
+              return reject(new BridgeRpcError(code, e.message || "未知错误", method, e.details));
             }
             resolve(unwrap(json));
           });
         }
       );
       req.on("error", (e) =>
-        reject(new BridgeRpcError("CONNECTION_REFUSED", `无法连接本地桥 127.0.0.1:${this.port}（${e.message}）`, method))
+        // req.destroy(err)（超时/主动中断）会把我们自己的 BridgeRpcError 也走 error 事件，
+        // 无差别包装会把它伪装成 CONNECTION_REFUSED——调用方于是去排查本地桥是否挂了，
+        // 而真实原因是「页面上下文超时」。原样透传，保持错误码可编程判断。
+        e instanceof BridgeRpcError
+          ? reject(e)
+          : reject(new BridgeRpcError("CONNECTION_REFUSED", `无法连接本地桥 127.0.0.1:${this.port}（${e.message}）`, method))
       );
       req.setTimeout(timeoutMs, () => req.destroy(new BridgeRpcError("TIMEOUT", `请求超时 ${timeoutMs}ms`, method)));
       req.write(body);
@@ -183,6 +253,13 @@ export class Rpc {
         pageWaitForReady: versionKnown ? gte(version, "0.3.3") : null,
         cspFallback: versionKnown ? gte(version, "0.3.3") : null,
         fastFailContext: versionKnown ? gte(version, "0.3.6") : null,
+        // 渲染器被 Memory Saver 冻结时自动 CDP 解冻重试。
+        // 旧版没有这个能力：后台 tab 被冻后每个 page.* 都要等 13s 才报 PAGE_CONTEXT_TIMEOUT。
+        freezeRecovery: versionKnown ? gte(version, "0.3.10") : null,
+        // page.ensureActive / page.scroll{checked} —— 后台 tab 的 rAF 被暂停时
+        // 临时激活以保证渲染（只切标签页不聚焦窗口），以及滚动推进检测。
+        ensureActive: versionKnown ? gte(version, "0.3.10") : null,
+        scrollChecked: versionKnown ? gte(version, "0.3.10") : null,
       },
     };
   }
@@ -272,6 +349,90 @@ export class Rpc {
       tabId,
       `(()=>{const el=${expression}; if(!el) return {ok:false,err:'element not found'}; el.click(); return {ok:true};})()`
     );
+  }
+
+  // ---------- 前台渲染保障（rAF 被暂停时） ----------
+
+  /**
+   * 确保目标页真的在渲染。**只在必要时才激活**（`document.hidden` 为真时），
+   * 且只切标签页、**不聚焦窗口**——实测 `chrome.tabs.update({active:true})` 单独就能把
+   * requestAnimationFrame 拉起来（Chrome 不在前台时也有效），不会把用户从别的应用里弹出来。
+   *
+   * 为什么需要它：Chrome 对后台标签页把 rAF **完全暂停**（实测 2s 内 0 帧，活动页 60 帧），
+   * 依赖 rAF 的懒加载 / 瀑布流 / 无限滚动永不推进，加长超时没用（是暂停不是节流）。
+   * 注：CDP `Emulation.setFocusEmulationEnabled` 也能恢复 rAF，但它 **detach 或页面导航后
+   * 立即失效**，而 detach 是每次 RPC 收尾都会做的事——所以只能真激活。
+   *
+   * 用完会空闲 `restoreAfterMs`（默认 20s）后自动把活动标签页还给用户原来那个；
+   * 长流程中每次 page.* 调用都会续期，不会中途抢走前台。提前归还可调 `restoreActive`。
+   *
+   * @returns {Promise<{activated:boolean, alreadyRendering:boolean, willRestoreTo?:number}>}
+   */
+  async ensureActive(tabId, { restoreAfterMs } = {}) {
+    const params = { tabId };
+    if (restoreAfterMs != null) params.restoreAfterMs = restoreAfterMs;
+    return this.call("page.ensureActive", params, 20000);
+  }
+
+  /** 立刻把活动标签页还给用户（不等空闲计时器）。 */
+  async restoreActive(tabId) {
+    return this.call("page.restoreActive", { tabId }, 15000);
+  }
+
+  /**
+   * 滚动并验证真的推进了。后台页 rAF 被暂停时，滚动指令会「成功」但页面不动——
+   * 那种假成功会让人拿着空列表继续往下走。这个封装会回读页面高度与滚动位置，
+   * 没推进就抛 `SCROLL_STALLED` / `SCROLL_NO_GROWTH`（错误里带 `atBottom` / `wasHidden` /
+   * `recoverable` 结构化字段，不用解析 message）。
+   *
+   * @param {object} opts 透传给 page.scroll（direction/amount/selector/y/behavior...）
+   * @param {boolean} [opts.allowNoProgress] 到底了就设 true，避免在最后一屏报错
+   */
+  async scrollChecked(tabId, opts = {}) {
+    return this.call("page.scroll", { tabId, ...opts, checked: true }, 30000);
+  }
+
+  /**
+   * 滚动加载：**先直接滚，真的卡住了才临时激活并重试**。
+   *
+   * 这是给「滚动加载列表」场景的推荐入口——把「要不要激活」的判断收敛在一处，
+   * 不需要每个 Agent 自己写 try/catch 去读 `recoverable`：
+   *
+   *  1. 先直接 `scrollChecked`（不打扰用户前台）；
+   *  2. 只有错误里 `recoverable === true`（后台渲染被暂停，且不是真的到底了）才 `ensureActive`；
+   *  3. 激活后重试一次；仍不推进就**原样抛出**，让调用方自己决定收尾；
+   *  4. 激活过的（`borrowed:true`）会在流程末尾自动归还前台（或由调用方显式 `restoreActive`）。
+   *
+   * 不自动激活的场景：`recoverable === false`（前台也没动 → 选择器/容器问题）、
+   * 或错误里 `atBottom === true`（大概率真到底了，激活没用）。
+   *
+   * @returns {Promise<object>} 最后一次成功的结果，额外带 `borrowed` / `activated` / `attempts`
+   */
+  async scrollLoad(tabId, opts = {}) {
+    const attempt = async () => {
+      try {
+        const r = await this.scrollChecked(tabId, opts);
+        return { ok: true, r };
+      } catch (e) {
+        return { ok: false, e };
+      }
+    };
+
+    let first = await attempt();
+    if (first.ok) return { ...first.r, borrowed: false, activated: false, attempts: 1 };
+
+    const e = first.e;
+    const canRecover = e.detail("recoverable") === true;
+    if (!canRecover) throw e;                     // 激活也解决不了：原样抛出
+
+    await this.ensureActive(tabId);
+    const second = await attempt();
+    if (second.ok) {
+      return { ...second.r, borrowed: true, activated: true, attempts: 2, firstError: { code: e.code, details: e.details } };
+    }
+    // 激活后仍不推进：把第二次的错误抛出（信息更新），但保留第一次的错误码便于归因
+    second.e.details = { ...(second.e.details || {}), firstCode: e.code, activatedButStillStalled: true };
+    throw second.e;
   }
 
   /** 先算坐标再真实点击。selector 用 CSS；找不到返回 false 而不抛。 */
@@ -370,10 +531,18 @@ export class Rpc {
 }
 
 export class BridgeRpcError extends Error {
-  constructor(code, message, method) {
+  constructor(code, message, method, details) {
     super(`[${code}] ${message}${method ? ` (${method})` : ""}`);
     this.code = code;
     this.method = method;
+    // 结构化细节（如 SCROLL_NO_GROWTH 的 atBottom / wasHidden）。
+    // 让调用方**可编程判断**要不要激活 / 重试，而不必去解析 message 文本。
+    this.details = details;
+  }
+
+  /** 便捷读取：从 details 里取字段（无 details 时返回 undefined）。 */
+  detail(key) {
+    return this.details ? this.details[key] : undefined;
   }
 }
 

@@ -119,13 +119,17 @@ function wsConnect(port, pathname, token) {
       }
     });
     const client = {
+      // 客户端→服务端必须 mask（RFC 6455 §5.1）。服务端已不再容忍未 mask 帧。
       send(obj) {
         const data = Buffer.from(JSON.stringify(obj), "utf8");
+        const mask = crypto.randomBytes(4);
+        const masked = Buffer.alloc(data.length);
+        for (let i = 0; i < data.length; i++) masked[i] = data[i] ^ mask[i & 3];
         let header;
-        if (data.length < 126) header = Buffer.from([0x81, data.length]);
-        else if (data.length < 65536) { header = Buffer.alloc(4); header[0] = 0x81; header[1] = 126; header.writeUInt16BE(data.length, 2); }
-        else { header = Buffer.alloc(10); header[0] = 0x81; header[1] = 127; header.writeBigUInt64BE(BigInt(data.length), 2); }
-        sock.write(Buffer.concat([header, data]));
+        if (data.length < 126) header = Buffer.from([0x81, 0x80 | data.length]);
+        else if (data.length < 65536) { header = Buffer.alloc(4); header[0] = 0x81; header[1] = 0x80 | 126; header.writeUInt16BE(data.length, 2); }
+        else { header = Buffer.alloc(10); header[0] = 0x81; header[1] = 0x80 | 127; header.writeBigUInt64BE(BigInt(data.length), 2); }
+        sock.write(Buffer.concat([header, mask, masked]));
       },
       next() {
         if (queue.length) return Promise.resolve(queue.shift());
@@ -133,8 +137,14 @@ function wsConnect(port, pathname, token) {
       },
       rawClose() { sock.destroy(); },
       closeFrame() {
-        // 发标准 WebSocket close 帧（比 destroy 更可靠地通知对端）
-        try { sock.write(Buffer.from([0x88, 0x02, 0x03, 0xe8])); } catch (e) {}
+        // 发标准 WebSocket close 帧（比 destroy 更可靠地通知对端）。客户端帧同样要 mask。
+        try {
+          const mask = crypto.randomBytes(4);
+          const data = Buffer.from([0x03, 0xe8]);
+          const masked = Buffer.alloc(2);
+          for (let i = 0; i < 2; i++) masked[i] = data[i] ^ mask[i & 3];
+          sock.write(Buffer.concat([Buffer.from([0x88, 0x80 | 2]), mask, masked]));
+        } catch (e) {}
         setTimeout(() => sock.destroy(), 100);
       },
       close() { sock.destroy(); },

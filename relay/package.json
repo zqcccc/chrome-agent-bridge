@@ -1,6 +1,6 @@
 {
   "name": "agent-browser-bridge",
-  "version": "0.3.9",
+  "version": "0.3.11",
   "description": "Agent Browser Bridge - Chrome 扩展 + 本地桥（Native Messaging / WebSocket）",
   "private": true,
   "scripts": {
@@ -8,13 +8,20 @@
     "install-host": "bash install-host.sh",
     "icons": "node generate-icons.js",
     "version-guard": "node version-guard.js",
-    "test": "node version-guard.js && node test.js && node test-unit.js && node --test test-verify.mjs test-bridge-lib.mjs test-tab-health.mjs && node test-tab-cleanup.mjs",
+    "test": "npm run test:unit-all && npm run test:e2e",
+    "test:unit-all": "node version-guard.js && node test-unit.js && node --test test-verify.mjs test-hardening.mjs test-content-stop.mjs test-bridge-lib.mjs test-tab-health.mjs",
+    "test:e2e": "node test.js && node test-stop-e2e.mjs && node test-tab-cleanup.mjs && node test-freeze-recovery.mjs && node test-foreground-rendering.mjs",
     "test:integration": "node test.js",
     "test:unit": "node test-unit.js",
+    "test:hardening": "node --test test-hardening.mjs",
+    "test:content-stop": "node --test test-content-stop.mjs",
+    "test:stop-e2e": "node test-stop-e2e.mjs",
     "test:verify": "node --test test-verify.mjs",
     "test:lib": "node test-bridge-lib.mjs",
     "test:health": "node test-tab-health.mjs",
-    "test:cleanup": "node test-tab-cleanup.mjs"
+    "test:cleanup": "node test-tab-cleanup.mjs",
+    "test:freeze": "node test-freeze-recovery.mjs",
+    "test:foreground": "node test-foreground-rendering.mjs"
   },
   "engines": {
     "node": ">=18"

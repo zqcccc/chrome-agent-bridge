@@ -274,11 +274,20 @@
     ].join("");
     stopBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2" fill="currentColor"/></svg><span>${escapeHtml(stopLabel)}</span>`;
     stopBtn.addEventListener("click", () => {
-      try {
-        chrome.runtime.sendMessage({ type: "bridge.indicatorEvent", event: "agent.stop" });
-      } catch (e) { /* noop */ }
+      // 停止是**本地状态变更**，不是一条单向通知：
+      //  1. 页面先自己进入停止态（多步动作能在下一步前退出）；
+      //  2. 再上报 background，由它拦住后续 RPC 并同步 host。
+      // 即使 background 不可达，第 1 步也已经生效，界面与行为不会互相矛盾。
+      //
+      // 不带 tabId：由 background 用 sender.tab.id 判定范围。
+      // 「在这个页面上按停止」应当只停这个标签页，而不是把整台机器上所有 Agent
+      // 一起停掉——那是个过大的副作用（全局停止留给显式 API 调用）。
+      setStopState(true, "user", null);
       hideStop();
       setControl("released");
+      try {
+        chrome.runtime.sendMessage({ type: "bridge.indicatorEvent", event: "agent.stop", payload: { reason: "user" } });
+      } catch (e) { /* noop */ }
     });
     document.documentElement.appendChild(stopBtn);
   }
@@ -304,9 +313,39 @@
     return { ok: true };
   }
 
+  // ---------- 停止状态（页面侧） ----------
+  // 为什么要在这里也维护：用户按下停止按钮的那一刻，content.js 里可能正跑着一个
+  // **多步**动作（滚动循环、逐字输入、等选择器），而 background 已经把它派发出去了，
+  // 撤不回来。这里让那些循环能在**下一步之前**看到停止标记并主动退出。
+  //
+  // 历史问题：点击停止只做了 hideStop + setControl("released")——界面显示已释放，
+  // 但后续步骤照跑，用户看到的是「按钮消失了，页面还在自己动」。
+  let stopState = { stopped: false, at: 0, reason: "", tabId: null };
+  function setStopState(stopped, reason, tabId) {
+    stopState = { stopped: !!stopped, at: stopped ? Date.now() : 0, reason: reason || "", tabId: tabId === undefined ? null : tabId };
+    if (stopped) {
+      // 页面自己也看得见：光标立即收掉，避免「停止后光标还在飘」。
+      hide();
+    }
+    return stopState;
+  }
+  // 暴露给同页的其他脚本/调试：`window.__AGENT_BRIDGE_STOPPED__` 可同步读取。
+  try {
+    Object.defineProperty(window, "__AGENT_BRIDGE_STOPPED__", {
+      get() { return stopState.stopped; },
+      configurable: true,
+    });
+  } catch (e) { /* noop */ }
+
   // ---------- 消息入口 ----------
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (!msg || msg.type !== "bridge.indicator") return false;
+    if (!msg) return false;
+    // 停止状态推送（来自 background 的 agent.stop / agent.resume 广播）
+    if (msg.type === "bridge.stopState") {
+      sendResponse(setStopState(msg.stopped, msg.reason, msg.tabId));
+      return false;
+    }
+    if (msg.type !== "bridge.indicator") return false;
     const a = msg.action;
     try {
       switch (a) {
@@ -338,6 +377,12 @@
         case "hideStop":
           hideStop();
           sendResponse({ ok: true });
+          break;
+        case "stopState":
+          sendResponse(setStopState(msg.stopped, msg.reason, msg.tabId));
+          break;
+        case "getStopState":
+          sendResponse(stopState);
           break;
         default:
           sendResponse({ ok: false, error: "unknown indicator action: " + a });

@@ -1,6 +1,6 @@
 ---
 name: agent-browser-bridge
-description: 驱动用户的真实 Chrome 浏览器（本地扩展 + 本地桥）完成任务——**用户在浏览器上能做的任何事，本 skill 基本都能做**：网上查资料/搜信息、打开网页读取/查证内容、站内搜索并整理结果、抓取动态渲染或登录后页面的数据、点击/输入/滚动/截图/执行 JS/下载文件，以及登录后业务操作（填表提交、发消息、投递简历、下单、预订、管理后台操作）。最大优势：走真实 Chrome 环境与真实登录态，能进入普通自动化工具被反爬/风控拦截的页面（验证码、登录墙、无头浏览器指纹检测、滑块等），拿到登录后或动态渲染的内容——普通搜索工具拿不到的（小红书、BOSS 直聘、公众号后台、网银、论坛、需账号的站内搜索等）都从这里走。触发词：搜索、查找、检索、查询、查证、搜一下、抓取、爬数据、收集信息、调研口碑、避坑、打开某网页、读取网页内容、操作浏览器、在 Chrome 里点击/输入/滚动/截图、填表、提交、发消息、投递、下单、预订、下载、小红书、BOSS 直聘、NotebookLM、ChatGPT 网页版、登录后页面。执行规则：小红书/BOSS/ChatGPT/NotebookLM 等已有专项子技能，必须先读对应子技能 SKILL.md 并优先跑其 scripts/ 下现成脚本（自带风控防护），禁止自己从零写抓取脚本；缺功能时以现有脚本为模板改写并注明来源。登录约束：页面需要登录/授权/扫码/验证码时，必须先告知用户要访问的页面和原因，等待用户手动完成登录后再继续，不得替用户登录或绕过验证。若任务不需要真实登录态、通用搜索/抓取工具即可完成，优先用通用工具。
+description: 用真实 Chrome 打开、读取、操作任意网页——**拿到 http(s) 链接要读内容时默认用本技能，不要先试 curl / wget / WebFetch 赌它是静态页**：前端渲染的站点（SPA / React / Vue / 动态加载）用 curl 只能拿到空壳 HTML，正文一个字都没有，而且**不会报错**，会静默给出错误结论。覆盖：读网页正文与价格/文档/列表数据、站内搜索、抓取动态渲染或登录后数据、点击输入滚动截图、执行 JS、下载文件、填表提交发消息投递下单预订、管理后台操作。走用户日常 Chrome 与真实登录态，可进入被反爬 / 风控拦截（验证码、登录墙、无头指纹、滑块）与需登录页面：小红书、知乎、大众点评、BOSS 直聘、公众号后台、网银、论坛等。已有专项子技能（xhs / boss / chatgpt / notebooklm / debug）必须先读其 SKILL.md 并优先跑 scripts/ 下现成脚本，禁止从零写抓取脚本。需要登录 / 授权 / 扫码 / 验证码时，必须先告知用户要访问的页面与原因并等待用户手动完成，不得替用户登录或绕过验证。判断口径：**只要任务是「从某个网址拿到内容」或「在网页上做操作」，就是本技能**，不存在「先用通用工具试、失败再切过来」的降级层。
 ---
 
 # Agent Browser Bridge —— 让 Agent 操作日常 Chrome
@@ -107,7 +107,7 @@ TAB=$(node scripts/preflight.mjs --pick github)   # 直接拿到可用 tab 的 i
 | 操作页面 | 点击、输入、滚动、截图、执行 JS、下载文件、查看媒体 |
 | 登录后业务操作 | 填表提交、发消息、投递简历、下单、预订、管理后台操作 |
 
-**什么时候不用它**：任务不需要真实登录态、通用搜索/抓取工具就能拿到结果时，优先用通用工具（更快、更省、不打扰用户的浏览器）。
+**什么时候用它**：凡是要在浏览器里真正操作网页就一律用它，没有例外，也不存在「先用通用工具试、失败再切过来」的降级层。浏览器任务归它一家：读页面、站内搜索、抓动态或登录后数据、点击输入提交、截图下载、执行 JS。
 
 ## 第一原则：先查子技能，用现成脚本（禁止重造）
 
@@ -154,7 +154,37 @@ TAB=$(node scripts/preflight.mjs --pick github)   # 直接拿到可用 tab 的 i
 - `<cli>` 是纯 HTTP 客户端，**不依赖 cwd**，给绝对路径即可，无需 `cd` 到仓库根。
 - 子 skill 文档（「专项实战」列出的各 `*/SKILL.md`）沿用本表记号。
 
-**什么时候必须用它（从 agent-browser 降级）**：主流 UGC 站点（小红书、知乎、大众点评、脉脉、淘宝、京东、Reddit 等）有严格反爬（验证码滑块、强制扫码登录、封禁无头指纹）。**一旦 `agent-browser` 打不开、被拦截、跳转登录页或内容被折叠截断，立即无缝切到本 skill**，借真实 Chrome 环境继续；不要在原工具上重试加码。前置检查在本文件「前置条件」一节。
+**反爬站点是本 skill 的主场，不是切换来的**：主流 UGC 站点（小红书、知乎、大众点评、脉脉、淘宝、京东、Reddit 等）有严格反爬（验证码滑块、强制扫码登录、封禁无头指纹）。这类站点**从一开始就走本 skill**，不要先用 `agent-browser` 或其它无头工具试一轮——它们会被拦截、跳转登录页或内容被折叠截断，那几轮纯属浪费。前置检查在本文件「前置条件」一节。
+
+### 最常犯的错：拿到网址先 `curl`（务必看这一段）
+
+**症状**：用户给一个链接让你读内容（价格页、文档页、产品页、列表页），你第一反应 `curl -sL <url>`，拿回几 KB 的 HTML，`<body>` 里几乎没文本；于是你去扒 `assets/index-xxxx.js` 里的字符串，或者干脆放弃说「抓不到」。
+
+**这是本 skill 存在的首要原因，也是最典型的浪费。** 现代前端站点（React / Vue / SPA / 任何 `index-*.js` 的构建产物）的 HTML 是**空壳**，正文由 JS 在浏览器里渲染。`curl` 不执行 JS，所以：
+
+- 拿到的是 `<!DOCTYPE html>` + 一堆 `<script>`，`body` 可见文本长度为 **0**；
+- **关键陷阱：它不报错**。HTTP 200、内容非空（有 JS），`grep` 也能命中几个词——于是你以为读到了，实际正文一个字都没有，最后给出错误结论。
+- 判断信号：HTML 里出现 `index-<hash>.js` / `main-<hash>.js` / `__toCdnUrl` / `vite` / `webpack` 之类的构建产物引用，且可见文本极少 → **立刻改用本 skill，不要再去扒 JS bundle**。
+
+**正确动作**：拿到 http(s) 链接要读内容，**默认走本 skill 打开页面读 DOM**，不要先用 curl/wget/WebFetch 赌它是静态页。一次 `tabs.resolve` + `page.evaluate` 就能拿到渲染后的正文，成本远低于「curl → 发现是空壳 → 扒 JS → 猜」这条路。
+
+```bash
+# 一条命令看页面渲染后的正文（CLI，最省事）
+node "$CLI" open "https://www.example.com/pricing/"   # 输出 tabId
+node "$CLI" eval <tabId> "document.body.innerText"
+```
+
+```js
+// 编程方式（推荐用于多步流程）
+import { Rpc, openUrl, waitReady } from "./scripts/lib/bridge.mjs";
+const b = new Rpc({ agentId: "read-page", agentName: "ReadPage" });
+const { tabId } = await openUrl(b, "https://www.example.com/pricing/");  // tabs.resolve + 旧版降级
+await waitReady(b, tabId);
+const text = await b.call("page.evaluate", { tabId, expression: "document.body.innerText" });
+console.log(text);
+```
+
+> 只有一种情况 curl 是对的：目标是**明确返回 JSON / XML / 纯文本的 API 或静态文件**（如 `api.example.com/v1/items.json`、`.md`、`.csv`、`robots.txt`）。只要目标是**给人看的网页**，就用本 skill。
 
 ## 前置条件（每个任务开始前必须检查）
 
@@ -163,6 +193,12 @@ TAB=$(node scripts/preflight.mjs --pick github)   # 直接拿到可用 tab 的 i
 0. **登录由用户主导**：目标页面需要登录/授权/扫码/验证码时，必须先向用户说明要访问哪个页面、为什么需要登录，然后等待用户手动完成登录、确认登录成功后再继续。禁止替用户登录、绕过登录墙或静默跳过验证。用户未登录前不要继续执行后续步骤。
 1. **扩展已加载**：chrome://extensions 里有 "Agent Browser Bridge"（已解压；ID 以你本机 `chrome://extensions` 中显示的为准），开关为 On。
 2. **host 存活**：`curl -s http://127.0.0.1:8778/status` 返回 `{"ok":true,...}`。
+   - **如果 host 根本起不来**：先看它是不是以 `FATAL code=TOKEN_UNAVAILABLE` 退出了。
+     v0.3.11 起 token 读不到时**拒绝启动**（不再静默降级成一个固定密码）。常见成因是
+     `~/.chrome-agent-bridge/` 权限不对（曾用 sudo 跑过）或磁盘满。修法：
+     `mkdir -p ~/.chrome-agent-bridge && chmod 700 ~/.chrome-agent-bridge && chmod 600 ~/.chrome-agent-bridge/token`；
+     或显式提供：`AGENT_BRIDGE_TOKEN=<够长的随机串>`。
+     **不要**试图用猜的 token 绕过——桥不会接受弱凭据。
    - **推荐 Native 模式**：不要手动 `npm start`。注册 native host 后，Chrome 按需拉起 host 进程，该进程监听 8778，Agent 连 8778 即同一进程。Chrome 关闭时进程自动退出。`status` 返回 `mode:native`。
    - **standalone WS 模式（二选一）**：`cd "$ROOT/relay" && npm start`（`$ROOT` 见下方「快速开始」）,host 常驻 8778，扩展用 `ws://127.0.0.1:8778/agent` 连入。`status` 返回 `mode:standalone`。
    - **两种模式不要同时运行**：standalone 占着 8778 时，native 拉起的进程会因端口占用退出，扩展 `auto` 通道会回退到 WS（不透明）。推荐只用 Native。
@@ -380,15 +416,81 @@ grep "tab=<id>" host.log | grep -E "TIMEOUT|note=dispatch" | head -20           
 | 登录 / 扫码 / 验证码 / 2FA / 选文件 | `tabs.activate`（或 `page.focus`），并告知用户 |
 | 最终给用户核对的可视化结果 | `page.activateAndShot` |
 | 被 OneTab / 浏览器丢弃冻结的 tab | `tabs.activate`（激活即唤醒重载） |
-| 后台 tab 定时器被节流、页面"不反应" | 放宽等待仍不行再 `tabs.activate` |
+| **滚动加载不推进 / 懒加载出不来内容** | **`page.ensureActive`（v0.3.10+）** |
+| 需要前台时序（动画、依赖 rAF 的组件） | **`page.ensureActive`（v0.3.10+）** |
+
+### 页面必须激活才能继续时：用 `page.ensureActive`，不要用 `tabs.activate`（v0.3.10+）
+
+**Chrome 对后台标签页把 `requestAnimationFrame` 完全暂停**（实测 2s 内 **0 帧**，活动页 60 帧）、
+`document.visibilityState="hidden"`。依赖 rAF / IntersectionObserver 的懒加载、瀑布流、无限滚动
+在后台**永不推进**——滚动会返回 `{ok:true}`，但列表永远只有首屏那几条。
+
+> 这是「暂停」不是「节流」，**加长超时完全没用**，别在这上面浪费轮次。
+
+```js
+await rpc.ensureActive(tabId);      // 需要页面真渲染时
+await rpc.restoreActive(tabId);     // 收工/提前归还
+```
+
+和 `tabs.activate` 的关键区别：
+
+- **只切标签页、不聚焦窗口**（不调 `chrome.windows.update({focused:true})`）。实测单独
+  `chrome.tabs.update({active:true})` 就能恢复 rAF（Chrome 不在前台时同样有效），
+  **所以用户正在别的应用里工作时不会被弹到 Chrome**。
+- **用完自动还原**：默认 20s 无操作后把活动标签页还给用户原来那个；长流程中每次 `page.*` 调用
+  都会续期，不会在滚动循环中途抢走前台。`restoreAfterMs` 可调。
+- **只在必要时才激活**：内部先探 `document.hidden`，已在渲染就原样返回（`activated:false`）。
+
+> 注：CDP `Emulation.setFocusEmulationEnabled` 也能恢复 rAF，但它 **detach 或页面导航后立即失效**
+> （实测），而 detach 是每次 RPC 收尾都会做的事，所以不能用它代替。
+
+### 滚动加载检测：`page.scroll { checked: true }`
+
+后台页里 `window.scrollBy` **仍然生效**（滚动位置会变），所以「滚动成功」不能当作「内容加载了」的依据。
+
+```js
+await rpc.scrollChecked(tabId, { direction: "down", expectGrowth: true });
+// 推进了：{ checked:true, grew, moved, atBottom, heightBefore, heightAfter }
+// 后台没加载出来：抛 SCROLL_NO_GROWTH
+// 视口完全没动：抛 SCROLL_STALLED
+// 到底了收尾：加 allowNoProgress:true
+```
+
+**错误里带结构化字段，用字段判断，不要解析 message**：
+
+```js
+try { await rpc.scrollChecked(tabId, { y: 99999, expectGrowth: true }); }
+catch (e) {
+  e.code;                  // SCROLL_NO_GROWTH | SCROLL_STALLED
+  e.detail("recoverable"); // ★ 激活能不能解决：true 才值得调 ensureActive
+  e.details.atBottom;      // 真到底了就别再激活
+  e.details.wasHidden;     // 当时是不是后台标签页
+}
+```
+
+`recoverable === false` 时（前台也没动 / 已到底）**不要激活**——那是选择器或容器问题，
+激活只会白打扰用户。
+
+**不想自己写判断就用 `scrollLoad`**：先直接滚 → 只有 `recoverable===true` 才 `ensureActive` →
+重试一次；返回带 `{ borrowed, activated, attempts, firstError }`。
+
+`expectGrowth` 是「这一滚**应该**加载出新内容」的声明；判断到底请用返回的 `atBottom` 字段
+（**不要**用 atBottom 去免掉这个检查——懒加载的哨兵元素本来就在列表末尾）。老写法
+`page.scroll`（不带 `checked`）行为不变。
 
 ### 截图行为变化（v0.3.0+）
 
 `page.screenshot` 默认 CDP 静默截图（后台 tab 可用）；CDP 失败时**不再偷偷激活窗口**，报 `SCREENSHOT_FAILED`。显式传 `allowActivate:true` 或改用 `page.activateAndShot` 才会降级到 `captureVisibleTab`（该路径要求目标 tab 是窗口内激活 tab）。
 
-### 后台节流注意
+### 后台节流与冻结（v0.3.10+ 自动处理）
 
-Chrome 会把后台 tab 的定时器压到 1 秒级、长闲后可能冻结：依赖 rAF/轮询渲染的页面（瀑布流、懒加载）可能看似无响应。处理：`page.waitForSelector` / `page.waitForUrl` 超时放宽到 30s+；仍无响应再 `tabs.activate`。
+Chrome 会把后台 tab 的定时器压到 1 秒级，并在长闲后**冻结渲染器**（Memory Saver / 高能效模式）。
+两种情况都已自动处理，Agent 不需要做任何事：
+
+- **冻结**：`chrome.scripting.*` 全部挂到超时（13s），扩展会自动 CDP 解冻后重试一次。
+- **渲染暂停**：rAF 被暂停导致懒加载不推进——这一种**不能**自动处理（自动激活会在长流程里反复
+  抢用户前台），需要你显式 `page.ensureActive`，并用 `page.scroll{checked}` 判断是否真的加载了。
+
 
 ## 错误码（可诊断）
 
@@ -398,9 +500,30 @@ Chrome 会把后台 tab 的定时器压到 1 秒级、长闲后可能冻结：�
 - `TAB_BUSY`：同 tab 请求串行队列中前序请求占用（一般等待而非报错；若恢复窗口内，短时间等待后重试）。
 - `NAV_TIMEOUT`：导航/等待 URL/ready/selector 超时。
 - `PAGE_CONTEXT_TIMEOUT`：页面上下文已销毁/无法注入 content script（导航中、chrome://、上下文崩溃）。
+  **v0.3.10+ 会自动先试一次 CDP 解冻**（渲染器被 Memory Saver 冻结是它的头号成因）；仍报错才是真坏。
+- `SCROLL_NO_GROWTH`：`page.scroll{checked:true, expectGrowth:true}` 时，滚动生效了但页面没加载出新内容。
+  典型是后台标签页 rAF 被暂停 → 先 `page.ensureActive`。
+- `SCROLL_STALLED`：滚动指令完全没生效（位置未变），通常是选择器/容器不可滚。
 - `CONTENT_TIMEOUT`：content 调用（click/type 等）超时。
 - `EXT_DISCONNECTED` 在扩展 WS/Native 断连时让所有 pending 请求确定结局，不无限挂起。
 - `TAB_LEASED`：Tab 已被其他 Agent 占用。
+- `AGENT_STOPPED`：**用户在页面上点了「停止 Agent」**（或有人调了停止接口）。
+  - 只拦**写**操作（click/type/press/navigate/scroll/…，以及 CDP 的 `Input.*`）。
+  - 只读操作（`page.info`/`snapshot`/`evaluate`/`tabs.list`、CDP 的 `Runtime.*`）**不受影响**——
+    你仍然可以看页面来判断该等用户还是该恢复。
+  - 恢复：`rpc.call("agent.resume", { tabId })`（省略 tabId = 恢复全局）。
+    判断依据在 `e.detail("resumeWith")`（= `"agent.resume"`）与 `e.detail("scope")`（`"tab"` / `"all"`）。
+  - 停止**不是回放**：已经落到页面上的动作（点过的按钮、提交过的表单）无法撤销，
+    只有**尚未派发**的排队请求会被取消。收到这个错误就停下来问用户，不要自动 resume 后重试。
+
+### 超时与取消语义（v0.3.11+，避免「以为失败却偷偷执行」）
+
+- **排队时间计入你的 timeoutMs**：请求从进入 host 就开始计时，排队、等扩展重连、执行共用同一预算。
+  排到队时预算已耗尽就直接失败（`TIMEOUT`，`details.phase` 是 `queued` / `waiting-ext` / `executing`），
+  **不会**在你已经放弃之后才把操作发出去。
+- **客户端断开即取消未派发的请求**：HTTP 连接断开 / WS 关闭时，同 Agent 排队中且尚未派发的请求会被取消。
+  对 `page.click` / `page.type` / 发消息 / 提交表单这类**不可逆**操作，这条是防止「调用方以为失败、实际稍后执行」的关键。
+- 已经派发到扩展的请求无法撤回（响应里会如实报告 `inFlight` 数量）。
 
 HTTP 直调建议携带 `X-Agent-Id` 和 `X-Agent-Name`；WebSocket 订阅使用 `/bridge?...&agentId=<id>&name=<name>`。
 
@@ -432,6 +555,42 @@ await bridge.releaseTab(tabId);
 
 租约默认 120 秒，最长 1 小时；异常退出会自动过期。其他 Agent 访问已占用 Tab 会收到 `TAB_LEASED`，不要绕过租约强行操作。
 
+租约在**派发前会重新校验**（v0.3.11+）：排队期间租约易主，排到队时会被拒绝，而不是带着过期归属继续执行。
+
+### 停止 Agent（用户随时可能按下）
+
+页面上会出现一个「停止 Agent」按钮（只在 click/type/scroll 等交互操作后显示）。用户按下后：
+
+| 会怎样 | 说明 |
+|---|---|
+| 后续**写**操作被拒 | 报 `AGENT_STOPPED`，**不会**静默继续 |
+| 排队中未派发的请求被取消 | 立即收到错误，不用等到排到队首 |
+| 只读操作不受影响 | 你仍可观察页面状态 |
+| 已派发/已完成的动作无法撤销 | 停止不是回放 |
+
+范围默认是**当前标签页**（按钮在你操作的那个页面上按下）；全局停止由 API 显式触发。
+
+```js
+// 判断自己是否被停（不必解析 message）
+try { await rpc.clickEl(tabId, "..."); }
+catch (e) {
+  if (e.code === "AGENT_STOPPED") {
+    console.log(e.detail("resumeWith")); // "agent.resume"
+    console.log(e.detail("scope"));      // "tab" | "all"
+    // 停下来问用户。不要自动 resume 重试——用户刚明确表示不要继续。
+  }
+}
+```
+
+CLI 也能管：
+
+```bash
+node agent/cli.mjs stop-status      # 当前有没有停止在生效
+node agent/cli.mjs stop             # 全局停止
+node agent/cli.mjs stop 12345       # 只停 tab 12345
+node agent/cli.mjs resume 12345     # 恢复该 tab
+```
+
 ## 同 tab 串行与跨 tab 并行
 
 - 同一 tab 的 `page.*` / `tabs.get|activate|prepare|close|reload` / `session.*` 请求在 host 端**严格串行**（按 tabId 维护队列），避免 BOSS 重型 SPA 下 navigate/snapshot/evaluate 互相堆积导致超时。
@@ -444,6 +603,24 @@ await bridge.releaseTab(tabId);
 - `page.waitForReady` `{ tabId, timeoutMs? }`：等 `document.readyState` 为 complete。
 - `page.waitForSelector` `{ tabId, selector, by?, timeoutMs?, intervalMs? }`：等选择器出现。
 - `page.waitLoad` `{ tabId, timeoutMs? }`：等加载完成（webNavigation + 轮询兑底）。
+
+## 前台渲染保障（v0.3.10+）
+
+Chrome 对后台标签页把 `requestAnimationFrame` **完全暂停**（实测 2s 内 0 帧），
+懒加载 / 瀑布流 / 无限滚动在后台永不推进。需要页面真渲染时：
+
+- `page.ensureActive` `{ tabId, restoreAfterMs? }`：**只在必要时**（`document.hidden`）临时激活。
+  只切标签页、**不聚焦窗口**，且空闲后**自动把活动页还给用户**（默认 20s，长流程中每次
+  `page.*` 调用续期）。返回 `{ activated, alreadyRendering, willRestoreTo, note }`。
+- `page.restoreActive` `{ tabId }`：立刻归还，不等空闲计时器。
+- `page.scroll` `{ ..., checked: true }`：滚动并**回读页面高度/滚动位置**验证真的推进了，
+  没推进报 `SCROLL_NO_GROWTH` / `SCROLL_STALLED`；错误里带 `recoverable` / `atBottom` /
+  `wasHidden` 结构化字段（用字段判断，不要解析 message）。到底收尾加 `allowNoProgress:true`。
+- `page.scrollLoad`（客户端封装，见 `scripts/lib/bridge.mjs`）：先直接滚，只在 `recoverable===true`
+  时自动 `ensureActive` 并重试——**不写判断也能用，且不会在无关场景打扰用户前台**。
+
+> 为何不自动激活：自动激活会在长流程里反复抢用户前台。所以只提供「可判断的信号 +
+> 一键封装」，由 Agent 决定。详见 `KNOWN_ISSUES.md`。
 
 ## CDP 直通：`session.send`（未封装的底层能力都从这里走）
 

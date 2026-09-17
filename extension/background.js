@@ -232,6 +232,32 @@ function normalizeErrCode(e) {
   return "INTERNAL";
 }
 
+// 错误里可以带结构化细节（如 SCROLL_NO_GROWTH 的 atBottom/wasHidden），让调用方**可编程判断**
+// 而不必解析 message 文本。只透传白名单字段：避免把任意对象（可能含页面内容）带出去。
+const ERROR_DETAIL_KEYS = [
+  "atBottom", "wasHidden", "grew", "moved", "heightBefore", "heightAfter", "yBefore", "yAfter",
+  "tabId", "recoverable", "retryAfterMs",
+  // 停止类错误的细节（AGENT_STOPPED）：调用方靠 resumeWith 知道怎么恢复，
+  // 靠 scope 知道是「整机停了」还是「只有这个 tab 停了」。
+  "resumeWith", "scope", "stoppedAt", "reason", "action",
+];
+function errorDetails(e) {
+  if (!e || typeof e !== "object") return undefined;
+  const out = {};
+  for (const k of ERROR_DETAIL_KEYS) {
+    if (e[k] !== undefined && e[k] !== null) out[k] = e[k];
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+// 统一的错误响应体构造：所有出口都走这里，避免漏掉 details（历史 bug：details 被静默丢弃）。
+function errorPayload(e) {
+  const payload = { code: normalizeErrCode(e), message: e && e.message ? String(e.message) : String(e) };
+  const details = errorDetails(e);
+  if (details) payload.details = details;
+  return payload;
+}
+
 // ---------- 入站：native ----------
 function handleNativeMsg(msg) {
   if (!msg || typeof msg !== "object") return;
@@ -251,7 +277,7 @@ function handleNativeMsg(msg) {
         nativePort.postMessage({
           type: "response",
           responseToRequestId: msg.requestId,
-          error: { code: normalizeErrCode(e), message: e && e.message ? String(e.message) : String(e) },
+          error: errorPayload(e),
         });
       });
     return;
@@ -274,20 +300,117 @@ function handleWsMsg(msg) {
     const caller = { agentName: msg.agentName, agentId: msg.agentId };
     dispatch(msg.method, msg.params || {}, caller)
       .then((result) => ws.send(JSON.stringify({ id: msg.id, ok: true, result: result === undefined ? null : result })))
-      .catch((e) => ws.send(JSON.stringify({ id: msg.id, ok: false, error: { code: normalizeErrCode(e), message: e && e.message ? String(e.message) : String(e) } })));
+      .catch((e) => ws.send(JSON.stringify({ id: msg.id, ok: false, error: errorPayload(e) })));
   }
+}
+
+// ---------- 停止状态（扩展侧） ----------
+// 为什么扩展也要维护一份：host 只能拦住「还没派发」的请求。一个已经发到扩展、
+// 正在 content script 里跑的 page.click / page.type 不受 host 控制；
+// 如果用户在那一瞬间按了停止，扩展必须自己知道「不要再往下做了」。
+//
+// 历史问题：agent.stop 只做了视觉撤销（隐藏光标/按钮/badge），语义上是一个通知；
+// 界面显示「已放开」而排队的操作照跑。
+const stoppedScopes = new Map();   // "*" | String(tabId) -> { at, reason, expiresAt }
+const STOP_TTL_MS = 300000;
+
+function isStopped(tabId) {
+  const now = Date.now();
+  for (const [k, v] of stoppedScopes) if (v.expiresAt <= now) stoppedScopes.delete(k);
+  if (stoppedScopes.size === 0) return null;
+  if (tabId !== undefined && tabId !== null) {
+    const t = stoppedScopes.get(String(tabId));
+    if (t) return t;
+  }
+  return stoppedScopes.get("*") || null;
+}
+
+function setStopped(tabId, reason) {
+  const key = tabId === undefined || tabId === null ? "*" : String(tabId);
+  // tabId 必须存进记录里：stopStatus / stoppedError 靠它区分「整机停了」还是「只有这个 tab 停了」。
+  // （不存的话 scope 会永远是 "all"，调用方就无法判断自己这个 tab 到底该不该等。）
+  const st = {
+    at: Date.now(), reason: reason || "user", expiresAt: Date.now() + STOP_TTL_MS,
+    tabId: tabId === undefined || tabId === null ? null : tabId,
+  };
+  stoppedScopes.set(key, st);
+  return st;
+}
+function clearStopped(tabId) {
+  if (tabId === undefined || tabId === null) { const had = stoppedScopes.size > 0; stoppedScopes.clear(); return had; }
+  return stoppedScopes.delete(String(tabId));
+}
+function stoppedError(st, method, tabId) {
+  return {
+    code: "AGENT_STOPPED",
+    message: `用户已停止 Agent（${st.reason}），${method} 未执行`,
+    details: {
+      stoppedAt: st.at, reason: st.reason, resumeWith: "agent.resume",
+      // 与 host 的 stoppedError 保持同一形状（契约测试守着）。
+      scope: st.tabId != null ? "tab" : "all",
+      tabId: tabId != null ? tabId : st.tabId,
+    },
+  };
+}
+
+// 停止状态会拦哪些方法？只拦**有副作用**的（真正动页面的），不拦读取/状态/停止控制本身。
+// 否则用户在停止后连「看一下当前状态」都做不到，而且 agent.resume 也永远调不通。
+//
+// ⚠ 这份清单必须与 relay/host.js 的 SIDE_EFFECT_METHODS **逐字一致**：host 拦
+// 「还没派发的」，扩展拦「已派发但还没落到页面上的」。两边不一致就会出现
+// 「host 放行、扩展拒绝」这类难定位的行为。test-hardening.mjs 有契约测试防止漂移。
+const SIDE_EFFECT_METHODS = new Set([
+  "page.click", "page.type", "page.press", "page.select", "page.scroll",
+  "page.hover", "page.focusEl", "page.navigate", "page.back", "page.forward",
+  "page.reload", "page.waitFor", "page.activateAndShot", "page.ensureActive",
+  "tabs.create", "tabs.reload", "tabs.activate",
+]);
+
+// session.send 是“包罗万象”的 CDP 通道：既能 Input.dispatchMouseEvent（真点击），
+// 也能 Runtime.evaluate / Page.captureScreenshot（纯读取）。一刀切拦掉会把 Agent 的
+// 观察能力一起封死（skill 的 ev/attach 全走 CDP），所以按 **CDP method** 细分。
+// ⚠ 与 relay/host.js 的同名定义必须一致（契约测试守着）。
+const BLOCKED_CDP_PREFIXES = ["Input."];
+const BLOCKED_CDP_METHODS = new Set([
+  "Page.navigate", "Page.reload", "Page.navigateToHistoryEntry",
+  "Page.setDocumentContent", "DOM.setAttributeValue", "DOM.setOuterHTML",
+]);
+function isBlockedCdpCall(cdpMethod) {
+  const m = String(cdpMethod || "");
+  if (BLOCKED_CDP_METHODS.has(m)) return true;
+  return BLOCKED_CDP_PREFIXES.some((p) => m.startsWith(p));
+}
+
+function isSideEffectMethod(method, params) {
+  if (typeof method !== "string") return false;
+  if (method === "agent.stop" || method === "agent.resume" || method === "agent.stopStatus") return false;
+  if (method.startsWith("page.indicator.")) return false;  // 指示器只是视觉，不拦
+  if (method === "session.send") return isBlockedCdpCall(params && params.method);
+  return SIDE_EFFECT_METHODS.has(method);
 }
 
 // host 下发事件
 function handleHostEvent(event, payload) {
   switch (event) {
-    case "agent.stop":
+    case "agent.stop": {
+      const tabId = payload && payload.tabId !== undefined ? payload.tabId : null;
+      setStopped(tabId, (payload && payload.reason) || "user");
       // 用户按下停止：光标、按钮和标签页接管状态都立即撤销。
       broadcastToTabs({ type: "bridge.indicator", action: "hide" });
       broadcastToTabs({ type: "bridge.indicator", action: "hideStop" });
       broadcastToTabs({ type: "bridge.indicator", action: "setControl", state: "released" });
       clearAllTabControlBadges();
+      // 告诉页面里的 content 脚本也进入停止态：它手上可能有一个正在跑的
+      // 多步动作（如滚动循环 / 逐字输入），需要它自己在下一步前退出。
+      broadcastToTabs({ type: "bridge.stopState", stopped: true, reason: (payload && payload.reason) || "user", tabId });
       break;
+    }
+    case "agent.resume": {
+      const tabId = payload && payload.tabId !== undefined ? payload.tabId : null;
+      clearStopped(tabId);
+      broadcastToTabs({ type: "bridge.stopState", stopped: false, tabId });
+      break;
+    }
     default:
       break;
   }
@@ -397,12 +520,55 @@ function isPageControlMethod(method) {
 async function dispatch(method, params, caller) {
   const agentName = caller?.agentName || "";
   const agentId = caller?.agentId || "";
+
+  // 停止闸门（在**任何副作用之前**）：用户按了停止后，新到的写操作一律拒绝，
+  // 而不是只广播一条事件然后照做。见 isStopped / SIDE_EFFECT_METHODS 的注释。
+  if (isSideEffectMethod(method, params)) {
+    const st = isStopped(params && params.tabId);
+    if (st) throw stoppedError(st, method, params && params.tabId);
+  }
+  // 停止 / 恢复本身：本地状态立即生效，host 侧也会各自维护一份（两边互补）。
+  if (method === "agent.stop") {
+    const tabId = params && params.tabId !== undefined ? params.tabId : null;
+    const st = setStopped(tabId, params && params.reason);
+    broadcastToTabs({ type: "bridge.indicator", action: "hide" });
+    broadcastToTabs({ type: "bridge.indicator", action: "hideStop" });
+    broadcastToTabs({ type: "bridge.indicator", action: "setControl", state: "released" });
+    clearAllTabControlBadges();
+    broadcastToTabs({ type: "bridge.stopState", stopped: true, reason: st.reason, tabId });
+    return { stopped: true, scope: tabId === null ? "all" : "tab", tabId, reason: st.reason, stoppedAt: st.at, expiresAt: st.expiresAt, resumeWith: "agent.resume" };
+  }
+  if (method === "agent.resume") {
+    const tabId = params && params.tabId !== undefined ? params.tabId : null;
+    const had = clearStopped(tabId);
+    broadcastToTabs({ type: "bridge.stopState", stopped: false, tabId });
+    return { stopped: false, scope: tabId === null ? "all" : "tab", tabId, wasStopped: had };
+  }
+  if (method === "agent.stopStatus") {
+    const st = isStopped(params && params.tabId);
+    // 与 host 的 agentStopStatus 保持同一形状：stopped = 「有没有停止在生效」，
+    // applicable = 「这个 tabId 会不会被拦」。两个都给，避免误读。
+    return {
+      stopped: stoppedScopes.size > 0,
+      applicable: !!st,
+      scope: st ? (st.tabId != null ? "tab" : "all") : null,
+      stop: st || null,
+      scopes: [...stoppedScopes.keys()],
+    };
+  }
+
   if (isPageControlMethod(method) && params && params.tabId) {
     recordTabAgent(params.tabId, agentName, agentId);
-    try { await indicatorCall(params.tabId, { action: "setControl", state: "active", agentName, agentId }); } catch (e) { /* chrome:// 等受限页忽略 */ }
+    // 有未完成的「借前台」时续期：还原只发生在真的空闲之后，不会在长流程中途抢走前台。
+    touchBorrow(params.tabId);
+    // 不 await：indicator 只是视觉提示，但它对冻结/受限页要先撞 3s PING 超时。
+    // 串在 RPC 前面等于给每个 page.* 白加 3s 延迟（冻结 tab 上尤其明显）。
+    indicatorCall(params.tabId, { action: "setControl", state: "active", agentName, agentId })
+      .catch(() => { /* chrome:// 等受限页忽略 */ });
   }
   if (INTERACTIVE_METHODS.has(method) && params && params.tabId) {
-    try { await indicatorCall(params.tabId, { action: "showStop", label: "停止 Agent", agentName, agentId }); } catch (e) { /* chrome:// 等受限页忽略 */ }
+    indicatorCall(params.tabId, { action: "showStop", label: "停止 Agent", agentName, agentId })
+      .catch(() => { /* 同上：失败不影响主 RPC */ });
   }
   switch (method) {
     case "bridge.status": return bridgeStatus();
@@ -448,6 +614,8 @@ async function dispatch(method, params, caller) {
     case "page.back": return pageBack(params.tabId);
     case "page.forward": return pageForward(params.tabId);
     case "page.focus": return pageFocus(params.tabId);
+    case "page.ensureActive": return pageEnsureActive(params.tabId, params);
+    case "page.restoreActive": return pageRestoreActive(params.tabId);
     case "page.waitLoad": return waitForLoad(params.tabId, params.timeoutMs);
     case "page.waitForReady": return waitForReady(params.tabId, params.timeoutMs);
     case "page.waitForUrl": return waitForUrl(params.tabId, params);
@@ -464,7 +632,7 @@ async function dispatch(method, params, caller) {
     case "page.click": return pageAction(params.tabId, "click", params);
     case "page.type": return pageAction(params.tabId, "type", params);
     case "page.press": return pageAction(params.tabId, "press", params);
-    case "page.scroll": return pageAction(params.tabId, "scroll", params);
+    case "page.scroll": return params.checked ? pageScrollChecked(params.tabId, params) : pageAction(params.tabId, "scroll", params);
     case "page.hover": return pageAction(params.tabId, "hover", params);
     case "page.focusEl": return pageAction(params.tabId, "focusEl", params);
     case "page.waitFor": return pageAction(params.tabId, "waitFor", params);
@@ -613,6 +781,113 @@ async function tabsActivate(tabId) {
   try { await chrome.windows.update(tab.windowId, { focused: true }); } catch (e) { /* noop */ }
   return { tab: serializeTab(tab) };
 }
+
+// ---------- 前台渲染保障：必要时临时激活，用完自动还原 ----------
+// 背景：Chrome 对后台标签页把 requestAnimationFrame **完全暂停**（实测 2s 内 0 帧，
+// 活动页 60 帧），`document.visibilityState = "hidden"`。依赖 rAF 的懒加载 / 瀑布流 /
+// 无限滚动在后台永不推进——注意这是「暂停」不是「节流」，加长超时没用。
+//
+// 已试过但不行的方案（实测）：CDP `Emulation.setFocusEmulationEnabled` 确实能把 rAF 拉起来，
+// 但它 **detach 或页面导航后立即失效**，而 detach 是每次 RPC 收尾都会做的事，等于没用。
+// 所以只能真让标签页 active。
+//
+// 本实现的取舍：只切**标签页**，不聚焦窗口（不调 chrome.windows.update({focused:true})）。
+// 实测 `chrome.tabs.update({active:true})` 单独就能恢复 rAF（Chrome 非前台时同样有效），
+// 所以用户正在别的应用里工作时不会被弹到 Chrome。用完空闲 N 秒把活动标签页还给用户原来那个。
+const borrowedActive = new Map();   // tabId -> { prevTabId, windowId, timer, at }
+const BORROW_RESTORE_MS = 20000;
+
+function clearBorrow(tabId) {
+  const b = borrowedActive.get(tabId);
+  if (b && b.timer) clearTimeout(b.timer);
+  borrowedActive.delete(tabId);
+}
+
+// 每次对该 tab 的 page.* 调用都重置计时：还原只发生在「真的闲着」之后，
+// 不会在长流程中途（比如滚动循环里两次调用间隔 20s+）把前台抢走。
+// 用 per-borrow 的 restoreMs（而不是全局常量），调用方可按需缩短/加长。
+function touchBorrow(tabId) {
+  const b = borrowedActive.get(tabId);
+  if (!b) return;
+  if (b.timer) clearTimeout(b.timer);
+  b.at = Date.now();
+  b.timer = setTimeout(() => { restoreBorrowed(tabId, "idle"); }, b.restoreMs || BORROW_RESTORE_MS);
+}
+
+// 把活动标签页还给用户原来那个。返回被还原到的 tabId，没做事则返回 null。
+async function restoreBorrowed(tabId, reason) {
+  const b = borrowedActive.get(tabId);
+  if (!b) return null;
+  clearBorrow(tabId);
+  try {
+    // 用户已经自己切走了（目标 tab 不再是活动页）：不要跟他抢，直接放弃还原。
+    const cur = await chrome.tabs.get(tabId);
+    if (!cur.active) return null;
+  } catch (e) { return null; }
+  try {
+    const prev = await chrome.tabs.get(b.prevTabId);
+    if (prev.windowId !== b.windowId) return null;   // 用户把原标签页移走了
+    await chrome.tabs.update(b.prevTabId, { active: true });
+    return b.prevTabId;
+  } catch (e) {
+    // 原标签页已关：尝试退到该窗口里任意一个别的页，而不是把 agent 的页留在前台
+    try {
+      const others = await chrome.tabs.query({ windowId: b.windowId });
+      const fallback = others.find((t) => t.id !== tabId);
+      if (fallback) { await chrome.tabs.update(fallback.id, { active: true }); return fallback.id; }
+    } catch (e2) { /* noop */ }
+    return null;
+  }
+}
+
+// 同窗口里当前的活动标签页（排除自己）。
+async function activeTabInWindow(windowId, exceptTabId) {
+  const list = await chrome.tabs.query({ windowId, active: true });
+  const t = list.find((x) => x.id !== exceptTabId);
+  return t ? t.id : null;
+}
+
+// 确保目标页真的在渲染（必要时临时激活）。返回实际状态供调用方判断。
+async function pageEnsureActive(tabId, params) {
+  requireTabId(tabId);
+  const t = await chrome.tabs.get(tabId);
+  if (!/^(https?|file):/.test(t.url || "")) {
+    throw { code: "UNSUPPORTED_URL", message: `该页面不支持操作（${t.url || "未知"}）` };
+  }
+  const restoreAfterMs = (params && params.restoreAfterMs) || BORROW_RESTORE_MS;
+  // 用 document.hidden 判定而不是 tab.active：非聚焦窗口里的活动标签页 rAF 是正常的，
+  // 那种情况不需要动它（实测 hidden=false、rAF=61）。
+  let hidden = false;
+  try {
+    const probe = await pageEvaluate(tabId, { expression: "({hidden: document.hidden, vis: document.visibilityState})" });
+    hidden = !!(probe && probe.result && probe.result.hidden);
+  } catch (e) {
+    // 探不到就按 tab.active 保守判断
+    hidden = !t.active;
+  }
+  if (!hidden) {
+    return { activated: false, alreadyRendering: true, hidden: false, tabId };
+  }
+
+  const prevTabId = await activeTabInWindow(t.windowId, tabId);
+  // 只切标签页，不聚焦窗口：Chrome 非前台时同样能恢复 rAF，不把用户从别的应用里弹出来。
+  await chrome.tabs.update(tabId, { active: true });
+  clearBorrow(tabId);
+  if (prevTabId != null) {
+    borrowedActive.set(tabId, { prevTabId, windowId: t.windowId, at: Date.now(), timer: null, restoreMs: restoreAfterMs });
+    touchBorrow(tabId);
+  }
+  // 让渲染器真正跑起来（等一两帧），否则调用方紧接着的操作可能仍撞在旧的 hidden 状态上。
+  await sleepMs(250);
+  return {
+    activated: true, alreadyRendering: false, hidden: false, tabId,
+    restoreAfterMs,
+    willRestoreTo: prevTabId,
+    note: prevTabId != null
+      ? `已临时激活以保证渲染；${Math.round(restoreAfterMs / 1000)}s 无操作后自动切回标签页 ${prevTabId}（不聚焦窗口）`
+      : "已激活以保证渲染（该窗口内没有可还原的原标签页）",
+  };
+}
 // 打开一个 URL：优先复用同类「用户没在看」的标签页，绝不抢占用户正在浏览的页面。
 //
 // 复用候选默认排除：聚焦窗口的活动标签页（= 用户正在看，navigate 它会把人家的页面顶掉）、
@@ -657,7 +932,10 @@ async function tabsResolve(params) {
   let lastErr = null;
   for (const cand of candidates) {
     try {
-      await tabsPrepare(cand.id);   // 静默注入 + 防后台冻结
+      // 候选健康检查：不跑解冻自愈——一个真被冻结的候选不值得为它挂调试器 + 等 13s，
+      // 直接换下一个 / 落到新建（tabs.resolve 的语义是「找个能用的 tab」，不是「救活这个 tab」）。
+      await ensureInjected(cand.id, { noRecover: true });
+      try { await chrome.tabs.update(cand.id, { autoDiscardable: false }); } catch (e) { /* noop */ }
       if (cand.url === url) {
         // 目标页已在该 tab 打开：不重复导航（会整页刷新，丢状态且多发一次请求）
         const t = await chrome.tabs.get(cand.id);
@@ -706,6 +984,9 @@ async function tabsPrepare(tabId) {
     throw { code: "TAB_DISCARDED", message: `标签页已被冻结/丢弃（${t.title || t.url}），tabs.prepare 无法静默唤醒；请改用 tabs.activate（会切到该 tab 并重载页面）` };
   }
   try { await chrome.tabs.update(tabId, { autoDiscardable: false }); } catch (e) { /* noop */ }
+  // 注入失败先试一次解冻自愈（冻结的 tab 看上去与坏 tab 一模一样）。
+  // ensureInjected 自带 CDP 解冻兜底；这里只是确保错误码区分得开：
+  // 冻结能救回来就走成功路径，救不回来才报 PAGE_CONTEXT_TIMEOUT。
   try {
     await ensureInjected(tabId);
     clearBroken(tabId);   // 注入成功 => 上下文恢复正常，解除快速失败标记
@@ -717,6 +998,9 @@ async function tabsPrepare(tabId) {
 }
 async function tabsClose(tabId) {
   requireTabId(tabId);
+  freezeState.delete(tabId);
+  // 关掉一个正被「借前台」的 tab：先把活动页还给用户，否则前台会落在一个空位/随机页上。
+  await restoreBorrowed(tabId, "closing").catch(() => null);
   await chrome.tabs.remove(tabId);
   return { ok: true, tabId };
 }
@@ -738,7 +1022,8 @@ async function pageNavigate(tabId, url, params) {
   requireTabId(tabId);
   if (!url) throw { code: "BAD_PARAMS", message: "缺少 url" };
   if (!/^(https?|file):\/\//i.test(url)) url = "https://" + url;
-  brokenTabs.delete(tabId);
+  clearBroken(tabId);
+  freezeState.delete(tabId);   // 导航成功 = 渲染器必然已被重新激活
   await chrome.tabs.update(tabId, { url });
   if (params.waitLoad !== false) {
     await waitForLoad(tabId, params.timeoutMs || NAV_TIMEOUT_MS).catch(() => {
@@ -769,6 +1054,13 @@ async function pageFocus(tabId) {
   requireTabId(tabId);
   await tabsActivate(tabId);
   return { ok: true, tabId };
+}
+
+// 把活动标签页还给用户（收工/提前归还用；不等到闲置计时器到期）。
+async function pageRestoreActive(tabId) {
+  requireTabId(tabId);
+  const restored = await restoreBorrowed(tabId, "explicit");
+  return { ok: true, tabId, restoredTo: restored };
 }
 
 // ---------- 导航等待 ----------
@@ -868,8 +1160,110 @@ async function waitForSelector(tabId, params) {
   });
 }
 
+// ---------- 滚动推进检测 ----------
+// 为什么单立一条：后台标签页 rAF 被暂停时，`window.scrollBy` 这类直接 DOM 操作**仍然生效**
+// （实测滚动位置会变），但依赖 rAF / IntersectionObserver 回调的**懒加载不会触发**，
+// 页面高度不增长。调用方看到 `{ok:true}` 就接着往下走，于是拿到空列表还以为是站点改版。
+// 所以校验要分两层：
+//   - 视口没动（moved=false）—— 明确异常，报 SCROLL_STALLED；
+//   - 高度没长（grew=false）—— 语义模糊（可能是到底了，也可能是懒加载没触发），
+//     默认只作为字段返回，调用方声明 `expectGrowth:true` 时才报 SCROLL_NO_GROWTH。
+function scrollSignature(tabId) {
+  return pageEvaluate(tabId, {
+    expression: `({
+      y: window.scrollY, h: document.documentElement.scrollHeight,
+      ih: window.innerHeight, hidden: document.hidden,
+      canScroll: document.documentElement.scrollHeight > window.innerHeight + 4
+    })`,
+  }).then((r) => (r && r.result) || null).catch(() => null);
+}
+
+const RENDER_HINT =
+  "若需继续加载，先调 page.ensureActive { tabId } 临时激活以保证渲染" +
+  "（只切标签页不聚焦窗口，用完自动还原），或确认已到底后停止。";
+
+async function pageScrollChecked(tabId, params) {
+  requireTabId(tabId);
+  const before = await scrollSignature(tabId);
+  const res = await pageAction(tabId, "scroll", params);
+  // 让滚动 / 懒加载真正落地后再采样
+  await sleepMs(params && params.settleMs != null ? params.settleMs : 600);
+  const after = await scrollSignature(tabId);
+  if (!before || !after) {
+    return { ...(res || {}), checked: false, note: "无法采样页面状态，已跳过校验" };
+  }
+
+  const grew = after.h > before.h + 2;
+  const moved = Math.abs(after.y - before.y) > 2;
+  const atBottom = after.y + after.ih >= after.h - 4;
+  const out = {
+    ...(res || {}), checked: true, grew, moved, atBottom,
+    heightBefore: before.h, heightAfter: after.h, yBefore: before.y, yAfter: after.y,
+    wasHidden: before.hidden,
+  };
+
+  if (params && params.allowNoProgress) return { ...out, note: "已允许无推进（allowNoProgress）" };
+  // 内容不满一屏：不能滚是正常的，不是失败
+  if (!before.canScroll) return { ...out, note: "页面内容不满一屏，无需滚动" };
+
+  // 视口完全没动：明确异常（真到底了也会 moved，因为到底前的最后一滚仍改变位置）
+  if (!moved) {
+    throw {
+      code: "SCROLL_STALLED",
+      message: `滚动未生效（位置始终 ${after.y}，页面高 ${after.h}）${before.hidden ? "；当前为后台标签页" : ""}。` +
+        `可能原因：选择器/容器不可滚、页面接管了滚动。${RENDER_HINT}`,
+      atBottom, wasHidden: before.hidden,
+      // 后台才可能是渲染被暂停；前台还没动就是选择器/容器问题，激活也没用。
+      recoverable: !!before.hidden,
+    };
+  }
+
+  // 调用方声明了「这一滚应该加载出新内容」但高度没长。
+  // 注意：**不能因为 atBottom 就放过**——懒加载的哨兵元素本来就在列表末尾，
+  // 「到底部」正是应该触发加载的位置；用 atBottom 做例外等于把这个信号关掉。
+  // 但 atBottom 仍会随错误返回，供调用方区分「真的到底了」与「卡住了」。
+  if (params && params.expectGrowth && !grew) {
+    // 后台标签页里 atBottom 不可信：同一位置在激活后会加载出更多内容（实测），
+    // 所以后台场景一律归因为渲染被暂停。
+    const msg = before.hidden
+      ? `滚动生效了（${before.y}→${after.y}）但页面没有加载出新内容（高 ${before.h} 未变）；` +
+        `当前是后台标签页，懒加载靠 rAF/IntersectionObserver 触发而 Chrome 已暂停渲染。${RENDER_HINT}`
+      : `滚动生效了（${before.y}→${after.y}）但页面没有加载出新内容（高 ${before.h} 未变，atBottom=${atBottom}）。` +
+        `若 atBottom=true 说明可能真的到底了，可改用 allowNoProgress 收尾；否则${RENDER_HINT}`;
+    throw {
+      code: "SCROLL_NO_GROWTH", message: msg, atBottom, wasHidden: before.hidden,
+      // 关键信号：后台 → 激活能解决；前台且 atBottom → 大概率真到底了，激活无用。
+      recoverable: !!before.hidden || !atBottom,
+    };
+  }
+
+  return out;
+}
+
 // ---------- Content Script 消息 ----------
-async function ensureInjected(tabId) {
+// 渲染器被冻结（Chrome Memory Saver / 高能效模式）时，chrome.scripting 的所有调用都会
+// 挂满超时才失败，而 CDP 通道完好。实测复现：
+//   冻结后 scripting executeScript = 13s 后 PAGE_CONTEXT_TIMEOUT；CDP Runtime.evaluate = 32ms 正常。
+// 这曾是最主要的失败源（host.log 433 次 PAGE_CONTEXT_TIMEOUT，tabs.prepare 失败率 34%，
+// 耗时整齐卡在 13s / 26s = ping 3s + 注入 10s 的整数倍）。
+// 对策：scripting 失败时先用 CDP 把渲染器解冻（Page.setWebLifecycleState: active），再重试一次。
+// 解冻成功后脚本层立刻恢复毫秒级响应（实测 5/5 成功）。
+async function ensureInjected(tabId, opts) {
+  try {
+    return await ensureInjectedOnce(tabId);
+  } catch (e) {
+    if (e && e.code !== "PAGE_CONTEXT_TIMEOUT") throw e;
+    if (opts && opts.noRecover) throw e;
+    // 疑似渲染器被冻结：解冻后重试一次。
+    // 冷却中 / CDP 不可用（用户 DevTools 占用等）则原样抛出，调用方拿到快速失败。
+    if (!(await recoverFrozenTab(tabId))) throw e;
+    clearBroken(tabId);
+    await sleepMs(120);
+    return await ensureInjectedOnce(tabId);
+  }
+}
+
+async function ensureInjectedOnce(tabId) {
   try {
     const t = await chrome.tabs.get(tabId);
     if (!/^(https?|file):/.test(t.url || "")) {
@@ -906,7 +1300,7 @@ async function ensureInjected(tabId) {
     if (e2 && e2.code === "PAGE_CONTEXT_TIMEOUT") throw e2;
     throw { code: "PAGE_CONTEXT_TIMEOUT", message: `注入 content script 失败: ${e2 && e2.message || e2}` };
   }
-  await new Promise((r) => setTimeout(r, 50));
+  await sleepMs(50);
   try {
     await pingOnce();
     clearBroken(tabId);
@@ -915,6 +1309,8 @@ async function ensureInjected(tabId) {
     throw { code: "PAGE_CONTEXT_TIMEOUT", message: `content script 注入后仍无响应: ${e2 && e2.message || e2}` };
   }
 }
+
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 内部超时：包裹 sendMessage，避免 BOSS SPA 上下文销毁后卡死
 function withTimeout(promise, timeoutMs, code, message) {
@@ -956,6 +1352,9 @@ async function contentCall(tabId, action, args) {
   if (resp.ok === false) {
     const err = new Error(resp.error && resp.error.message ? resp.error.message : "content 执行失败");
     err.code = (resp.error && resp.error.code) || "CONTENT_ERROR";
+    // details 必须带上：errorPayload() 靠它把 AGENT_STOPPED 的 resumeWith/stoppedAt
+    // 以及 SCROLL_* 的 recoverable 透到 host 与客户端。
+    if (resp.error && resp.error.details) err.details = resp.error.details;
     throw err;
   }
   return resp.result;
@@ -1549,6 +1948,85 @@ if (chrome.debugger && chrome.debugger.onDetach) {
   });
 }
 
+// ---------- 渲染器解冻（Chrome Memory Saver / 高能效模式） ----------
+// 背景：Chrome 冻结后台标签页的渲染器后，chrome.scripting.*（executeScript / 注入）
+// 会一直挂起到超时（实测 13s 后 PAGE_CONTEXT_TIMEOUT），而 CDP 通道仍然完好
+// （实测同一 tab 被 Page.setWebLifecycleState 冻结后，CDP Runtime.evaluate 仍 32ms 返回）。
+// 这是 host.log 里最大的失败源：433 次 PAGE_CONTEXT_TIMEOUT、tabs.prepare 失败率 34%。
+//
+// 注意：这是「冻结」不是「丢弃」。discarded tab 已卸载渲染器，CDP 也救不回来，
+// 仍走 TAB_DISCARDED 报错让调用方决定是否 tabs.activate。
+//
+// 限流策略（为什么不是「成功后冷却 60s」）：Chrome 可能刚解冻就又把 tab 冻回去，
+// 成功后长时间冷却会让这种情况下退化成「13s 报错且不自愈」。改用滑动窗口：
+// 60s 内最多解冻 MAX 次，既能让反复被冻结的正常 tab 自愈，又不会给真坏的 tab 反复挂调试器。
+const FREEZE_WINDOW_MS = 60000;
+const FREEZE_MAX_PER_WINDOW = 5;
+const FREEZE_FAIL_BACKOFF_MS = 5000;  // 解冻失败（CDP 不可用等）后的退避窗口
+const freezeState = new Map();        // tabId -> { attempts: number[], lastFailedAt }
+
+// 返回还需要等待的毫秒数；0 表示现在可以尝试解冻。
+function freezeBackoff(tabId) {
+  const st = freezeState.get(tabId);
+  if (!st) return 0;
+  if (st.lastFailedAt) {
+    const left = FREEZE_FAIL_BACKOFF_MS - (Date.now() - st.lastFailedAt);
+    if (left > 0) return left;
+  }
+  const recent = (st.attempts || []).filter((ts) => Date.now() - ts < FREEZE_WINDOW_MS);
+  if (recent.length >= FREEZE_MAX_PER_WINDOW) {
+    return FREEZE_WINDOW_MS - (Date.now() - recent[0]);
+  }
+  return 0;
+}
+
+// 经 CDP 让渲染器回到 active。成功返回 { ok:true }；CDP 不可用（无 debugger 权限、
+// 用户 DevTools 占用、tab 已关闭）返回 { ok:false, reason }，调用方原样抛出原错误。
+function tryUnfreezeTab(tabId) {
+  return new Promise((resolve) => {
+    const finish = (v) => { try { chrome.debugger.detach({ tabId }, () => {}); } catch (e) { /* noop */ } resolve(v); };
+    const timer = setTimeout(() => finish({ ok: false, reason: "UNFREEZE_TIMEOUT" }), 5000);
+    const done = (v) => { clearTimeout(timer); finish(v); };
+    try {
+      chrome.debugger.attach({ tabId }, "1.3", () => {
+        if (chrome.runtime.lastError) {
+          const m = String(chrome.runtime.lastError.message || "");
+          // 用户手动开着 DevTools：不抢，直接放弃自愈。
+          return done({ ok: false, reason: /Another debugger|already has/i.test(m) ? "DEBUGGER_BUSY" : "ATTACH_FAILED" });
+        }
+        chrome.debugger.sendCommand({ tabId }, "Page.setWebLifecycleState", { state: "active" }, (resp) => {
+          const err = chrome.runtime.lastError;
+          if (err) return done({ ok: false, reason: "UNFREEZE_COMMAND_FAILED" });
+          done({ ok: true, resp });
+        });
+      });
+    } catch (e) {
+      done({ ok: false, reason: "ATTACH_THREW" });
+    }
+  });
+}
+
+// 带限流与状态记录的解冻尝试。返回 true 表示已解冻，调用方可以重试 scripting。
+async function recoverFrozenTab(tabId) {
+  if (freezeBackoff(tabId) > 0) return false;   // 限流中：不重复挂调试器，让调用方拿到原错误
+  const st = freezeState.get(tabId) || { attempts: [], lastFailedAt: 0 };
+  st.attempts = (st.attempts || []).filter((ts) => Date.now() - ts < FREEZE_WINDOW_MS);
+  st.attempts.push(Date.now());
+  freezeState.set(tabId, st);
+
+  const r = await tryUnfreezeTab(tabId);
+  const cur = freezeState.get(tabId) || { attempts: [] };
+  if (r.ok) {
+    cur.lastFailedAt = 0;
+    console.warn("[bridge] renderer was frozen, unfroze tab", tabId);
+  } else {
+    cur.lastFailedAt = Date.now();
+    console.warn("[bridge] unfreeze skipped", tabId, r.reason);
+  }
+  freezeState.set(tabId, cur);
+  return r.ok;
+}
+
 // ---------- 工具 ----------
 function requireTabId(tabId) {
   if (tabId === undefined || tabId === null) throw { code: "BAD_PARAMS", message: "缺少 tabId" };
@@ -1567,7 +2045,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .then((result) => sendResponse({ ok: true, result }))
       .catch((e) => sendResponse({
         ok: false,
-        error: { code: normalizeErrCode(e), message: e && e.message ? String(e.message) : String(e) },
+        error: errorPayload(e),
       }));
     return true;
   }
@@ -1578,8 +2056,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   // 页面 indicator 上报（如 agent.stop 按钮被点击）
   if (msg.type === "bridge.indicatorEvent") {
-    sendToHost({ type: "event", event: msg.event, payload: msg.payload || null });
-    sendResponse({ ok: true });
+    // 范围判定：payload.tabId 显式指定优先；否则用 sender.tab.id。
+    // 「在这个页面上按停止」只应停这个标签页，而不是把整台机器上所有 Agent 一起停掉
+    // ——那是过大的副作用。全局停止留给显式 API 调用（POST /agent/stop 不带 tabId）。
+    // 取不到 tabId（如扩展页面自己发的）时退回全局，宁可多停也不要停不住。
+    const senderTabId = sender && sender.tab && sender.tab.id !== undefined ? sender.tab.id : null;
+    const tabId = msg.payload && msg.payload.tabId !== undefined && msg.payload.tabId !== null
+      ? msg.payload.tabId
+      : senderTabId;
+    const forwardedPayload = { ...(msg.payload || {}), tabId };
+
+    // 先本地生效再转发：按钮点击是用户直接意图，不应等一个 host 往返才生效。
+    // （若 host 不可达，本地闸门仍然拦得住后续写操作。）
+    if (msg.event === "agent.stop") {
+      setStopped(tabId, forwardedPayload.reason || "user");
+      broadcastToTabs({ type: "bridge.stopState", stopped: true, reason: forwardedPayload.reason || "user", tabId });
+    } else if (msg.event === "agent.resume") {
+      clearStopped(tabId);
+      broadcastToTabs({ type: "bridge.stopState", stopped: false, tabId });
+    }
+    sendToHost({ type: "event", event: msg.event, payload: forwardedPayload });
+    sendResponse({ ok: true, tabId, stopped: msg.event === "agent.stop" ? !!isStopped(tabId) : !isStopped(tabId) });
     return false;
   }
   // 会话记录器：content 上报页面变化事件 → 每 tab 环形缓冲

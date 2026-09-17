@@ -98,11 +98,99 @@ host.log 只记 host 侧的 RPC 收发，**不含扩展内部的 `console.error`
 ### 回归自检：`node agent/cli.mjs verify`
 
 改完扩展跑一次，验证各修复项是否生效（脚本在 `agent/verify-bridge.mjs`）。改坏东西能立刻发现，不用等用户反馈。
+全量回归是 `cd relay && npm test`（含版本守卫、集成、单元、lib、tab 健康、冻结自愈）。
 
 写这类自检脚本有两条教训（都是我自己踩出来的假红）：
 
 1. **版本号断言写下限，不要写死具体值**。写死 `version === "0.3.4"` 之后每发一次版都得回来改脚本，改漏了就出现「功能正常但测试失败」。改成 `>= 0.3.3`（修复引入的最低版本）即可。
 2. **测试要自己保证前置条件**。扩展重载后旧标签页的 content script 会失效，脚本若随机挑一个 http tab 就直接测，会拿到 `TIMEOUT` 假红。正确做法是先对候选 tab 逐个 `tabs.prepare` 探测，取第一个可注入的。
+   同理：断言「withPage 结束后 tab 已关闭」时必须用唯一 URL + `match:"exact"`——`tabs.resolve` 默认按 **host** 匹配，环境里已有同域 tab 时会复用而不新建，复用不关（正确行为）却让断言失败。
+
+### 冻结自愈：`ensureInjected` 的 CDP 兜底（v0.3.10）
+
+`chrome.scripting.*` 在**渲染器被冻结**时全部挂到超时（13s），而 CDP 通道完好。这是 host.log 里
+最大的失败源（433 次 `PAGE_CONTEXT_TIMEOUT`，`tabs.prepare` 失败率 34%，耗时整齐卡在 13s / 26s）。
+Chrome 的 Memory Saver / 高能效模式就是这么冻后台 tab 的。
+
+`ensureInjected` 现在遇 `PAGE_CONTEXT_TIMEOUT` 会 CDP 解冻（`Page.setWebLifecycleState: active`）后重试一次。
+
+**改这块要注意三点**：
+
+1. **限流用滑动窗口，不要用「成功后冷却」**。Chrome 可能刚解冻又冻回去，成功即长冷却会让这种情况退化成不自愈。当前是 60s / 最多 5 次。
+2. **冻结 ≠ 丢弃**。`discarded` 的 tab 渲染器已卸载，CDP 救不回来，仍报 `TAB_DISCARDED`。不要在 `tryUnfreezeTab` 里试图处理 discarded。
+3. **不是每个入口都该自愈**。`tabs.resolve` 的候选探测走 `ensureInjected(..., {noRecover:true})`——它的语义是「找个能用的 tab」，为一个冻死的候选挂调试器 + 等 13s 不如换下一个。
+
+回归测试：`node relay/test-freeze-recovery.mjs`。它用 CDP 的 `Page.setWebLifecycleState` **手动冻结**
+渲染器来复现，不依赖等它自然冻结，所以能稳定跑。改解冻逻辑后先跑它。
+
+排查时可直接用 CDP 确认是不是冻结：`session.attach` + `session.send {method:"Page.setWebLifecycleState",params:{state:"active"}}`，
+再发一次原调用——从 13s 报错变成毫秒级成功，就是冻结。
+
+### 渲染暂停：`page.ensureActive`（v0.3.10）
+
+与「冻结」是两件事，不要混：
+
+| | 冻结（Memory Saver） | 渲染暂停（后台 tab） |
+|---|---|---|
+| 现象 | `chrome.scripting.*` 挂满 13s 才报错 | 脚本能跑，但 rAF=0、懒加载不推进 |
+| 影响 | 所有 `page.*` / `tabs.prepare` 失败 | 滚动「成功」但页面高度不变 |
+| 处理 | **自动** CDP 解冻重试 | 需 Agent 显式 `page.ensureActive` |
+
+**为什么渲染暂停不自动处理**：自动激活会在长流程里反复抢用户前台（实测后台 tab 的 rAF 是
+**0 帧**，活动页 60 帧）。所以只提供能力 + 假成功检测，由 Agent 决定。
+
+**`ensureActive` 的实现要点**（改这块前先读）：
+
+1. **只切标签页，不聚焦窗口**。不要加 `chrome.windows.update({focused:true})`——实测单独
+   `chrome.tabs.update({active:true})` 就能恢复 rAF（Chrome 不在前台时同样有效），加上聚焦
+   会把用户从别的应用里弹出来，这是这个 API 存在的意义。
+2. **用完必须归还**。借前台的记录在 `borrowedActive`，空闲 `BORROW_RESTORE_MS` 后自动还原；
+   `touchBorrow` 在每个 `page.*` 调用时续期（否则长流程中途会被抢走前台）。
+   计时器用 **per-borrow 的 `restoreMs`**，不是全局常量——我第一版写成全局常量，
+   于是 `restoreAfterMs` 参数被静默忽略，测试直接抓到。
+3. **用 `document.hidden` 判定而不是 `tab.active`**：非聚焦窗口里的活动标签页 rAF 是正常的
+   （实测 hidden=false、rAF=61），那种情况不需要动它。
+4. **CDP `Emulation.setFocusEmulationEnabled` 不能用**：它能恢复 rAF，但 **detach 或导航后
+   立即失效**，而 detach 是每次 RPC 收尾都会做的事。已实测确认，不要再试。
+
+**滚动检测的语义**：`expectGrowth` = 「这一滚应该加载出新内容」。**不要因为 `atBottom=true`
+就跳过报错**——懒加载的哨兵元素本来就在列表末尾，那正是应该触发加载的位置（实现时踩过这个坑，
+导致检测形同虚设）。后台场景下 atBottom 不可信（同一位置激活后会加载出更多）。
+
+**设计决定：不做自动激活，但必须让 Agent 能判断**。自动激活会在长流程里反复抢用户前台，
+所以只提供信号 + 一键封装。为了让「判断」真的可行，加了 `recoverable` 字段：
+
+| 情况 | `recoverable` | 该怎么办 |
+|---|---|---|
+| 后台标签页、懒加载没触发 | `true` | 值得 `ensureActive` 后重试 |
+| 前台也没动（选择器/容器不可滚） | `false` | **激活没用**，别白白打扰用户 |
+| 已到底（`atBottom:true`） | `false` | 用 `allowNoProgress` 收尾 |
+
+**踩过的坑：信号根本传不出去**。扩展抛的错误里本来带了 `atBottom`/`wasHidden`，但三层链路
+（扩展 `error:{code,message}` → host 重建 error 对象 → `BridgeRpcError`）**只保留 code/message，
+details 被静默丢弃**，Agent 只能解析 message 文本才能判断——等于「让 Agent 自己判断」是句空话。
+现在：
+
+- 扩展：`errorPayload()` 统一出口，所有地方（native/ws/bridge.action）都走它，避免再漏。
+- host：`rejectPending` 和 HTTP 出口都补上 `details`。**重建错误对象时极易漏掉，改这块要盯住**。
+- `BridgeRpcError` 新增 `details` + `detail(key)`。
+- 透传用**白名单**（`ERROR_DETAIL_KEYS`），不是全量：避免把任意对象（可能含页面内容）带出去。
+
+回归测试里专门有一条「details 三层链路未丢」——加字段时先想「这一路会不会被丢掉」。
+
+回归测试：`node relay/test-foreground-rendering.mjs`。它本地起一个靠 IntersectionObserver
+懒加载的页面确定性复现，**不依赖外网站点**。写这类测试的四个坑（都踩过）：
+
+- 断言前要**等页面自己的探针脚本就位**，不能只 sleep 固定时长——后台标签页的脚本执行会被推迟，
+  探针未就位时 `undefined - undefined = NaN`，JSON 序列化后是 `null`，报错信息完全看不懂。
+- 测试页内容**必须超过一屏**，否则命中「内容不满一屏无需滚动」的正常分支，造成假红。
+- **懒加载是异步的**：不要断言「第一次滚动就必须 grew」，要允许重试几次、只断言「最终能加载出来」。
+- **测试跑在用户正在使用的真实浏览器上**，而它会临时借走活动标签页。用户随时可能切标签页，
+  「调用前的活动页」在断言时已经变了——**这不是产品 bug**。第一版没做处理，实测 3 次里红 1 次。
+  现在所有涉及活动页的断言都是「干扰检测 + 重试」：检测到 `activeNow() !== tabId` 就重试，
+  重试耗尽则报 `skip`（不计失败）而不是给出假红。
+  > 一般原则：**写针对真实环境的测试，先想「用户同时在操作时会怎样」**。
+  > 假红的代价比不测更大——它会训练人忽略红色。
 
 `Uncaught (in promise)` 之类的面板报错同理：面板累积显示、不区分新旧，排查前先重新导航重置，再只触发一次待测调用——否则会把历史残留当成新问题。
 

@@ -665,13 +665,43 @@
     },
   };
 
+  // ---------- 停止状态（页面动作层） ----------
+  // 与 indicator.js 的停止标记互补：indicator 负责「看得见」（光标/按钮），
+  // 这里负责「真的不做」。两者都监听 bridge.stopState。
+  //
+  // 为什么必须有这一层：background 的停止闸门只能拦住**还没派发**的请求。
+  // 一个已经进到 content.js、正在跑多步逻辑的动作不受它控制。这里在**每个动作
+  // 开始之前**检查标记，让「停止」对已经派发但还没落到页面上的动作也生效。
+  let stoppedAt = 0;
+  function markStopped(stopped) { stoppedAt = stopped ? Date.now() : 0; }
+  function stoppedError(action) {
+    return {
+      code: "AGENT_STOPPED",
+      message: `用户已停止 Agent，${action} 未执行`,
+      details: { stoppedAt, resumeWith: "agent.resume", action },
+    };
+  }
+  // 只有**会改变页面状态**的动作才拦。snapshot 等只读动作必须放行：
+  // 停止后 Agent 还要能观察页面才能判断「该等用户还是该恢复」。
+  // （这与 relay/host.js 的 SIDE_EFFECT_METHODS、background.js 的闸门是同一个原则：
+  //   拦写、不拦读，并且不能把恢复/观察的路径一起堵死。）
+  const MUTATING_ACTIONS = new Set(["click", "type", "press", "scroll", "hover", "focusEl", "select", "waitFor"]);
+
   // ---------- 消息入口 ----------
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    // 停止状态推送（background 收到 agent.stop / agent.resume 后广播）
+    if (msg && msg.type === "bridge.stopState") {
+      markStopped(msg.stopped);
+      sendResponse({ ok: true, stopped: !!msg.stopped });
+      return false;
+    }
     if (!msg || msg.type !== "bridge.action") return false;
     const action = msg.action;
     const args = msg.args || {};
     Promise.resolve()
       .then(() => {
+        // 动作级停止闸门：见上方 markStopped / MUTATING_ACTIONS 的注释。
+        if (stoppedAt && MUTATING_ACTIONS.has(action)) throw stoppedError(action);
         switch (action) {
           case "snapshot": return snapshot(args);
           case "click": return doClick(args);
@@ -688,7 +718,13 @@
       .then((result) => sendResponse({ ok: true, result }))
       .catch((e) => sendResponse({
         ok: false,
-        error: { code: e && e.code || "CONTENT_ERROR", message: e && e.message ? String(e.message) : String(e) },
+        error: {
+          code: e && e.code || "CONTENT_ERROR",
+          message: e && e.message ? String(e.message) : String(e),
+          // details 透传：AGENT_STOPPED 要能带回 resumeWith / stoppedAt，
+          // 否则上层只能靠 message 文本猜。
+          details: (e && e.details) || undefined,
+        },
       }));
     return true; // 异步响应
   });

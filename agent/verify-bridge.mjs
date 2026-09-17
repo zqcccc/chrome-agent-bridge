@@ -40,12 +40,22 @@ for (const m of ["page.waitForReady", "page.waitForUrl", "page.waitForSelector"]
 }
 
 // 2. 文档里写了但没实现的别名
+// 注意：这些别名里有几个**会真的新建 tab**（tabs.resolve / tabs.openUrl / page.open → tabsResolve，
+// tabs.open / tabs.new → tabsCreate）。早先版本没关，实测每跑一次 verify 就在用户浏览器里
+// 攒下 5 个 example.com 垃圾页（总标签页一度 49 个）。所以这里记录新建的 tabId 并收尾关闭——
+// 「自己开的 tab 必须自己关」这条约束，验证脚本自己也得守。
+const openedByProbe = new Set();
 for (const m of ["tabs.resolve", "tabs.openUrl", "page.open", "tabs.open", "tabs.new", "page.reload", "tabs.claim", "tabs.release"]) {
   // active:false —— 别名探测只是验证「方法已注册」，别把浏览器切到新 tab（污染用户当前页）
   const r = await rpc(m, { tabId: 1, url: "https://example.com", active: false, timeoutMs: 1 });
   const isUnknown = r.error?.code === "UNKNOWN_METHOD";
   check(`别名 ${m} 已兼容`, !isUnknown, isUnknown ? "UNKNOWN_METHOD" : `返回 ${r.error?.code || "ok"}`);
+  const newId = r.result?.tabId ?? r.result?.tab?.id ?? (r.result?.id);
+  if (r.ok && newId !== undefined) openedByProbe.add(newId);
 }
+// 收尾：关掉探测过程中新建的 tab（复用来的 tab 不会出现在这里，不会误关用户页面）
+for (const id of openedByProbe) await rpc("tabs.close", { tabId: id }, 8000).catch(() => {});
+if (openedByProbe.size) console.log(`  （已关闭探测新建的 ${openedByProbe.size} 个 tab）`);
 
 // 3. 真实 tab 上的等待方法
 // 注意：扩展重载后旧标签页的 content script 会失效，随机挑一个来测会假红。

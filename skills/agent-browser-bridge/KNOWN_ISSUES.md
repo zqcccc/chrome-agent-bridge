@@ -47,15 +47,146 @@
 
 - 桥的读/写/点击/截图默认全部静默：不切换激活 tab、不把浏览器窗口拉到前台。脚本里用 `tabs.prepare`（注入 content script + 防后台冻结）代替过去的 `tabs.activate`。
 - **何时才显式激活**：登录/扫码/验证码/2FA/选文件（需用户眼睛）、最终核对可视化结果（`page.activateAndShot`）、被 OneTab/浏览器丢弃冻结的 tab（激活即唤醒重载；`tabs.prepare` 对被冻结 tab 返回 `TAB_DISCARDED`，`tabs.list` 的 tab 带 `discarded` 字段可预判）。
+- **页面必须激活才能继续时，就激活——但用 `page.ensureActive`，不要用 `tabs.activate`**（v0.3.10+）。
+  区别：`ensureActive` **只切标签页、不聚焦窗口**，且**用完自动把活动标签页还给用户**（空闲 20s，
+  可调 `restoreAfterMs`）；`tabs.activate` 会连窗口一起拉到前台并且永不归还。
+  典型场景：滚动加载不推进、懒加载出不来内容（后台 tab 的 rAF 被 Chrome 暂停）。
+  详见下方「已根治：后台 tab 渲染被暂停」。
 - 截图默认 CDP 静默；CDP 失败不再自动激活窗口（报 `SCREENSHOT_FAILED`），需要时显式 `allowActivate:true` 或 `page.activateAndShot`。
 - BOSS 薪资 OCR 走 macOS 窗口截图，需要 Chrome 窗口可见：静默模式下该步先 `tabs.activate` 再截。
 - 旧版扩展（无 `tabs.prepare`，返回 `UNKNOWN_METHOD`）：脚本里的 `try{...}catch{}` 会吞掉，`page.*` 内容调用自带 `ensureInjected` 自动注入，流程仍可跑；只有防冻结不生效。
 - **打开网址走 `tabs.resolve`（v0.3.9+），不要自己挑 tab**（2026-09 补充）。过去脚本里的 `tabs.find(t => t.url.includes(站点)) || tabs.find(t => t.active)` 有个坏 fallback：找不到匹配 tab 就拿用户当前正在看的页面去 `page.navigate`，直接把人家看的页面顶掉。`tabs.resolve` 把这条规则收进扩展：只复用**非活动**的同类 tab（排除聚焦窗口的活动页、pinned、discarded），没有就 `active:false` 静默新开后台 tab。**自己写脚本时也不要再写「fallback 到 active tab」这句。**
 
-## 已知状态：后台 tab 节流（静默模式的代价）
+## 已根治：后台 tab 渲染器被冻结（扩展 v0.3.10+）
 
-- Chrome 把后台 tab 定时器压到 1 秒级、长闲后可能冻结：依赖 rAF/轮询渲染的页面（瀑布流、懒加载）可能看似无响应。
-- 处理：`page.waitForSelector` / `page.waitForUrl` 超时放宽到 30s+；仍无响应再 `tabs.activate`（代价是抢一次焦点）。不要把「页面没反应」误判成站点风控。
+> 本条曾是「已知状态：静默模式的代价」，让 Agent 忍着。实际上它不是代价，是**当时最大的失败源**：
+> host.log 全量统计里 `PAGE_CONTEXT_TIMEOUT` 433 次居首，`tabs.prepare` 失败率 **33.9%**，
+> 耗时整齐卡在 **13s / 26s**（= ping 3s + 注入 10s 的整数倍）。v0.3.10 起自动自愈。
+
+**现象**：某个用得好好的 tab 突然所有 `page.*` / `tabs.prepare` 都要等十几秒才失败（`PAGE_CONTEXT_TIMEOUT`），
+换个调用还是失败，过一会儿自己又好了。
+
+**根因**：Chrome 的 **Memory Saver / 高能效模式**会冻结后台标签页的渲染器。冻结后
+`chrome.scripting.*`（注入、executeScript）**全部不可用**，只会挂到超时；而 **CDP 通道完好**。实测对照：
+
+| 状态 | `page.evaluate` / `tabs.prepare`（scripting） | CDP `Runtime.evaluate` |
+|---|---|---|
+| 正常 | 125–2000ms 成功 | 32ms |
+| `Page.setWebLifecycleState: frozen` 冻结后 | **13022ms 后 `PAGE_CONTEXT_TIMEOUT`** | **32ms 正常** |
+| 再发 `active` 解冻 | 125ms 恢复 | — |
+
+`Page.setWebLifecycleState` 就是 Chrome 自己冻结后台 tab 用的协议，所以这不是人造场景。
+日志侧的佐证：失败前同 tab 空闲时长**中位数 41s、>60s 占 46%**——典型的「放一会儿就被冻」。
+
+**v0.3.10 起自动处理，Agent 不需要做任何事**：`ensureInjected` 遇到 `PAGE_CONTEXT_TIMEOUT` 时，
+自动 CDP attach → `Page.setWebLifecycleState: active` 解冻 → 重试一次。
+实测从「13s 报错」变成「13s + 0.5s 后成功」，之后恢复毫秒级。
+
+限流用的是**滑动窗口**（60s 内最多解冻 5 次），不是「成功后冷却」——因为 Chrome 可能刚解冻又冻回去，
+成功即长冷却会让这种情况退化成不自愈。解冻失败（用户开着 DevTools 等）有 5s 退避，不会反复挂调试器。
+
+**Agent 侧仍要注意的两点**：
+
+1. **冻结 ≠ 丢弃**。`discarded` 的 tab 渲染器已被卸载，CDP 也救不回来，仍报 `TAB_DISCARDED`，
+   需要显式 `tabs.activate`（会重载页面）。`tabs.list` 的 `discarded` 字段可预判。
+2. **自愈要花约 13s**（第一次撞满 scripting 超时）。批量任务里如果某个 tab 反复出现 13s 延迟，
+   说明它一直被冻；`tabs.resolve` 换一个 tab 更快。
+
+**仍然成立的限制**：解冻只恢复**脚本执行能力**，不恢复前台时序——被冻过的页面里 rAF / 渲染节奏
+仍按后台走，依赖 `requestAnimationFrame` 的懒加载、瀑布流可能不推进。**这一点另见下一条**
+（v0.3.10 起有 `page.ensureActive` 可解）。
+
+回归测试：`node relay/test-freeze-recovery.mjs`（用 CDP 手动冻结渲染器复现，不依赖等它自然冻结）。
+
+## 已根治：后台 tab 渲染被暂停 → `page.ensureActive`（扩展 v0.3.10+）
+
+**现象（比上面那条更隐蔽）**：滚动指令返回 `{ok:true}`、点击也成功，但**列表永远是空的 / 永远只有
+首屏那几条**，页面高度不变。你以为是站点改版或选择器写错，实际是懒加载根本没触发。
+
+**根因**：Chrome 对后台标签页把 `requestAnimationFrame` **完全暂停**（实测 2s 内 **0 帧**，
+活动页 60 帧）、`document.visibilityState="hidden"`。依赖 rAF / IntersectionObserver 的
+懒加载、瀑布流、无限滚动在后台**永不推进**。
+
+> 这是「暂停」不是「节流」——**加长超时完全没用**，别在这上面浪费轮次。
+
+**已试过但不行的方案**：CDP `Emulation.setFocusEmulationEnabled` 确实能把 rAF 拉起来，
+但它 **detach 或页面导航后立即失效**（实测），而 detach 是每次 RPC 收尾都会做的事，等于没用。
+所以只能真让标签页 active。
+
+### 用法
+
+```js
+// 需要页面真的渲染时（滚动加载、等懒加载出内容、依赖动画/时序的操作）
+await rpc.ensureActive(tabId);
+// 返回 { activated, alreadyRendering, willRestoreTo, note }
+
+// 收工/提前归还（不等空闲计时器）
+await rpc.restoreActive(tabId);
+```
+
+- **只在必要时才激活**：内部先探 `document.hidden`，已经在渲染就原样返回（`activated:false`），
+  不会白切一次前台。
+- **只切标签页，不聚焦窗口**：不调 `chrome.windows.update({focused:true})`。实测单独
+  `chrome.tabs.update({active:true})` 就能恢复 rAF（Chrome 不在前台时同样有效），
+  **所以用户正在别的应用里工作时不会被弹到 Chrome**——这是它和 `tabs.activate` 的关键区别。
+- **用完自动还原**：默认 20s 无操作后把活动标签页还给用户原来那个；长流程中每次 `page.*`
+  调用都会续期，不会在滚动循环中途抢走前台。`restoreAfterMs` 可调。
+- 用户自己切走了、原标签页被关了（退到同窗口其它页）等边界都有处理。
+
+### 滚动推进检测：`page.scroll { checked: true }`
+
+后台页里 `window.scrollBy` **仍然生效**（实测滚动位置会变），所以「滚动成功」不能作为
+「内容加载了」的依据。`checked` 会回读页面高度与滚动位置：
+
+```js
+await rpc.scrollChecked(tabId, { direction: "down", expectGrowth: true });
+// 推进了：{ checked:true, grew, moved, atBottom, heightBefore, heightAfter }
+// 后台没加载出来：抛 SCROLL_NO_GROWTH
+// 视口完全没动：抛 SCROLL_STALLED
+// 到底了收尾：加 allowNoProgress:true，不再报错
+```
+
+#### 错误里带结构化字段，**用字段判断，不要解析 message**
+
+```js
+try {
+  await rpc.scrollChecked(tabId, { y: 99999, expectGrowth: true });
+} catch (e) {
+  e.code;                    // "SCROLL_NO_GROWTH" | "SCROLL_STALLED"
+  e.details.atBottom;        // 是否已到底（真到底了就别再激活）
+  e.details.wasHidden;       // 当时是不是后台标签页
+  e.details.recoverable;     // ★ 激活能不能解决：true 才值得调 ensureActive
+  e.detail("recoverable");   // 便捷读取（等价于 e.details.recoverable）
+}
+```
+
+`recoverable` 就是为「由 Agent 判断该不该激活」设计的：
+
+| 情况 | `recoverable` | 该怎么办 |
+|---|---|---|
+| 后台标签页、懒加载没触发 | `true` | 值得 `ensureActive` 后重试 |
+| 前台也没动（选择器/容器不可滚） | `false` | **激活没用**，别白白打扰用户 |
+| 已到底（`atBottom:true`） | `false` | 真到底了，用 `allowNoProgress` 收尾 |
+
+#### 不想自己写判断？用 `scrollLoad`
+
+```js
+await rpc.scrollLoad(tabId, { y: 99999, expectGrowth: true });
+// 内部：先直接滚 → 只有 recoverable===true 才 ensureActive → 重试一次
+// 返回带 { borrowed, activated, attempts, firstError }
+// 不该激活的场景（recoverable=false）直接原样抛出，不碰用户前台
+```
+
+- **`expectGrowth` 是「这一滚应该加载出新内容」的声明**，不是「到底了没」。
+  判断到底请用返回的 `atBottom` 字段。
+- 注意：**不能因为 `atBottom=true` 就放过**——懒加载的哨兵元素本来就在列表末尾，
+  「到底部」正是应该触发加载的位置；用 atBottom 做例外等于把这个信号关掉（实现时踩过）。
+- 后台场景下 `atBottom` **不可信**：同一位置激活后会加载出更多内容（实测），所以后台一律
+  归因为渲染被暂停。
+- 老写法 `page.scroll`（不带 `checked`）行为不变，不会突然开始报错。
+
+回归测试：`node relay/test-foreground-rendering.mjs`（本地起一个靠 IntersectionObserver
+懒加载的页面确定性复现，不依赖外网站点、不需要登录、不会因站点改版失效）。
 
 ## 已知状态：「接管中」滞留的自愈（扩展 v0.3.1+）
 
@@ -119,6 +250,9 @@
 - **根因（v0.3.6 才修到点子上）**：`chrome.tabs.sendMessage` 对「content script 不存在」**不会 reject，会一直挂起**。扩展 reload 前的旧标签页、content script 实例被销毁的页面都会命中——`ensureInjected` 的 ping 永不返回，外层 RPC 只能等满超时。此前几轮只在外层打补丁，没解决挂起。
 - 修法：给所有 `sendMessage` / `executeScript` 加超时（ping 3s、注入 10s、求值 12s），把「挂起」变成「快速可判定」；配合 `brokenTabs` 标记（30s TTL）让后续调用立即失败。实测坏 tab：首次 20s 判定，后续毫秒级失败。
 - `indicatorCall` 同样处理过——它是每个 `page.*` 的前置步骤，曾是一大卡点。
+  **v0.3.10 起它不再被 `await`**：indicator 只是视觉提示，但在冻结/受限页上它自己要先撞 3s
+  PING 超时；串在 RPC 前面等于给每个 `page.*` 白加 3s 延迟。现在改成 fire-and-forget（`.catch(()=>{})`），
+  失败不影响主 RPC。
 - 另一个触发源：导航超时往往意味着页面上下文已销毁。
 - v0.3.3 起：导航超时会给 tab 打「上下文失效」标记（30s TTL），后续 evaluate **立即返回 `PAGE_CONTEXT_TIMEOUT` 快速失败**，不再空等。`tabs.prepare` 注入成功会自动清除标记。
 - Agent 侧应对：收到 `PAGE_CONTEXT_TIMEOUT` 时，先 `tabs.prepare`（或 `page.navigate` 重来）恢复上下文，再继续；不要盲目重试同一个调用。
@@ -126,8 +260,76 @@
 ## 已知状态：操作报 PAGE_CONTEXT_TIMEOUT（页面上下文失效）
 
 - 含义：目标 tab 的 content script 不在了——常见于**扩展刚被重载过**（reload 前打开的旧标签页）、标签页被冻结/丢弃、或页面正在导航。
+- **v0.3.10 起，最常见的成因「渲染器被 Memory Saver 冻结」已自动自愈**（见上方「已根治」一节）：
+  扩展会 CDP 解冻后重试一次，Agent 无感。仍报这个错说明是真坏（受保护页 / discarded / 永远 loading）。
 - 处理：先 `tabs.prepare` 重新注入；仍不行则 `tabs.reload` 刷新该页面再操作。
 - 该错误是**快速失败**（毫秒级），不会挂死。若发现每个调用都要等几十秒才报这个错，说明扩展版本过旧（v0.3.6 以前），到 `chrome://extensions` 刷新扩展即可。
+
+## 已知状态：客户端超时被报成 CONNECTION_REFUSED（两个客户端都已修）
+
+- 现象：`无法连接本地桥 127.0.0.1:8778（[TIMEOUT] 请求超时 30000ms）`——看着像 host 挂了，
+  实际是**页面上下文超时**，与本地桥无关。会把人引向错误排查方向。
+- 根因：`req.on("error")` 无差别包装错误，而 `req.destroy(err)`（超时/中断）
+  也会走 `error` 事件，于是自己的超时错误被包成了 `CONNECTION_REFUSED`。
+- 已修（两处）：
+  - `scripts/lib/bridge.mjs`：`e instanceof BridgeRpcError` 时原样透传。
+  - `agent/client.mjs`（v0.3.11）：超时用专属的 `BridgeTimeoutError`，`error` 处理器凭
+    `instanceof BridgeError` 原样透传；只有真正的连接层失败才报 `CONNECTION_REFUSED`。
+- 现在的错误码区分：`TIMEOUT`（本地/服务端超时）· `CONNECTION_REFUSED`（连不上，才该提示启动桥）·
+  `UNAUTHORIZED`（token 不对）· `NOT_FOUND`（路由不存在）· `AGENT_STOPPED`（用户停了）· 业务错误。
+- 排查提示：拿不准是桥挂了还是页面超时时，直接 `curl -s http://127.0.0.1:8778/status`——
+  能返回 JSON 就说明桥好好的，问题在页面侧。
+
+## 已知状态：`details` 在客户端链路被丢（v0.3.11 已修）
+
+- 现象：`SCROLL_NO_GROWTH` 的 `recoverable` / `atBottom` 拿不到，Agent 只能去解析 message 文本，
+  「让 Agent 自己判断该不该激活」于是成了空话。
+- 根因：`agent/client.mjs` 重建 `BridgeError` 时只保留 `code` / `message`。
+- 已修：`BridgeError` 新增 `details` 与 `detail(key)`，HTTP / WS / 客户端 / 扩展四层都透传。
+  同时 host 的 WS `/bridge` 出口也补上了 details（以前只有 HTTP 出口带）。
+- 用法：`e.detail("recoverable")`，不要解析 message。
+
+## 已知状态：自写 WebSocket 实现把分片消息当成多条（v0.3.11 已修）
+
+- 现象：扩展连上了、但「从不响应」，host 日志里看不到任何错误。
+- 根因：`relay/ws-server.js` 对 text 帧和 continuation 帧都立即 `emit("message")`，
+  没有按 FIN 组装。一条分片传输的 JSON 被拆成 `{"ok":` 和 `true}`，两边 `JSON.parse` 都失败
+  后被静默忽略——错误被吞掉了，排查方向完全跑偏。
+- 已修：按 RFC 6455 组装到 FIN 才交付；并补齐协议加固：
+  - 未 mask 的客户端帧 → 1002；RSV 位非 0 → 1002；未知 opcode → 1002；
+  - 控制帧不得分片 / 不得 >125 字节；
+  - 单条消息上限（含分片累计）16MB、分片数上限，超限以 1009 提前拒绝（按声明长度就拒，不先攒内存）；
+  - 发送侧背压记账：排队未 flush 字节超上限就断开慢消费者（1013），不再忽略 `write()` 的返回值。
+- 副作用（对写测试的人重要）：**测试里手写的 WS 客户端必须带 mask**，否则现在会被拒。
+  真实 Chrome 一直带 mask，只有手写实现会漏——那正是应该被拒绝的对象。
+
+## 已知状态：`agent.stop` 以前只是通知，不是真停（v0.3.11 已修）
+
+- 现象：用户点页面上的「停止 Agent」，界面显示「已放开」，但排队的点击/输入继续执行；
+  通过 HTTP 调用、没订阅事件的 Agent 完全不知道用户按了停止。
+- 根因：按钮只发 `agent.stop` 事件，host 只把它 `broadcastToAgent`，既不清队列也不拦后续 RPC。
+- 已修：停止变成一个**可查询、会拒绝新写操作、会取消未派发请求**的状态，三层各管一段：
+  - **host**：拦「还没派发的」（含排队中），并取消它们；`/status` 与 `agent.stopStatus` 可查。
+  - **扩展**：拦「已派发但还没落到页面上的」。
+  - **页面（content.js）**：拦多步动作的下一步（滚动循环、逐字输入等）。
+- 范围：页面按钮只停**它所在的那个 tab**（用 `sender.tab.id` 判定），不再把整台机器上所有 Agent 一起停掉。
+- 恢复：`agent.resume`；错误里给 `details.resumeWith` / `details.scope`，不用解析 message。
+- 边界：**只拦写操作**。只读（`page.info`/`snapshot`/`evaluate`/`tabs.list`、CDP 的 `Runtime.*`）、
+  释放类（`tabs.close`/`session.detach`）、恢复类（`session.attach`/`agent.resume`）都不拦——
+  否则 Agent 被盲住，或者一次停止留下未释放的 debugger 会话，比不停更糟。
+  已完成的页面动作**无法撤销**，响应里会如实说明。
+
+## 已知状态：队列等待不计入超时（v0.3.11 已修）
+
+- 现象（已隔离复现）：设 `timeoutMs:10` 的请求，排队 52ms 后**仍被发送**。
+  对发消息 / 提交表单这类不可逆操作，这意味着「调用方以为失败」变成「稍后偷偷执行」。
+- 根因：超时计时器在请求**真正发出后**才启动；租约也只在入队前查一次。
+- 已修：
+  - 入口生成统一截止时间（预算），**排队、等扩展重连、执行共用它**；排队超时立即失败
+    （`details.phase` = `queued` / `waiting-ext` / `executing`）。
+  - **派发前重新校验**：取消标记 / 停止状态 / 租约归属 / 预算。
+  - **客户端断开即取消**尚未派发的请求（HTTP `aborted`/`close`、WS `close`）。
+  - 已派发到扩展的无法撤回，响应里用 `inFlight` 如实报告。
 
 ## 已知状态：debugger 会话状态（session.attach / session.send）
 

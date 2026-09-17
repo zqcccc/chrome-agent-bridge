@@ -20,7 +20,7 @@
 
 普通 AI 工具打不开的页面（要扫码登录、有验证码、反爬、内容动态渲染），它都能进——因为那就是你在用的真实 Chrome。
 
-**反过来，什么时候别用它**：任务不需要登录态、通用搜索/抓取工具就能拿到结果时，用通用工具更快，也不打扰你的浏览器。
+**唯一该先试 curl 的情况**：目标本身就是 JSON / XML / 纯文本（API、`.md`、`.csv`、`robots.txt`）。只要是**给人看的网页**，就直接用它——现代前端站点（React / Vue / SPA）用 curl 只能拿到空壳 HTML，`body` 可见文本长度为 0，而且**不报错**，很容易让人以为读到了、实际什么都没读到。
 
 ---
 
@@ -188,7 +188,7 @@ chrome-agent-bridge/
 ```bash
 clawhub login
 clawhub publish ./skills/agent-browser-bridge \
-  --slug agent-browser-bridge --version 0.3.9 \
+  --slug agent-browser-bridge --version 0.3.11 \
   --tags latest,browser,chrome --changelog "见 CHANGELOG.md"
 ```
 
