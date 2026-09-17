@@ -1,5 +1,113 @@
 # 版本与更新（扩展 + 本地桥）
 
+## 0.3.12：CDP 会话隔离（内部流程不再拆掉 Agent 的调试会话）+ LinkedIn 子技能
+
+这一版修的是一个**已在三个不同路径上各自发作**的根因，外加沉淀一个子技能。
+
+### 1. 内部 CDP 流程不再拆掉 Agent 的会话（真 bug，三个故障同一根因）
+
+扩展里有 4 处「`chrome.debugger.attach` → `sendCommand` → `detach`」的裸写法，其中前 3 处
+都**无条件 detach**：CDP 兜底求值、CDP 截图、渲染器解冻。而 `rpc.ev()` 会先 `session.attach`
+建立 Agent 自己的会话，于是这三个内部流程会把 Agent 的会话一并拆掉，而 `cdpSessions`
+集合仍留着 tabId —— 扩展内部状态与真实调试状态不一致。
+
+三个已复现的真实故障：
+
+1. **严格 CSP 站点**（linkedin.com / github.com / chatgpt.com）：先 `page.evaluate`（走 CDP 兜底）
+   再 `ev()` → 兜底拆掉会话。后果 A：兜底自己因 detach/sendCommand 竞态拿不到结果，抛出的
+   却是 `EVAL_ERROR`（错误信息指向 CSP，与真实原因完全无关）；后果 B：下一次 `ev()` 报
+   `SESSION_SEND_FAILED`「Debugger is not attached」。
+2. **Agent 持有会话时 `page.screenshot`** → attach 报「Another debugger is already attached」，
+   截图直接失败（而不是复用会话）。
+3. **Agent 持有会话时渲染器被冻结** → 解冻的 attach 失败，**自愈静默失效**，
+   仍要空等 13s 才报 `PAGE_CONTEXT_TIMEOUT`（实测：无会话时 11.9s 自愈成功，有会话时 13.0s 失败）。
+
+修法：收敛成**唯一入口** `withBorrowedDebugger(tabId, fn)`——「谁借的谁还」：
+
+| 情形 | 行为 |
+|---|---|
+| `cdpSessions` 已有该 tab | 复用 Agent 的会话，结束**不拆** |
+| attach 成功 | 我们借的，结束归还 |
+| attach 报 `already attached` | 本扩展的遗留会话，登记进 `cdpSessions` 后保留 |
+| 报 `Another debugger`（用户开着 DevTools） | 归一为 `DEBUGGER_BUSY` 抛出，**不抢** |
+
+> 为什么收敛而不是在三处各打补丁：第一版只在兜底求值里加判断，随后发现截图与解冻各有一份
+> 同样的缺陷。裸写 4 遍 `attach/detach` 本身就是 bug 的来源，所以改成单一入口。
+
+**回归测试**：`relay/test-cdp-session-isolation.mjs`（17 项，已接入 `test:e2e`）。
+它用**本地 CSP 页面**（响应头带 `script-src 'self'`）确定性复现，不依赖外网站点与登录态。
+已验证测试**真的会红**：在旧代码上 11 项失败，修后 17 项全绿。
+
+### 2. 测试套件不再「挂死」（v0.3.11 引入的回归）
+
+`relay/test.js` 第 6 步发一个 `agent.stop` 事件来验证订阅，第 7 步接着发 `page.click`（写操作）。
+但 v0.3.11 把 `agent.stop` 从「通知」改成了**强制状态**（host 会拦后续写操作），于是第 7 步
+在 host 入口就被拒掉、**不再转发给扩展**，而测试在 `await extWs.next()` 等一个永不到来的帧。
+
+实测：在干净 HEAD 上 **3/3 挂死**（`timeout` 才能收掉）。
+
+> 为什么没人发现：v0.3.11 的提交里没有跑完整 `npm test`（或只跑了离线层），
+> 而「挂住」不会像「失败」那样出现在结果里——它只会让进程停在那里。
+
+修法（两层）：
+
+1. **测试自净**：第 6 步验证完就补发 `agent.resume`，把 host 状态清干净再进第 7 步。
+   这也顺便把「停止/恢复事件真的落到 host 状态」这件事验证得更完整。
+2. **加挂死看门狗**：默认 60s（`BRIDGE_TEST_TIMEOUT_MS` 可调），超时打印已通过/失败项数
+   + 最可能的原因 + host 输出尾部，然后 `exit 1`。
+   > **「挂住」比「失败」更糟**：CI 会一直卡着，本地也看不出原因。以后写这类
+   > 「等对方回帧」的测试，都应配一个看门狗。
+
+已验证：修后连跑 3/3 通过；把补丁去掉后看门狗会在 15s 内明确报错并指出原因（不再无限挂起）。
+
+### 3. 新增 LinkedIn 子技能 `linkedin/`
+
+`linkedin/SKILL.md` + `linkedin/scripts/lib/linkedin.mjs`（公共层）+ 两个脚本：
+
+- `linkedin/scripts/linkedin-read.mjs`：**只读**读档案（经历/项目/教育/技能/Headline）
+- `linkedin/scripts/linkedin-edit.mjs`：改 Headline / About，带 `--dry-run` 与
+  「非空字段默认拒绝覆盖」（写公开档案是对外可见动作，不能默认覆盖）
+
+沉淀的是该站**五重叠加的坑**（每条都实测过，且现象都指向错误方向）：
+
+| 坑 | 现象 | 真相 |
+|---|---|---|
+| 严格 CSP | `EVAL_ERROR` 提到 CSP | 与表达式无关，必须走 CDP 求值 |
+| **SDUI 懒渲染** | 页面正常但条目 0 条 | 后台标签页 rAF 被暂停，SDUI 不渲染；需先 `ensureActive` |
+| 字段无稳定 id/name | 选择器时灵时不灵 | id 是 React 生成的；按 `aria-label` 定位 |
+| About 是 TipTap 富文本 | 找到了但写不进去 | 赋 `innerText` 被 ProseMirror 忽略，必须写 `innerHTML` + `InputEvent` |
+| 两种点击语义 | 点了没反应 | 有的按钮只认 `el.click()`，有的只认真实鼠标事件 |
+
+**顺带修掉四个真实缺陷**（都是写这个子技能时实测撞到的）：
+
+- **模板字符串里的 `split('\n')` 会变成真实换行**，生成的 JS 表达式当场断成两行、语法错误。
+  实测影响 `fillField` 的富文本分支——**任何多行富文本写入都是坏的**。改用 `JSON.stringify(NL)` 注入。
+  > 这与本仓库已记录的「单反斜杠被吃成 `d`」是同一类坑：**模板字符串里写正则/转义符**。
+  > 同类地方（`readSection` 的 id 解析）已改用字符串切分，从根上避开转义层。
+- **成功 toast 文案是「已成功保存。」**，而 `saveAndVerify` 只匹配「已保存|保存成功」，
+  于是把成功当成了校验错误（报 `validation-error`，实际已保存）。现在用宽松判据
+  （含「保存」且不含否定词），并支持「弹窗直接关掉」这条成功路径。
+- **语言档案 URL 拼出双问号 → 静默回退主档案**。About 的表单路径本身带查询串
+  （`?profileFormEntryPoint=GUIDANCE_CARD`），再拼 `?language=en` 就成非法 URL，
+  LinkedIn 把后一个参数当成前一个的值（`...GUIDANCE_CARD%3Flanguage%3Den`），
+  **不报错、静默返回主档案内容**。实测：英文 About 应为 1576 字符，拼错时拿到 768 字符的中文。
+  修法：新增 `withQuery()` 安全合并（已带 `?` 则用 `&`），`gotoForm` 改用它。
+  另修 `normalizeSlug` 的顺序 bug（先剥查询串再去尾斜杠，否则 `.../abc/?x=1` 与
+  `.../abc` 会得到不同结果，随后又拼 `/` 就出现双斜杠）。
+
+- **`linkedin-edit.mjs` 的参数解析会把旗标当成值**：旧写法 `out.headline = argv[++i]` 遇到
+  `--headline --dry-run` 会把 `--dry-run` 当作标题文本——**若该字段为空，就会把字面量
+  `--dry-run` 写进公开档案**。`--about --file x.md` 也把 `--file` 当成 About 正文、
+  反而读不到文件。现改为：识别已知旗标名，后一个位置是旗标或缺值时报错退出（码 2）。
+
+**回归测试**：`relay/test-linkedin-expr.mjs`（24 项，已接入 `test:unit-all`）。
+它用 mock rpc 抓出真正会发给页面的表达式，用解析器逐个验证语法——模板字符串转义类错误
+在真实使用中表现为「脚本报语法错但看起来莫名其妙」，用解析器断言能在毫秒内定位。
+已验证测试**真的会红**：把 `split(JSON.stringify(NL))` 改回 `split('\n')` 后，
+`fillField` 与 `fillHeadline` 两项立即失败。
+
+> 该子技能**不含任何个人数据**：档案 URL 由调用方传入，示例用占位符。
+
 ## 0.3.11：五项加固（token fail-closed · 真停止 · 预算与取消 · 错误契约 · WS 分片）
 
 这一版修的是**安全与可信度**问题，不是功能：五个缺陷都属于「界面/返回值说的是一回事，实际做的是另一回事」。
@@ -115,7 +223,7 @@ WS 分片与背压 / host-扩展副作用清单契约）、`test-content-stop.mj
 
 | 部件 | 版本 | 版本号来源 |
 |---|---|---|
-| 扩展 | **0.3.11** | `extension/manifest.json`（唯一事实来源） |
+| 扩展 | **0.3.12** | `extension/manifest.json`（唯一事实来源） |
 | 本地桥 host | 同扩展 | 启动时读 `extension/manifest.json`（不单独维护） |
 | 本 skill | 随 ClawHub 发布 | — |
 

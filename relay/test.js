@@ -212,6 +212,11 @@ async function main() {
   extWs.send({ type: "event", event: "agent.stop", payload: { from: "test" } });
   const ev = await sub;
   ok("agent 订阅收到扩展事件", ev.type === "event" && ev.event === "agent.stop", ev);
+  // v0.3.11 起 agent.stop 是**强制状态**（host 会拦后续写操作），不再只是通知。
+  // 必须在这里清掉，否则下一步的 page.click（写操作）会被 host 直接拒掉、不转发给扩展，
+  // 于是 `await extWs.next()` 永远等不到帧 —— 表现为整个测试挂死（实测 3/3 复现）。
+  extWs.send({ type: "event", event: "agent.resume", payload: {} });
+  await sleep(100);
 
   // 7. 扩展 RPC 报错传播
   const errPromise = httpReq(PORT, "POST", "/rpc", { method: "page.click" }, { Authorization: `Bearer ${token}` });
@@ -257,5 +262,21 @@ process.on("exit", () => {
     try { hostRef.kill("SIGKILL"); } catch (e) { /* noop */ }
   }
 });
+
+// 挂死看门狗：**「挂住」比「失败」更糟**——CI 会一直卡着、看不出原因，本地也会耗光耐心。
+// 实测教训：v0.3.11 把 agent.stop 改成强制状态后，本测试第 6 步发出 agent.stop、
+// 第 7 步的 page.click（写操作）就被 host 直接拒掉、不再转发给扩展，
+// 于是 `await extWs.next()` 永远等不到帧，整个套件无限挂起（实测 3/3 复现）。
+// 看门狗把它变成「明确失败 + 指出可能原因」，而不是一个没有输出的进程。
+const WATCHDOG_MS = Number(process.env.BRIDGE_TEST_TIMEOUT_MS) || 60000;
+const watchdog = setTimeout(() => {
+  console.error(`\n✗ 测试超时（${WATCHDOG_MS}ms）：进程挂死，通常是某个 await 永远等不到响应。`);
+  console.error(`  已通过 ${passed} 项、失败 ${failed} 项。`);
+  console.error("  常见原因：期望扩展回帧但请求被 host 拦下（如 agent.stop 生效后的写操作）、");
+  console.error("  或 host 已退出但测试仍在等它。可用 BRIDGE_TEST_TIMEOUT_MS 调整。");
+  if (hostOut) console.error("--- host 输出 ---\n" + hostOut.slice(-1500));
+  process.exit(1);
+}, WATCHDOG_MS);
+watchdog.unref();   // 正常结束时不要让看门狗拖住进程
 
 main().catch((e) => { console.error("测试异常:", e); process.exit(1); });

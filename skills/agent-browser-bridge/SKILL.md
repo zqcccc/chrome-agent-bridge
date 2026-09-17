@@ -134,6 +134,7 @@ TAB=$(node scripts/preflight.mjs --pick github)   # 直接拿到可用 tab 的 i
 | **BOSS 直聘 zhipin.com**（搜职位、筛选、读 JD、打招呼投递） | `boss/SKILL.md` | `boss-send-chat.mjs`、`boss-batch-apply.mjs`、`boss-verify-helpers.mjs` |
 | **ChatGPT chatgpt.com**（网页端提问、读回复、选模型、生图） | `chatgpt/SKILL.md` | `chatgpt-ask.mjs`、`cdp-eval.mjs`（**该站 CSP 严格，`page.evaluate` 不可用，一律走 CDP**） |
 | **NotebookLM**（新建笔记本、上传来源、提问、Studio 产物） | `notebooklm/SKILL.md` | `notebooklm/upload.mjs`、`notebooklm/ask.mjs`、`notebooklm/scripts/*.mjs`、`scripts/cdp-upload.mjs` |
+| **LinkedIn linkedin.com**（读档案、改 Headline/About、增删改经历与项目、中英文双语言档案） | `linkedin/SKILL.md` | `linkedin/scripts/linkedin-read.mjs`（只读）、`linkedin/scripts/linkedin-edit.mjs`、`linkedin/scripts/lib/linkedin.mjs`（公共层） |
 | **任何站点：页面异常 / 结构陌生 / 交付前验证** | `debug/SKILL.md` | `browser-debug.mjs`（首选仍是插件内置 `page.inspect` / `page.record`） |
 
 > 通用能力也可复用：`scripts/lib/bridge.mjs`（**统一封装：解包 / CDP 求值 / 点击双模式 / 坏 tab 熔断**）、`scripts/preflight.mjs`（开工体检）、`scripts/cdp-eval.mjs`（强 CSP 站点求值）、`scripts/cdp-upload.mjs`（注入文件上传）、`scripts/type-text.mjs`（受控组件输入）。
@@ -209,7 +210,7 @@ console.log(text);
 
 ## 快速开始（CLI）
 
-> ⚠️ **先回头看「第一原则」的子技能索引**：小红书 / BOSS 直聘 / ChatGPT / NotebookLM 有专项子技能与现成脚本，**命中就先跑脚本，不要从这里开始手写裸 RPC / 裸 `page.evaluate` 抓数据**（会触发风控）。通用站点或不涉及数据抓取的单点操作才用下面这些命令。
+> ⚠️ **先回头看「第一原则」的子技能索引**：小红书 / BOSS 直聘 / ChatGPT / NotebookLM / LinkedIn 有专项子技能与现成脚本，**命中就先跑脚本，不要从这里开始手写裸 RPC / 裸 `page.evaluate` 抓数据**（会触发风控）。通用站点或不涉及数据抓取的单点操作才用下面这些命令。
 >
 > **CLI 就在本 skill 目录旁的仓库里（`<仓库根>/agent/cli.mjs`），用上表「路径约定」的 `$ROOT` 直接引用，不要去文件系统里搜索它。**
 >
@@ -680,6 +681,7 @@ const hasHScroll = de.scrollWidth > de.clientWidth;   // 真正的判据
 - **ChatGPT 网页版（问答/选模型/生图）** → `chatgpt/SKILL.md`。脚本 `scripts/chatgpt-ask.mjs`（一键提问读回复）、`scripts/cdp-eval.mjs`（CDP 求值）。**注意：chatgpt.com 有严格 CSP，`page.evaluate` 不可用，一切页面内 JS 走 CDP（`cdp-eval.mjs` / `session.send`）。** 前置：用户已在浏览器登录 chatgpt.com。
 - **BOSS 直聘（职位搜索/筛选/打招呼投递）** → `boss/SKILL.md`。脚本 `scripts/boss-send-chat.mjs`（单条消息发送 + 送达验证）、`scripts/boss-batch-apply.mjs`（批量投递模板）、`scripts/boss-verify-helpers.mjs`（送达验证纯逻辑模块）。覆盖搜索 URL 与薪资档位、职位卡片提取、薪资字体加密（PUA 码点，用窗口截图 OCR）、按简历画像评分与定制打招呼、3 条消息投递、每日沟通上限与风控停止规则。前置：用户已登录 zhipin.com，发送前须经用户确认。
 - **NotebookLM**（新建笔记本、上传来源含视频/音频/图片/PDF、提问取回答、生成下载 Studio 产物）→ `notebooklm/SKILL.md`。脚本 `notebooklm/upload.mjs`、`notebooklm/ask.mjs`、`notebooklm/scripts/nblm-*.mjs`；文件上传走 CDP 注入。注意：网络出口需在开放地区（美国节点可用，香港/中国大陆不可用）。
+- **LinkedIn 职业档案（读取 / 编辑 Headline·About / 中英文双档案）** → `linkedin/SKILL.md`。脚本 `linkedin/scripts/linkedin-read.mjs`（**只读，改东西前先跑**）、`linkedin/scripts/linkedin-edit.mjs`（改 Headline/About，带 `--dry-run` 与「非空拒绝覆盖」保护）；公共层 `linkedin/scripts/lib/linkedin.mjs`。该站五重坑（**严格 CSP 禁 `page.evaluate`、SDUI 后台标签页不渲染、字段无稳定 id/name、About 是 TipTap 富文本、两种点击语义并存**）已在子技能里逐条收敛，**禁止从零手写**。前置：用户已登录 linkedin.com；改公开档案是对外可见动作，先 `--dry-run`。
 - **临场 Debug（任何站点通用）** → `debug/SKILL.md`（工具 `scripts/browser-debug.mjs`）。页面行为异常（404/风控误判、取不到内容、数量不对、URL 打不开）、需要理解陌生页面结构、或交付前验证提取结果时读取。**先探查后假设、不猜类名、异常先查 DOM 再下结论、输出独立验证**。
 
 ---

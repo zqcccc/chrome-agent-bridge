@@ -1791,43 +1791,95 @@ async function pageActivateAndShot(tabId, params) {
   return pageScreenshot(tabId, { ...(params || {}), allowActivate: true });
 }
 function cdpScreenshot(tabId, format, quality, captureBeyondViewport) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      try { chrome.debugger.detach({ tabId }, () => { /* noop */ }); } catch (e) { /* noop */ }
-      reject(new Error("CDP 截图超时（页面可能过大或忙碌）"));
-    }, 20000);
-    chrome.debugger.attach({ tabId }, "1.3", async () => {
-      if (chrome.runtime.lastError) {
-        clearTimeout(timer);
-        reject(new Error(chrome.runtime.lastError.message || "debugger attach failed"));
-        return;
-      }
-      try {
-        const result = await new Promise((res2, rej2) => {
-          chrome.debugger.sendCommand(
-            { tabId }, "Page.captureScreenshot",
-            { format, quality: format === "jpeg" ? quality : undefined, captureBeyondViewport },
-            (resp) => {
-              if (chrome.runtime.lastError) rej2(new Error(chrome.runtime.lastError.message));
-              else res2(resp);
-            }
-          );
-        });
-        clearTimeout(timer);
-        resolve({ data: "data:image/" + format + ";base64," + result.data });
-      } catch (e) {
-        clearTimeout(timer);
-        throw e;
-      } finally {
-        try { chrome.debugger.detach({ tabId }, () => { /* noop */ }); } catch (e) { /* noop */ }
-      }
-    });
+  return withBorrowedDebugger(tabId, async (send) => {
+    const result = await Promise.race([
+      send("Page.captureScreenshot", {
+        format,
+        quality: format === "jpeg" ? quality : undefined,
+        captureBeyondViewport,
+      }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("CDP 截图超时（页面可能过大或忙碌）")), 20000)),
+    ]);
+    return { data: "data:image/" + format + ";base64," + result.data };
   });
 }
 
 // 我们自己附加的 CDP 会话（tabId 集合）。与「用户手动打开的 DevTools」区分开：
 // 只有集合内的 tab 才允许 session.send，且 session.detach / 调试目标卸载时移除。
 const cdpSessions = new Set();
+
+/**
+ * 借用调试器跑一段 CDP 操作，结束后**只归还自己借的那一份**。
+ *
+ * 为什么必须收敛到这一个入口：扩展里原本有 4 处「attach → sendCommand → detach」的裸写法
+ * （CDP 兜底求值、CDP 截图、渲染器解冻、agent 会话），它们各自**无条件** detach。
+ * 于是当 agent 自己已经 session.attach 过（`rpc.ev()` 就会 attach）时，这些内部流程会把
+ * agent 的会话一起拆掉，而 `cdpSessions` 集合仍留着 tabId —— 扩展内部状态与真实调试状态
+ * 不一致，下一次 `session.send` 报「Debugger is not attached」，且错误信息完全看不出是谁拆的。
+ *
+ * 三个已复现的真实故障（均有回归测试 `relay/test-cdp-session-isolation.mjs`）：
+ *   1. linkedin.com 这类严格 CSP 站点：先 `page.evaluate`（走 CDP 兜底）再 `ev()` →
+ *      兜底拆掉会话，后续报 `SESSION_SEND_FAILED`；而兜底自己也因竞态拿不到结果，
+ *      抛出的却是 `EVAL_ERROR`（错误信息指向 CSP，与真实原因无关）。
+ *   2. agent 持有会话时 `page.screenshot` →「Another debugger is already attached」直接失败。
+ *   3. agent 持有会话时渲染器被冻结 → 解冻 attach 失败，**自愈静默失效**，
+ *      仍要空等 13s 才报 `PAGE_CONTEXT_TIMEOUT`。
+ *
+ * 三种情形（对应「谁借的谁还」）：
+ *   1. `cdpSessions` 已有该 tab → 直接复用 agent 的会话，结束**不拆**
+ *   2. attach 成功 → 我们借的，结束归还
+ *   3. attach 报 `already attached` → 本扩展的遗留会话，登记进 `cdpSessions` 后保留
+ *      （与 `sessionAttach` 的约定保持一致）
+ *
+ * 用户手动开着 DevTools 时报 `Another debugger`，归一为 `DEBUGGER_BUSY` 抛出——不能抢。
+ *
+ * @param {(send: (method: string, params?: object) => Promise<any>) => Promise<any>} fn
+ */
+async function withBorrowedDebugger(tabId, fn) {
+  requireTabId(tabId);
+  const send = (method, params) =>
+    new Promise((resolve, reject) => {
+      chrome.debugger.sendCommand({ tabId }, method, params || {}, (resp) => {
+        const err = chrome.runtime.lastError;
+        if (err) reject(new Error(err.message || "sendCommand failed"));
+        else resolve(resp);
+      });
+    });
+
+  // 情形 1：agent 自己持有会话 → 复用它，绝不拆
+  if (cdpSessions.has(tabId)) return fn(send);
+
+  const attached = await new Promise((resolve) => {
+    chrome.debugger.attach({ tabId }, "1.3", () => {
+      const err = chrome.runtime.lastError;
+      if (!err) return resolve({ ok: true, owned: true });
+      const m = String(err.message || "");
+      // 情形 3：本扩展已附加（上一次 detach 漏掉 / 并发重复 attach）
+      if (/already attached/i.test(m)) return resolve({ ok: true, owned: false });
+      resolve({
+        ok: false,
+        code: /Another debugger|already has/i.test(m) ? "DEBUGGER_BUSY" : "ATTACH_FAILED",
+        message: m,
+      });
+    });
+  });
+
+  if (!attached.ok) {
+    const e = new Error(attached.message || attached.code);
+    e.code = attached.code;
+    throw e;
+  }
+  if (!attached.owned) cdpSessions.add(tabId);
+
+  try {
+    return await fn(send);
+  } finally {
+    // 只归还自己借的那一份：复用来的会话拆掉会把 agent 后续调用全废掉
+    if (attached.owned) {
+      try { chrome.debugger.detach({ tabId }, () => { /* noop */ }); } catch (e) { /* noop */ }
+    }
+  }
+}
 
 // ---------- CDP 兜底求值（严格 CSP / Trusted Types 站点） ----------
 // 页面 CSP 缺 'unsafe-eval' 或有 Trusted Types 时，chrome.scripting 注入的 eval() 会被拦。
@@ -1859,37 +1911,23 @@ function cdpEvaluate(tabId, params) {
     var __run = function(){ return __wrap(eval(${JSON.stringify(expr)})); };
     return ${awaitPromise ? "Promise.resolve().then(__run)" : "__run()"};
   })()`;
-  return new Promise((resolve) => {
-    let settled = false;
-    const done = (v) => { if (settled) return; settled = true; try { chrome.debugger.detach({ tabId }, () => {}); } catch (e) { /* noop */ } resolve(v); };
-    const timer = setTimeout(() => done(null), Math.min(CONTENT_CALL_TIMEOUT_MS, 20000));
-    let attached = false;
-    try {
-      chrome.debugger.attach({ tabId }, "1.3", () => {
-        if (chrome.runtime.lastError) { clearTimeout(timer); return done(null); }
-        attached = true;
-        chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
-          expression: wrapped,
-          awaitPromise,
-          returnByValue: true,
-          userGesture: true,
-        }, (resp) => {
-          clearTimeout(timer);
-          if (chrome.runtime.lastError || !resp) return done(null);
-          if (resp.exceptionDetails) {
-            // 表达式本身报错：仍然返回，但标成 error，让调用方看到真实原因
-            return done(null);
-          }
-          const v = resp.result && resp.result.value;
-          done({ result: v, via: "cdp" });
-        });
-      });
-    } catch (e) {
-      clearTimeout(timer);
-      if (attached) { try { chrome.debugger.detach({ tabId }, () => {}); } catch (e2) { /* noop */ } }
-      done(null);
-    }
-  });
+  // 借用调试器：agent 已持有会话时复用、结束不拆（旧版无条件 detach，会拆掉 agent 的会话，
+  // 导致下一次 session.send 报「Debugger is not attached」——见 withBorrowedDebugger 注释）。
+  return withBorrowedDebugger(tabId, async (send) => {
+    const resp = await Promise.race([
+      send("Runtime.evaluate", {
+        expression: wrapped,
+        awaitPromise,
+        returnByValue: true,
+        userGesture: true,
+      }),
+      new Promise((r) => setTimeout(() => r(null), Math.min(CONTENT_CALL_TIMEOUT_MS, 20000))),
+    ]);
+    if (!resp) return null;                  // 超时或 sendCommand 失败
+    if (resp.exceptionDetails) return null;  // 表达式本身报错：交给调用方抛 EVAL_ERROR
+    const v = resp.result && resp.result.value;
+    return { result: v, via: "cdp" };
+  }).catch(() => null);   // attach 失败（用户 DevTools 占用等）→ 与旧行为一致，返回 null
 }
 
 // ---------- CDP Session ----------
@@ -1983,26 +2021,20 @@ function freezeBackoff(tabId) {
 // 经 CDP 让渲染器回到 active。成功返回 { ok:true }；CDP 不可用（无 debugger 权限、
 // 用户 DevTools 占用、tab 已关闭）返回 { ok:false, reason }，调用方原样抛出原错误。
 function tryUnfreezeTab(tabId) {
-  return new Promise((resolve) => {
-    const finish = (v) => { try { chrome.debugger.detach({ tabId }, () => {}); } catch (e) { /* noop */ } resolve(v); };
-    const timer = setTimeout(() => finish({ ok: false, reason: "UNFREEZE_TIMEOUT" }), 5000);
-    const done = (v) => { clearTimeout(timer); finish(v); };
-    try {
-      chrome.debugger.attach({ tabId }, "1.3", () => {
-        if (chrome.runtime.lastError) {
-          const m = String(chrome.runtime.lastError.message || "");
-          // 用户手动开着 DevTools：不抢，直接放弃自愈。
-          return done({ ok: false, reason: /Another debugger|already has/i.test(m) ? "DEBUGGER_BUSY" : "ATTACH_FAILED" });
-        }
-        chrome.debugger.sendCommand({ tabId }, "Page.setWebLifecycleState", { state: "active" }, (resp) => {
-          const err = chrome.runtime.lastError;
-          if (err) return done({ ok: false, reason: "UNFREEZE_COMMAND_FAILED" });
-          done({ ok: true, resp });
-        });
-      });
-    } catch (e) {
-      done({ ok: false, reason: "ATTACH_THREW" });
-    }
+  // 同样借用调试器：agent 持有会话时必须复用，否则解冻 attach 失败 → 自愈静默失效
+  // （实测：agent 持有会话时冻结，tabs.prepare 仍要空等 13s 才报 PAGE_CONTEXT_TIMEOUT）。
+  return withBorrowedDebugger(tabId, async (send) => {
+    const resp = await Promise.race([
+      send("Page.setWebLifecycleState", { state: "active" }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("UNFREEZE_TIMEOUT")), 5000)),
+    ]);
+    return { ok: true, resp };
+  }).catch((e) => {
+    const code = e && e.code;
+    if (code === "DEBUGGER_BUSY") return { ok: false, reason: "DEBUGGER_BUSY" };
+    if (code === "ATTACH_FAILED") return { ok: false, reason: "ATTACH_FAILED" };
+    if (e && e.message === "UNFREEZE_TIMEOUT") return { ok: false, reason: "UNFREEZE_TIMEOUT" };
+    return { ok: false, reason: "UNFREEZE_COMMAND_FAILED" };
   });
 }
 

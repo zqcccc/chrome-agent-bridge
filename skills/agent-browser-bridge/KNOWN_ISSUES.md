@@ -10,10 +10,31 @@
 - **不得以脚本自己打印的 `✓ 已删除` / `✓ 已保存` 作为成功依据。** 按钮被点到 ≠ 请求发出去了。
 - 为什么单独立一条：这个坑最隐蔽——脚本无报错、日志显示成功，但业务状态没变；不主动回读就会带着错误结论继续往下走（“删了重复项”其实没删、“保存了”其实没保存）。
 - 可用 `scripts/lib/bridge.mjs` 的 `rpc.mutateAndVerify(mutate, verify)` 强制这个模式。
+- **回读时不要只信「页面看起来对」**：子技能里有现成回读接口的先用（如 LinkedIn 的 `readSection()`），它们处理了该站的坑（懒渲染、SDUI 无 `<li>` 等）。
+
+## 已知错误码速查（先分清「桥/扩展的锅」还是「页面的锅」）
+
+排查前先看错误码，**不要凭 message 文本猜**：
+
+| 错误码 | 真实含义 | 该怎么办 |
+| --- | --- | --- |
+| `AGENT_STOPPED` | **用户在页面上点了「停止 Agent」** | 不是页面问题。停止一切写操作并汇报进度（`e.detail("scope")`） |
+| `EVAL_ERROR` 且 message 提到 CSP / unsafe-eval | 用了 `page.evaluate` 做字符串求值，被页面 CSP 拦 | 改走 CDP 求值（`rpc.ev()` / `scripts/cdp-eval.mjs`） |
+| `SESSION_SEND_FAILED`：Debugger is not attached | **扩展 bug（≤ v0.3.11）**：内部 CDP 流程拆了 Agent 的调试会话 | 升级到 ≥ 0.3.12；或全程只用 `ev()`、不混用 `page.evaluate` |
+| `SESSION_NOT_ATTACHED` | 没先 `session.attach` 就 `session.send` | 用 `rpc.ev()` / `withSession()`（它们会 attach） |
+| `TAB_UNHEALTHY` | 同 tab 已连续 3 次上下文级失败（本库主动熔断） | **换 tab**（`tabs.resolve` / `withPage`），不要原地重试 |
+| `PAGE_CONTEXT_TIMEOUT` | 页面上下文失效（导航中 / 渲染器被冻结 / 坏 tab） | 先 `tabs.prepare`；若反复出现在后台 tab，可能是被冻结（v0.3.10+ 会自愈） |
+| `UNKNOWN_METHOD` | 扩展版本不够新 | 不是站点问题也不是脚本 bug；对照 `CHANGELOG.md` 的症状表 |
+| `DEBUGGER_BUSY` | 用户手动开着 DevTools | 不抢，告知用户关掉 DevTools 再试 |
+| `UNSUPPORTED_URL` | 受保护协议（`chrome://` 等） | 桥不能注入也不能截图，换页面 |
+
+> **「页面看起来正常但取不到内容」优先怀疑懒渲染，不是选择器。** 实测 LinkedIn 档案页在
+> 后台标签页下 SDUI 完全不渲染（条目 0 条、不报错），先 `page.ensureActive` 再读。
+> 同类现象在瀑布流/无限滚动站点很常见。
 
 ## 约束零：先查子技能、优先用现成脚本，不自己重造
 
-- 根 `SKILL.md`「第一原则：先查子技能，用现成脚本（禁止重造）」列出了子技能索引。任务站点命中索引（小红书 / BOSS 直聘 / ChatGPT / NotebookLM）时，**必须先读对应子技能 `SKILL.md`，优先直接跑它给的 `scripts/*.mjs`**。
+- 根 `SKILL.md`「第一原则：先查子技能，用现成脚本（禁止重造）」列出了子技能索引。任务站点命中索引（小红书 / BOSS 直聘 / ChatGPT / NotebookLM / LinkedIn）时，**必须先读对应子技能 `SKILL.md`，优先直接跑它给的 `scripts/*.mjs`**。
 - **为什么这是风控约束而不只是效率建议**：这些脚本里的限速、随机抖动、单 tab 内操作、验证码/404 自动拦截退出、`tabs.prepare` 静默注入，都是踩过风控后调出来的。临时手写的裸脚本（自己拼 HTTP、自己写 `page.evaluate` 遍历 DOM、为每条内容开新 tab）没有这些防护，**几轮就会把账号/会话打到限制里**，且报错往往伪装成脚本 bug，让人误判为「选择器不对」而继续重试，进一步加重风控。
 - 脚本不完全贴合时：**先改参数**（`--max-scrolls` / `--max-results` / `--channel` / `--filter` / 选择器），再考虑改脚本。
 - 确实需要新功能才自己写，且必须**以同类子技能脚本为模板复制改写**（继承它的限速、拦截检测、静默 prepare、单 tab 操作），并在交付说明里注明「子技能 X 未覆盖 Y，基于 `scripts/Z.mjs` 改写」。禁止从零手写。
