@@ -208,6 +208,41 @@ service worker 里漏网的 rejection 会变成面板上的 `Uncaught (in promis
 
 ## 其他开发规范
 
+### 桥的语义变更必须同步「桥外消费者」（强制）
+
+改桥时不能只看 `relay/` 与 `extension/` 里的测试：**有些 skill 脚本不在本仓库里**，它们会真的点按钮、发消息，而 `npm test` 看不见它们。
+
+**先认清两种 skill 的区别**（很容易搞混）：
+
+| | `~/.agents/skills/agent-browser-bridge` | `~/.agents/skills/boss-zhipin-apply` |
+|---|---|---|
+| 实体 | **符号链接** → 本仓库 `skills/agent-browser-bridge` | 真实目录（不在任何 git 里） |
+| 改它等于 | 改仓库（改完要 commit） | 改本地文件（**无版本历史、无备份**） |
+
+所以：「`~/.agents/skills` 可以改」——但**要先分清改的是链接还是真目录**。改链接目录 = 改仓库；改真目录 = 只改本机、没有任何记录。
+
+**当前桥外消费者**（`node relay/check-skill-consumers.js` 会实时列出）：
+
+- `~/.agents/skills/boss-zhipin-apply/scripts/{send-chat,batch-apply,remote/*}.mjs` —— 4 个文件，直连 `/rpc` 与 `/tabs/claim`。
+- `~/.workbuddy/skills/boss-zhipin-apply` 是前者的**符号链接**（同一份），不用重复改。
+
+**改桥后的收尾动作**（两件事都要做）：
+
+```bash
+# 1. 机器检查：外部消费者是否还满足桥契约（静默吞错 / AGENT_STOPPED / 租约释放 / 进程 hook）
+cd relay && npm run check-consumers      # 已接入 test:unit-all，改坏会直接红
+
+# 2. 文档同步：把新错误码/新语义写进对应子 skill
+#    boss/ xhs/ debug/ 以及外部 boss-zhipin-apply/SKILL.md
+```
+
+**新增错误码或改变调用语义时，问自己**：外部 skill 脚本会怎么处理它？
+历史教训（v0.3.11）：桥新增 `AGENT_STOPPED`（用户点「停止 Agent」）后，
+BOSS 脚本把桥错误静默吞成 `{}`，把「用户叫停」误报成「元素不存在」，
+而且重试循环**在用户叫停后继续点击**——桥这边测试全绿，问题全在桥外。
+
+### 其他
+
 - 修改 skill 时保持按需加载结构：站点专项 / 通用能力拆成子 skill（如 `xhs/`、`debug/`），不把全部内容堆进根 `SKILL.md`。
 - 实测踩坑写回对应子 skill 或 `KNOWN_ISSUES.md`，避免下个 Agent 重踩。
 - 文档中所有命令给出后，用 `node --check` / 实跑验证过再写；"凭印象写命令"视为缺陷。
