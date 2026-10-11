@@ -28,8 +28,29 @@ t("不再输出分叉字段 hostVersion/extensionVersion",
 t("capabilities.tabsResolve 已判定", pf.capabilities.tabsResolve === true);
 
 console.log("\n== ev 取值（真实 tab）==");
-const tabs = await rpc.call("tabs.list");
-const tab = tabs.tabs.find(x => /^https?:/.test(x.url) && !x.discarded);
+// 挑 tab 必须**逐个探测可注入**，不能只看 http + !discarded。
+// 实测踩过：`status:"unloaded"` 的内部 API 页能混过 URL 过滤，但扩展对它没有 host 权限，
+// prepare 直接 PAGE_CONTEXT_TIMEOUT、ev 挂满 30s —— 功能没坏，测试假红。
+// 所以这里按候选顺序试 prepare，取第一个真能注入的。
+const { tabs: allTabs } = await rpc.call("tabs.list");
+const candidates = allTabs
+  .filter((x) => /^https?:/.test(x.url) && !x.discarded && x.status !== "unloaded")
+  .sort((a, b) => (a.active === b.active ? 0 : a.active ? -1 : 1));
+let tab = null;
+for (const c of candidates) {
+  try {
+    await rpc.call("tabs.prepare", { tabId: c.id, timeoutMs: 8000 });
+    tab = c;
+    break;
+  } catch (e) {
+    console.log(`    跳过 tab ${c.id}（${c.url.slice(0, 50)}）：${e.code}`);
+  }
+}
+if (!tab) {
+  console.log("  ✗ 没有可注入的 tab，跳过真实 tab 断言");
+  console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
+  process.exit(fail ? 1 : 0);
+}
 console.log("    使用 tab", tab.id, tab.url.slice(0, 60));
 const v = await rpc.ev(tab.id, "({n: 1+1, title: document.title.slice(0,30)})");
 t("ev 返回真实对象", v && v.n === 2, JSON.stringify(v));

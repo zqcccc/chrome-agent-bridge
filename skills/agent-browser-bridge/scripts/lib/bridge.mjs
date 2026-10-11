@@ -30,7 +30,7 @@ export function readToken() {
   try {
     return fs.readFileSync(p, "utf8").trim();
   } catch {
-    throw new Error(`读不到 token：${p}（先运行 relay/install-host.sh）`);
+    throw new Error(`读不到 token：${p}（桥可能从未安装，按 skill 目录下 INSTALL.md 安装）`);
   }
 }
 

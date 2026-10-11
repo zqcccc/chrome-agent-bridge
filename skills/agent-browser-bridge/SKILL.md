@@ -77,18 +77,25 @@ TAB=$(node scripts/preflight.mjs --pick github)   # 直接拿到可用 tab 的 i
 | 文件 | 什么时候读 |
 |---|---|
 | **`KNOWN_ISSUES.md`** | **开工前必读**。已知问题、行为约束、风控处理规则 |
+| **`INSTALL.md`** | **桥从未安装时读**（脚本报「读不到 token」、chrome://extensions 里没有扩展）。首次安装扩展与 host 的步骤 |
 | `CHANGELOG.md` | 拿到 `UNKNOWN_METHOD`、或要确认某能力的最低版本 |
 | `debug/SKILL.md` | 页面行为异常（取不到内容 / 数量不对 / 疑似风控），先探查再下结论 |
 | `AGENTS.md`（仓库根） | **只有改 bridge 代码时读**。改扩展/修 bug 的开发流程 |
 
 ---
 
-## 三条最容易踩的硬约束（摘要，完整版见 `KNOWN_ISSUES.md`）
+## 四条最容易踩的硬约束（摘要，完整版见 `KNOWN_ISSUES.md`）
 
 1. **变更类操作必须回读验证**。删除/保存/提交之后，重新加载列表页确认状态真的变了。
    > 历史教训：脚本打印了 `✓ 已删除`，回到列表页记录还在——按钮点了，请求没发出去。**不得以脚本自己打印的 ✓ 作为成功依据。**
 2. **遇到风控/安全验证立即停止，不要重试**。疯狂重试会加重风控。识别特征与例外（小红书软风控弹窗不算）见 `KNOWN_ISSUES.md` 约束一。
 3. **少开标签页**。优先在当前 tab 内跳转/点开，用完关掉。大量并发 tab = 更容易触发风控。
+4. **默认静默运行，不抢用户焦点**。用户在同时使用这个浏览器：读取、点击、输入、截图都在后台 tab 完成，不切换活动 tab，不把窗口拉到前台。
+   - 打开网址用 `tabs.resolve`（`rpc.withPage` / CLI `open` 已内置）：只复用用户没在看的同类 tab，没有就后台新开。
+   - 准备 tab 用 `tabs.prepare`（注入 content script），不要用 `tabs.activate`。
+   - 后台 tab 懒加载不推进、内容渲染不出来时，用 `page.ensureActive`：只切标签页、不聚焦窗口，空闲后自动把活动 tab 还给用户。
+   - 只有需要用户眼睛的步骤才显式激活：登录、扫码、验证码、2FA、选文件、最终可视化核对（`page.activateAndShot`）。
+   - 详见 `KNOWN_ISSUES.md` 约束三。
 
 架构：Chrome 扩展（MV3）↔ 本地桥 host（relay/host.js，:8778）↔ Agent 客户端（HTTP/WS JSON-RPC）。
 
@@ -193,6 +200,7 @@ console.log(text);
 
 0. **登录由用户主导**：目标页面需要登录/授权/扫码/验证码时，必须先向用户说明要访问哪个页面、为什么需要登录，然后等待用户手动完成登录、确认登录成功后再继续。禁止替用户登录、绕过登录墙或静默跳过验证。用户未登录前不要继续执行后续步骤。
 1. **扩展已加载**：chrome://extensions 里有 "Agent Browser Bridge"（已解压；ID 以你本机 `chrome://extensions` 中显示的为准），开关为 On。
+   - **从未安装**（没有 `~/.chrome-agent-bridge/token`、扩展列表里没有它）：读 `INSTALL.md`，向用户说明步骤并得到同意后再安装。不要用 curl 等方式替代桥继续任务。
 2. **host 存活**：`curl -s http://127.0.0.1:8778/status` 返回 `{"ok":true,...}`。
    - **如果 host 根本起不来**：先看它是不是以 `FATAL code=TOKEN_UNAVAILABLE` 退出了。
      v0.3.11 起 token 读不到时**拒绝启动**（不再静默降级成一个固定密码）。常见成因是
@@ -203,7 +211,21 @@ console.log(text);
    - **推荐 Native 模式**：不要手动 `npm start`。注册 native host 后，Chrome 按需拉起 host 进程，该进程监听 8778，Agent 连 8778 即同一进程。Chrome 关闭时进程自动退出。`status` 返回 `mode:native`。
    - **standalone WS 模式（二选一）**：`cd "$ROOT/relay" && npm start`（`$ROOT` 见下方「快速开始」）,host 常驻 8778，扩展用 `ws://127.0.0.1:8778/agent` 连入。`status` 返回 `mode:standalone`。
    - **两种模式不要同时运行**：standalone 占着 8778 时，native 拉起的进程会因端口占用退出，扩展 `auto` 通道会回退到 WS（不透明）。推荐只用 Native。
+   - **如果 8778 完全连不上（host 进程数 0）**：先跑 `node scripts/preflight.mjs`，它会把
+     native host 注册文件、host 进程数、`host.log` 尾部一次性打出来，直接指出卡在哪一层。
+     别停在「Chrome 是否在运行」——Chrome 在跑而 host 起不来时，那句话是对的但没用。
+   - **最常见的真实原因：host 启动脚本在 Chrome 的最小环境下找不到 node。** Chrome 拉起
+     native host 时只给 `PATH=/usr/bin:/bin:/usr/sbin:/sbin`，用 fnm / nvm / volta 装的 node
+     全都不在里面，启动脚本必须自己按绝对路径去找 node。判据：`host.log` 尾部没有
+     `host vX.Y.Z start` 这一行（说明 `host.js` 从未启动），同时 host 进程数为 0。
 3. **扩展已连上 host**：status 输出 `extConnected:true`。扩展 reload 或 Chrome 重启后几秒内自动重连。
+   - **host 起来了但 `extConnected` 一直 false**：说明扩展侧没连上。按顺序排除：
+     扩展被禁用或未加载；native 注册文件里的 `allowed_origins` 与当前扩展 ID 不一致
+     （扩展重新「加载已解压」后 ID 会变，变了必须重跑 `install-host.sh`）；
+     扩展 options 页里的通道不是 `auto`/`native`。改完要**完全退出 Chrome 再打开**（不是关窗口），
+     Chrome 才会重新拉起扩展与 host。
+   - 这一层在 `host.log` 里的特征是：只有 `ext=waiting` 后跟 `native channel closed`，
+     没有任何 RPC 请求记录——**没有错误码可统计**，所以别去 grep 错误码分布。
 4. **扩展版本够新**：拿 `bridge.status` 的 `result.version` 与 [`CHANGELOG.md`](CHANGELOG.md) 的「当前版本」比对。
    - **扩展不会自动更新**（未上架商店）。**拿到 `UNKNOWN_METHOD` 第一反应就该查版本**——它不是站点问题、也不是脚本 bug，就是扩展版本不够新。症状与最低版本的对照表在 `CHANGELOG.md` 末尾。
    - 版本落后时：向用户说明要更新到哪个版本、为什么（例如「你要用的 `tabs.resolve` 需要 0.3.9，现在是 0.3.8」），**得到同意后再执行** `git pull` + `install-host.sh` + `reload-ext`。不要自己动用户的 Chrome。
@@ -224,7 +246,6 @@ console.log(text);
 >
 > 自包含的等价调用（RPC / HTTP）见下方「编程调用」与「HTTP 直调」——任何环境都能用，不依赖 CLI 的存在。
 
-```bash
 export BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token)   # 每次 shell 都要
 ROOT="$(cd -P <skill 目录> && pwd)/../.."                # 仓库根 = skill 目录的上两级
 CLI="$ROOT/agent/cli.mjs"                                # 下文的 <cli>
@@ -238,7 +259,7 @@ node "$CLI" wait <tabId> ready|url|selector <match|选择器> [timeoutMs]  # 增
 node "$CLI" click <tabId> <css选择器>
 node "$CLI" type <tabId> <sel> <text>
 node "$CLI" press <tabId> <key>
-node "$CLI" scroll <tabId> <sel> <dir>
+node "$CLI" scroll <tabId> <up|down|left|right>   # 只收两个参数，没有选择器
 node "$CLI" snap <tabId>        # 页面快照（a11y 树+元素清单）
 node "$CLI" shot <tabId>        # 页面截图（保存当前目录）
 node "$CLI" inspect <tabId> [overview|links|media|scroll|modal|sel:<css>]  # 内置页面探查
@@ -668,7 +689,7 @@ const hasHScroll = de.scrollWidth > de.clientWidth;   // 真正的判据
 ## Agent 行为约束（所有任务、所有网站，必须遵守）
 
 1. **遇到风控/安全验证 → 立即停止，禁止疯狂重试**：页面跳转到验证码页（如小红书 `website-login/captcha` /「Security Verification」）、滑块验证、人机校验，或大量 404 /「页面不见了」时，**立即停止该站点的所有后续请求**。不要换参数重试、不要加大滚动轮数、不要重新批量打开页面、不要换个 tab 再试。停下来向用户说明，等待用户手动完成验证或风控解除后再继续。疯狂重试会加重风控，导致账号/会话被更长时间限制。桥本身（host/扩展）几乎从不是这类问题的原因：先 `/status` 确认 `extConnected:true`，桥正常则归因于站点侧风控。
-   - **例外：小红书「`.reds-alert` 软风控弹窗」不算入本条**（2026-09-14 补充）。这类弹窗（`操作太频繁，请稍后再试` / `网络异常点此重试` / `系统繁忙` / `广告屏蔽插件提示` 等）只有「我知道了」按钮，点一下就过，**不是**需要人验的硬风控。识别与一键关掉工具：`xhs/scripts/xhs-dismiss-softblock.mjs`（软风控退出码 0；硬风控退出码 2 才停下来等用户）。详见 `xhs/SKILL.md`「软风控弹窗一键处理」与 `KNOWN_ISSUES.md` 约束一·例外。
+   - **例外：小红书「`.reds-alert` 软风控弹窗」不算入本条**（2026-09-14 补充）。这类弹窗（`操作太频繁，请稍后再试` / `网络异常点此重试` / `系统繁忙` / `广告屏蔽插件提示` 等）只有「我知道了」按钮，点一下就过，**不是**需要人验的硬风控。识别与一键关掉工具：`scripts/xhs-dismiss-softblock.mjs`（软风控退出码 0；硬风控退出码 2 才停下来等用户；退出码 3 是巡检本身异常，**别当成「没有弹窗」**）。详见 `xhs/SKILL.md`「软风控弹窗一键处理」与 `KNOWN_ISSUES.md` 约束一·例外。
 2. **优先页面内跳转/点开，少开标签页**：目标站点的内容本身就能在页面内点开（如小红书每个笔记都是可点开的页面内弹窗），**优先在当前 tab 内 `page.navigate` 跳转或直接点开内容，不要为每条内容新开标签页**。确需新开时，用完立即 `tabs.close`。同一任务同时打开的 tab 控制在个位数，确需保留的只有搜索/列表页本身。大量并发 tab = 大量并发请求 = 更容易触发风控，也让快照/截图/tab 管理混乱。
 3. **不抢占用户正在看的标签页**：拿到一个网址要打开时走 `tabs.resolve`（见上方「打开网址」一节），它会复用**非活动**的同类 tab，没有就静默新开后台 tab。**禁止把「聚焦窗口的活动 tab」拿来 `page.navigate`**——那是用户正在看的页面，跳走就是直接把人家的页面顶掉。判断依据用 `tabs.list` 返回的 `active` 字段（或 `tabs.active`），不要凭「最后一个 tab」之类的猜测。真需要在用户当前页上操作时，先向用户说明。
    - 脚本里不要写「找不到匹配 tab 就 fallback 到 active tab」——这条 fallback 正是抢页面的元凶。宁可静默新开后台 tab。

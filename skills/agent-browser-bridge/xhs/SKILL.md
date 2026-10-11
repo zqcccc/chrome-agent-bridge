@@ -28,7 +28,7 @@ description: agent-browser-bridge 的子技能——小红书（Xiaohongshu）�
 ### 用法
 
 ```bash
-BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-dismiss-softblock.mjs <tabId>                     # 单轮巡检（默认不点，仅检测；加 --format json 看结构化报告）
+BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-dismiss-softblock.mjs <tabId>                     # 单轮巡检（**默认会点掉**软风控；加 --format json 看结构化报告）
 BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-dismiss-softblock.mjs <tabId> --loop             # 持续巡检，连续 --stable-rounds 轮干净才退出
 BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-dismiss-softblock.mjs <tabId> --loop --interval-ms 4000 --stable-rounds 3
 BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs-dismiss-softblock.mjs <tabId> --dry-run          # 只看、不点
@@ -41,6 +41,7 @@ BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <skill 目录>/scripts/xhs
 | `0` | 无弹窗 / 软风控已全部关掉 / `--loop` 稳定退出 | 软风控已点【我知道了】/【确定】/【重试】/【×】 |
 | `1` | 发现“未知”弹窗（未匹配软/硬模式，保守不点） | 未动 |
 | `2` | 发现硬风控（账号异常 / 封禁 / 验证码 / 滑块） | 未动（调者应停、等用户） |
+| `3` | 巡检本身异常（桥/RPC 失败等，拿不到弹窗状态） | 未动（**别当成「没有弹窗」**） |
 
 ### 哪些算“软” / “硬”（脚本内部正则，2026-09-14 实测命中）
 

@@ -263,6 +263,14 @@ function handleNativeMsg(msg) {
   if (!msg || typeof msg !== "object") return;
   if (msg.type === "hello") {
     console.log("[bridge] host hello:", msg.host, msg.version, "channel=native");
+    // token 自愈：host 每次 hello 都带上自己的 token。扩展 storage 里那份可能是脏的
+    // （实测出现过尾部多一个 '%' —— 存的是 49 字符，token 文件是 48 字符）。
+    // 脏 token 平时无感（native 通道不校验它），但 native 挂掉回退 WS 时，
+    // encodeURIComponent 会把 '%' 变成 %25，握手必然 401，兜底通道等于不存在。
+    // 这里以 host 的 token 为准写回，让 WS 兜底随时可用。
+    if (typeof msg.token === "string" && msg.token && msg.token !== normalizeToken(config.token)) {
+      saveConfig({ token: msg.token }).catch(() => { /* 配置写回失败不影响主流程 */ });
+    }
     return;
   }
   if (msg.type === "pong") return;

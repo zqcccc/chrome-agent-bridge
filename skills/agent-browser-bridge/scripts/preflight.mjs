@@ -18,6 +18,8 @@
  */
 
 import { Rpc } from "./lib/bridge.mjs";
+import { readdirSync, readFileSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 
 const args = process.argv.slice(2);
 const asJson = args.includes("--json");
@@ -35,7 +37,71 @@ function classifyTab(t) {
   return "ok";
 }
 
-const rpc = new Rpc({ agentId: `preflight-${process.pid}`, agentName: "Preflight" });
+
+/**
+ * 桥起不来时的可执行自查。
+ *
+ * 存在的理由：原来的提示只有一句「检查 Chrome 是否运行、扩展是否启用；host 由 Chrome 按需拉起」，
+ * 而真实故障（host 启动脚本在 Chrome 最小环境下找不到 node）下这两条**都成立**——
+ * 于是 Agent 拿到一句正确但没用的话，没有任何下一步可做。这里给出能直接跑的判定：
+ * native host 注册文件在不在、Chrome 有没有真的去拉起 host、host.log 最后说了什么。
+ */
+function hostDiagnostics() {
+  const lines = [];
+  const home = process.env.HOME || "";
+  if (!home) return ["    读不到 HOME，无法定位 native host 注册目录"];
+
+  // 1) native host 注册文件：Chrome 靠它知道去哪拉起 host
+  const nmDir = `${home}/Library/Application Support/Google/Chrome/NativeMessagingHosts`;
+  let names = [];
+  try { names = readdirSync(nmDir).filter((f) => f.endsWith(".json")); } catch { /* 目录不存在 */ }
+  const ours = names.filter((f) => f.includes("agentbrowser") || f.includes("agent-browser"));
+  if (!names.length) lines.push(`    · native host 注册目录不存在：${nmDir}`);
+  else if (!ours.length) lines.push(`    · 注册目录里没有本桥的 host（只有：${names.join(", ")}）`);
+  else {
+    for (const f of ours) {
+      try {
+        const j = JSON.parse(readFileSync(`${nmDir}/${f}`, "utf8"));
+        const ok = existsSync(j.path) ? "存在" : "不存在 ← 这就是问题";
+        lines.push(`    · ${f} → path=${j.path}（${ok}）`);
+      } catch (e) {
+        lines.push(`    · ${f} → 解析失败：${e.message}`);
+      }
+    }
+  }
+
+  // 2) host 进程在不在。host 由 Chrome 按需拉起，进程为 0 说明 Chrome 根本没拉起来，
+  //    或者拉起后立刻退出（启动脚本报错就是这种表现）。
+  const alive = countHostProcesses();
+  lines.push(`    · host 进程数：${alive === null ? "无法判定" : alive}${alive === 0 ? " ← Chrome 没拉起 host，或它起来就退了" : ""}`);
+
+  // 3) host.log 尾部：区分「host 从未启动」与「起来但扩展没连上」
+  const logFile = `${home}/.chrome-agent-bridge/host.log`;
+  try {
+    const tail = readFileSync(logFile, "utf8").trimEnd().split("\n").slice(-3);
+    for (const t of tail) lines.push(`    · host.log: ${t}`);
+    if (!tail.some((t) => t.includes("host v"))) {
+      lines.push("      （尾部没有启动记录 = host.js 从未真正启动，问题在启动脚本，不是桥本身）");
+    }
+  } catch {
+    lines.push(`    · 读不到 ${logFile}（host 从未成功启动过）`);
+  }
+  return lines;
+}
+
+/** host 进程计数；平台不支持时返回 null，不伪造数字。 */
+function countHostProcesses() {
+  if (process.platform !== "darwin" && process.platform !== "linux") return null;
+  try {
+    const out = execFileSync("pgrep", ["-f", "chrome-agent-bridge.*host.js"], { encoding: "utf8" });
+    return out.trim() ? out.trim().split("\n").length : 0;
+  } catch (e) {
+    // pgrep 无匹配时退出码 1，那是真答案（0 个），不是错误
+    if (e && e.status === 1) return 0;
+    return null;
+  }
+}
+let rpc;
 
 function out(obj) {
   if (asJson) console.log(JSON.stringify(obj, null, 2));
@@ -45,15 +111,25 @@ async function main() {
   // ---- 1. 桥与扩展 ----
   let pf;
   try {
+    // 放进 try：缺 token 时 new Rpc 就会报错，要让下面的诊断与 INSTALL 提示能打印
+    rpc = new Rpc({ agentId: `preflight-${process.pid}`, agentName: "Preflight" });
     pf = await rpc.preflight();
   } catch (e) {
     console.error(`✗ 连不上本地桥：${e.message}`);
-    console.error("  → 检查 Chrome 是否运行、扩展是否启用；host 由 Chrome 按需拉起。");
+    console.error("  自查（按顺序看，别只停在「检查 Chrome 是否运行」）：");
+    for (const line of hostDiagnostics()) console.error(line);
+    console.error("  → 最常见的原因：host 启动脚本在 Chrome 的最小环境下找不到 node。");
+    console.error("    Chrome 拉起 host 时只给 PATH=/usr/bin:/bin:/usr/sbin:/sbin，");
+    console.error("    版本管理器（fnm / nvm / volta）装的 node 不在里面，脚本必须自己按绝对路径找。");
+    console.error("    修好启动脚本后，完全退出 Chrome 再打开，Chrome 会重新拉起 host。");
+    console.error("  → 若从未安装过（无 token、扩展列表里没有 Agent Browser Bridge）：读 skill 目录下 INSTALL.md。");
     process.exit(2);
   }
   if (!pf.extConnected) {
     console.error(`✗ 桥在运行但扩展未连接（channel=${pf.channel}）`);
-    console.error("  → 打开 chrome://extensions 确认扩展已启用；或重载扩展。");
+    for (const line of hostDiagnostics()) console.error(line);
+    console.error("  → host 已经起来了，问题在通道侧：扩展被禁用/未加载，或 native 通道连上就断。");
+    console.error("    完全退出 Chrome 再打开（不是关窗口），让 Chrome 重新拉起扩展与 host。");
     process.exit(2);
   }
 
