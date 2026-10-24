@@ -134,7 +134,7 @@ body.slice(0, 400)                            // 职位头部（薪资/经验/�
 
 1. 详情页点「立即沟通」：`a.btn-startchat`（点击后跳转到 `/web/geek/chat`，新会话在左侧列表顶部且 `selected`，需验证选中会话的公司/HR 匹配预期，不匹配就重试一次点击）。
 2. 聊天页结构：输入框 `div.chat-input`（contenteditable）；发送按钮 `button.btn-send`（有内容才 enabled）。点击「立即沟通」后，聊天页是异步加载的：**不能仅凭 URL 已跳转或点击 RPC 成功就继续**。必须等待并确认当前会话的公司/HR 与职位匹配，且 `div.chat-input` 已出现；若页面正文为空、输入框不存在或会话仍在加载，先等待后重新只读核对，未确认输入框前禁止进入下一个岗位。若重试后仍未渲染，记录为 `unknown`/未完成并保留当前会话现场，不要留下空会话后静默跳过。
-3. 输入受控文本（native setter + InputEvent，见根 SKILL.md「实战踩坑清单」第 5 条），然后**轮询发送按钮直到真正可用**（最多约 5 秒）再点击。BOSS 的 contenteditable/Vue 状态同步是异步的，禁止仅依赖固定 700ms 延迟。
+3. 输入文本：`scripts/boss-send-chat.mjs` 用 CDP `Input.insertText`（受信任事件，能触发 Vue/React 受控更新），写入前会先 `page.focusEl` 聚焦 `.chat-input`——`Input.insertText` 只作用于当前焦点元素，不聚焦则文字落不到输入框。然后**轮询发送按钮直到真正可用**（最多约 3 秒）再点击。BOSS 的 contenteditable/Vue 状态同步是异步的，禁止仅依赖固定延迟。手写流程时才用 native setter + InputEvent（见根 `SKILL.md`「实战踩坑清单」第 5 条）。
 4. 每条消息发送后必须按"当前会话 + 本次发送文本"定位消息气泡，优先使用 `.message-item.item-myself` / `.message-content`，并在同一气泡的父级内检查"送达/已读"；不能用宽泛选择器直接取 DOM 最后一项，也不能只检查最短文本子节点。遇到 `平台暂不支持直接发送` 立即记录为 `blocked`。遇到 RPC/扩展超时或暂未渲染，记录 `unknown` 后先做一次只读页面核对；确认不存在且输入框为空时才允许补发，确认已存在则改为 `sent`，严禁因 UNKNOWN 直接重发。
 
 **单条消息发送脚本（推荐）**：

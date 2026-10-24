@@ -1,6 +1,6 @@
 ---
 name: agent-browser-bridge
-description: 用真实 Chrome 打开、读取、操作任意网页——**拿到 http(s) 链接要读内容时默认用本技能，不要先试 curl / wget / WebFetch 赌它是静态页**：前端渲染的站点（SPA / React / Vue / 动态加载）用 curl 只能拿到空壳 HTML，正文一个字都没有，而且**不会报错**，会静默给出错误结论。覆盖：读网页正文与价格/文档/列表数据、站内搜索、抓取动态渲染或登录后数据、点击输入滚动截图、执行 JS、下载文件、填表提交发消息投递下单预订、管理后台操作。走用户日常 Chrome 与真实登录态，可进入被反爬 / 风控拦截（验证码、登录墙、无头指纹、滑块）与需登录页面：小红书、知乎、大众点评、BOSS 直聘、公众号后台、网银、论坛等。已有专项子技能（xhs / boss / chatgpt / notebooklm / debug）必须先读其 SKILL.md 并优先跑 scripts/ 下现成脚本，禁止从零写抓取脚本。需要登录 / 授权 / 扫码 / 验证码时，必须先告知用户要访问的页面与原因并等待用户手动完成，不得替用户登录或绕过验证。判断口径：**只要任务是「从某个网址拿到内容」或「在网页上做操作」，就是本技能**，不存在「先用通用工具试、失败再切过来」的降级层。
+description: 用真实 Chrome 打开、读取、操作任意网页——**拿到 http(s) 链接要读内容时默认用本技能，不要先试 curl / wget / WebFetch 赌它是静态页**：前端渲染的站点（SPA / React / Vue / 动态加载）用 curl 只能拿到空壳 HTML，正文一个字都没有，而且**不会报错**，会静默给出错误结论。覆盖：读网页正文与价格/文档/列表数据、站内搜索、抓取动态渲染或登录后数据、点击输入滚动截图、执行 JS、下载文件、填表提交发消息投递下单预订、管理后台操作。走用户日常 Chrome 与真实登录态，可进入被反爬 / 风控拦截（验证码、登录墙、无头指纹、滑块）与需登录页面：小红书、知乎、大众点评、BOSS 直聘、公众号后台、网银、论坛等。已有专项子技能（xhs / boss / chatgpt / notebooklm / linkedin / debug / captcha）必须先读其 SKILL.md 并优先复用 scripts/ 下现成脚本与 scripts/lib/bridge.mjs；遇到页面改版、结构变动或未收录站点时，通过 page.inspect 实时探查并灵活应变；任务中验证通过的新站点配方、改版适配与通用经验必须在收尾时沉淀回子技能、scripts/ 或 KNOWN_ISSUES.md。需要登录 / 授权 / 扫码 / 验证码时，必须先告知用户要访问的页面与原因并等待用户手动完成，不得替用户登录或绕过验证。判断口径：**只要任务是「从某个网址拿到内容」或「在网页上做操作」，就是本技能**，不存在「先用通用工具试、失败再切过来」的降级层。
 ---
 
 # Agent Browser Bridge —— 让 Agent 操作日常 Chrome
@@ -116,22 +116,42 @@ TAB=$(node scripts/preflight.mjs --pick github)   # 直接拿到可用 tab 的 i
 
 **什么时候用它**：凡是要在浏览器里真正操作网页就一律用它，没有例外，也不存在「先用通用工具试、失败再切过来」的降级层。浏览器任务归它一家：读页面、站内搜索、抓动态或登录后数据、点击输入提交、截图下载、执行 JS。
 
-## 第一原则：先查子技能，用现成脚本（禁止重造）
+## 第一原则：优先复用、临场应变、持续沉淀
 
-**这是本 skill 的硬性执行规则，优先级高于「快速开始」里的任何命令。**
+**这是本 skill 的核心工作循环，优先级高于「快速开始」里的任何命令。**
 
-这些站点的风控是按行为特征判定的（请求频率、并发标签数、滚动节奏、DOM 遍历方式）。子技能里的 `scripts/*.mjs` 是踩过坑以后调出来的参数：内置限速与随机抖动、并发 tab 控制、验证码/404/「Security Verification」自动拦截退出、`tabs.prepare` 静默注入、受控组件的正确 setter、以及该站专属的坑（如 BOSS 的 PUA 薪资字体、chatgpt.com 的 CSP 禁止 `page.evaluate`）。**自己临时写的裸脚本没有这些防护，几轮就会把账号/会话打到风控里，而且报错信息往往看不出是被风控还是脚本 bug。**
+真实站点的风控按行为特征判定（请求频率、并发标签数、滚动节奏、DOM 遍历方式），同时网页 DOM 又会随 A/B 测试、站点改版或业务分支动态变化。因此使用本 skill 必须遵循「**先复用已有积累 → 遇变化灵活应变 → 跑通后回写沉淀**」的闭环。
 
-### 执行流程（命中站点时必须照做）
+### 1. 优先复用（站在已有积累上开工）
 
-1. **先查子技能索引**（下表）。任务站点/目标命中任一行 → **先读取对应子技能的 `SKILL.md`**，再动浏览器。
-2. **优先直接跑它给的脚本**：子技能的 `scripts/*.mjs` 自包含（不依赖 CLI / 不依赖 cwd），按文档给的命令行直接跑，不要退化成自己拼 HTTP / 自己写 `page.evaluate`。
-3. **脚本不完全贴合时，先改参数，再改脚本**：绝大多数情况改 `--max-scrolls` / `--max-results` / `--channel` / `--filter` / 选择器就够了。
-4. **确实没有的功能才自己写**，且必须满足三点：
-   - 以同类子技能脚本为**模板复制改写**（继承它的限速、拦截检测、静默 prepare、单 tab 内操作）；
-   - 沿用它的 RPC 调用方式与等待策略，不要回退成固定 `sleep`；
-   - 在交付说明里注明「子技能 X 未覆盖 Y，故基于 `scripts/Z.mjs` 改写」。
-5. **任何站点行为异常（取不到内容、数量不对、404、疑似风控）** → 读 `debug/SKILL.md`，先 `page.inspect` 探查再下结论，不要凭猜重试。
+1. **查子技能索引**（见下表）。任务站点或目标命中任一行 → **先读取对应子技能的 `SKILL.md`**，优先直接运行 `scripts/*.mjs`。这些脚本内置了实测调优的限速抖动、单 tab 复用、验证码/404 自动拦截退出、`tabs.prepare` 静默注入、受控组件输入以及站点专属处理（如 BOSS 的 PUA 薪资字体、chatgpt.com 的严格 CSP）。
+2. **复用通用底座**：操作未收录的新站点或编写新流程时，一律基于 `scripts/lib/bridge.mjs`（`Rpc`、`withPage`、`ev`、`clickReal`/`clickEl`、`scrollLoad`、`mutateAndVerify`）和通用脚本（`preflight.mjs`、`cdp-eval.mjs`、`cdp-upload.mjs`、`type-text.mjs`）构建，直接继承返回值解包、坏 tab 熔断、会话自动释放与停止信号识别，避免从零拼接裸 HTTP 请求。
+3. **先调参数，再改代码**：现成脚本与任务需求有细微差异时，优先通过命令行参数（`--max-scrolls` / `--max-results` / `--channel` / `--filter` / 选择器参数）适配。
+
+### 2. 随机应变（现成方案受阻时，依据实时 DOM 灵活变通）
+
+当遇到**未收录的新站点、页面改版导致旧选择器失效、非阻断型新弹窗、或者任务超出脚本预设范围**时，切勿机械重复失败命令，按以下方式临场应变：
+
+1. **先实时探查，以当前页面事实为准**：立即调用 `page.inspect`（`overview` / `links` / `scroll` / `modal` / `sel`）或开启 `page.record` 观察当前真实 DOM 结构，读 `debug/SKILL.md`。不迷信旧选择器，不凭想象盲猜类名。
+2. **多路径灵活切换**：
+   - **求值受阻切换**：`page.evaluate` 被页面 CSP 或 Trusted Types 拦截时，立即切换为 `rpc.ev()`（底层走 CDP `Runtime.evaluate`）或 `scripts/cdp-eval.mjs`。
+   - **点击模式切换**：CDP 真实鼠标事件（`rpc.clickReal`）点击无反应时，切换为 DOM 原生点击（`rpc.clickEl`）；反之，原生 `el.click()` 无法触发 React/Vue 菜单展开时，切换为 `rpc.clickReal`。
+   - **渲染与滚动切换**：后台标签页列表为空或 `scrollChecked` 报 `SCROLL_NO_GROWTH`（`recoverable: true`）时，调用 `page.ensureActive` 恢复前台渲染帧率，或直接使用 `rpc.scrollLoad`；window 滚不动时用 `page.inspect { focus: "scroll" }` 找出内部滚动容器再滚。
+   - **弹窗分流处置**：页面出现遮罩或弹窗时，先用 `page.inspect { focus: "modal" }` 查看文本与按钮——属于「我知道了 / 稍后再试 / 关闭引导」等提示型弹窗，直接点击关闭并继续；属于需要人工完成的验证码或登录墙，立即停止并交由用户处理。
+   - **数据源与入口变通**：DOM 结构极度复杂或虚拟列表难以滚动提取时，可检查页面内联状态（如 `window.__INITIAL_STATE__`、`__NEXT_DATA__`）或换用站内等价页面入口。
+3. **基于模板小步快跑**：需要修改脚本或写新脚本时，复制最相近的 `scripts/*.mjs` 作为起点（保留其限速、防风控与清理逻辑），先在单条数据上做最小实验验证通过，再执行批量任务。
+4. **守住应变底线**：灵活变通不突破四条安全红线——遇到需要人工验证的风控立即停手、不抢占用户正在浏览的活动标签页、变更类操作完成后必回读验证、收到 `AGENT_STOPPED` 立即终止写操作。
+
+### 3. 沉淀经验（把每次临场应变转化为可复用资产）
+
+每次通过临场探查解决了新问题、适配了站点改版、或跑通了新站点的完整流程后，在收尾阶段把经验沉淀回本 skill 目录，让后续任务直接受益：
+
+| 经验类型 | 沉淀位置 | 具体要求 |
+| --- | --- | --- |
+| **既有子技能的站点改版 / 新参数分支** | 对应 `scripts/*.mjs` 与 `<子技能>/SKILL.md` | 直接更新失效的选择器、补充兼容分支或新增命令行参数，并同步更新子技能文档说明，避免下次再踩同一处改版 |
+| **跨站点通用踩坑 / 浏览器与桥的行为规律** | `KNOWN_ISSUES.md` 或 `debug/SKILL.md` | 按「现象 → 根因 → 最小可复现/可复用代码」记录，标明适用条件 |
+| **高频新站点 / 可复用的通用能力** | `scripts/<name>.mjs`（大专项可建 `<站点>/SKILL.md`） | 基于 `scripts/lib/bridge.mjs` 封装为参数化脚本（不固定单次任务的 URL/关键词，不写机器绝对路径），并在下方「子技能索引」登记 |
+| **纯一次性临时探查脚本** | 任务结束前清理移除（或放入 gitignore 的临时目录） | **保持 `<skill 目录>` 根目录整洁**，禁止在 skill 根下遗留单次任务的临时脚本文件 |
 
 ### 子技能索引（命中即必须加载）
 
@@ -143,6 +163,7 @@ TAB=$(node scripts/preflight.mjs --pick github)   # 直接拿到可用 tab 的 i
 | **NotebookLM**（新建笔记本、上传来源、提问、Studio 产物） | `notebooklm/SKILL.md` | `notebooklm/upload.mjs`、`notebooklm/ask.mjs`、`notebooklm/scripts/*.mjs`、`scripts/cdp-upload.mjs` |
 | **LinkedIn linkedin.com**（读档案、改 Headline/About、增删改经历与项目、中英文双语言档案） | `linkedin/SKILL.md` | `linkedin/scripts/linkedin-read.mjs`（只读）、`linkedin/scripts/linkedin-edit.mjs`、`linkedin/scripts/lib/linkedin.mjs`（公共层） |
 | **任何站点：页面异常 / 结构陌生 / 交付前验证** | `debug/SKILL.md` | `browser-debug.mjs`（首选仍是插件内置 `page.inspect` / `page.record`） |
+| **Cloudflare 挑战页 / 人机验证（跨站点）**（`Just a moment...`、`Checking your browser`、Turnstile、`/cdn-cgi/challenge-platform/`） | `captcha/SKILL.md` | `captcha/scripts/cf-wait.mjs`（识别 → 等待自动通过 → 需要点击时交用户） |
 
 > 通用能力也可复用：`scripts/lib/bridge.mjs`（**统一封装：解包 / CDP 求值 / 点击双模式 / 坏 tab 熔断**）、`scripts/preflight.mjs`（开工体检）、`scripts/cdp-eval.mjs`（强 CSP 站点求值）、`scripts/cdp-upload.mjs`（注入文件上传）、`scripts/type-text.mjs`（受控组件输入）。
 
@@ -158,7 +179,7 @@ TAB=$(node scripts/preflight.mjs --pick github)   # 直接拿到可用 tab 的 i
 | `scripts/xxx.mjs` | 本 skill 目录内的开箱脚本 | `<skill 目录>/scripts/xxx.mjs`，**不依赖 CLI** |
 
 说明：
-- 主 CLI 与子 skill 脚本是两套东西：子 skill 的 `scripts/*.mjs` 自包含、不依赖 `agent/cli.mjs`，**能直接用就用（强制首选）**，不要退化成裸 HTTP / 裸 `page.evaluate` 重造——见上方「第一原则：先查子技能，用现成脚本（禁止重造）」。
+- 主 CLI 与子 skill 脚本是两套东西：子 skill 的 `scripts/*.mjs` 自包含、不依赖 `agent/cli.mjs`，**能直接用就优先复用**，遇到改版或新场景再按上方「第一原则：优先复用、临场应变、持续沉淀」灵活调整并回写沉淀。
 - `<cli>` 是纯 HTTP 客户端，**不依赖 cwd**，给绝对路径即可，无需 `cd` 到仓库根。
 - 子 skill 文档（「专项实战」列出的各 `*/SKILL.md`）沿用本表记号。
 
@@ -344,13 +365,15 @@ grep "tab=<id>" host.log | grep -E "TIMEOUT|note=dispatch" | head -20           
 2. **刚 reload 扩展前的旧标签页 content script 不注入**：`page.evaluate` 报 "Cannot access contents of the page"。解决：先 `tabs.prepare`（静默注入，不抢焦点）再操作，见下方「静默模式」。只有**被 OneTab 冻结 / 被浏览器丢弃（discarded）的标签**才必须 `tabs.activate` 唤醒（激活会自动重载页面）。
 3. **`chrome://` 等受保护页面**不能注入/截图（需 activeTab 授权，点一次扩展图标即可）。
 4. **eval 是同步求值**：表达式里有 `await`/Promise 必须传 `awaitPromise:true`，否则返回空对象。
-5. **受控组件（React/Vue）输入**：`el.value=x` 无效。用 native setter + InputEvent：
-   ```js
-   const setter = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'innerText').set; // textarea 用 'value'
-   setter.call(el, text);
-   el.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:text}));
-   ```
-   输完检查发送/提交按钮是否从 disabled 变 enabled，再点它。
+5. **受控组件（React/Vue）输入**：`el.value=x` 无效。两种可行做法：
+   - **CDP 受信任输入（首选）**：`session.attach` → `page.focusEl` 聚焦输入框 → `session.send {method:"Input.insertText", params:{text}}` → `session.detach`。**必须先聚焦**：`Input.insertText` 只写入当前焦点元素，不聚焦时文字落到 `document.body`，页面毫无反应（已实测）。后台标签页同样有效。
+   - **native setter + InputEvent**（不能挂 CDP 时）：
+     ```js
+     const setter = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'innerText').set; // textarea 用 'value'
+     setter.call(el, text);
+     el.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:text}));
+     ```
+   - 两种方式都要回读确认文字真的进了输入框，再检查发送/提交按钮是否从 disabled 变 enabled。
 6. **截图的静默策略**：`page.screenshot` 默认走 CDP（后台 tab 也可用，不抢焦点）。CDP 失败时**默认不再自动激活窗口**，返回 `SCREENSHOT_FAILED`；若可接受浏览器跳到前台，用 `page.activateAndShot` 或传 `allowActivate:true`。确实需要用户观看/系统级截图时再显式激活。
 7. **激活/准备后 tabId 不变**，但用户手动开/关标签会变——多步流程每步都重新 `tabs` 确认。
 8. **导航等待**：导航必须用 `page.navigate`（走 `chrome.tabs.update`），**禁止用 `page.evaluate` 改 `location.href`/`location.assign`/`history.go`**——后者会销毁执行上下文，导致 RPC 无法返回、Host 超时。`page.navigate` 后可调 `page.waitForUrl`/`page.waitForSelector`/`page.waitForReady` 按条件等待，不要用固定 sleep。
@@ -696,7 +719,7 @@ const hasHScroll = de.scrollWidth > de.clientWidth;   // 真正的判据
 
 ## 专项实战：子技能详解
 
-> **索引与强制使用规则见上文「第一原则：先查子技能，用现成脚本（禁止重造）」——命中站点必须先读子技能再动手。** 本节是各子技能的能力说明。
+> **索引、复用与应变沉淀规则见上文「第一原则：优先复用、临场应变、持续沉淀」——命中站点先读子技能复用现成脚本，遇到改版或新场景用 `page.inspect` 探查变通并在收尾时回写沉淀。** 本节是各子技能的能力说明。
 
 - **小红书（笔记 + 全部评论深度抓取）** → `xhs/SKILL.md`。含站内搜索/筛选/频道切换、搜用户、用户主页全部笔记、问点点 AI 问答；一键脚本 `scripts/extract-xhs-comments.mjs`（全量滚动 + 递归展开楼中楼二级回复）、`xhs-search-inpage.mjs`、`xhs-note-full.mjs`、`xhs-search-user.mjs`、`xhs-user-notes.mjs`、`xhs-ask-diandian.mjs`。**核心规约：进笔记必须展开全部评论（含二级回复）；脚本内置验证码/404 拦截自动退出。禁止自己写小红书抓取脚本。**
 - **ChatGPT 网页版（问答/选模型/生图）** → `chatgpt/SKILL.md`。脚本 `scripts/chatgpt-ask.mjs`（一键提问读回复）、`scripts/cdp-eval.mjs`（CDP 求值）。**注意：chatgpt.com 有严格 CSP，`page.evaluate` 不可用，一切页面内 JS 走 CDP（`cdp-eval.mjs` / `session.send`）。** 前置：用户已在浏览器登录 chatgpt.com。
@@ -704,6 +727,7 @@ const hasHScroll = de.scrollWidth > de.clientWidth;   // 真正的判据
 - **NotebookLM**（新建笔记本、上传来源含视频/音频/图片/PDF、提问取回答、生成下载 Studio 产物）→ `notebooklm/SKILL.md`。脚本 `notebooklm/upload.mjs`、`notebooklm/ask.mjs`、`notebooklm/scripts/nblm-*.mjs`；文件上传走 CDP 注入。注意：网络出口需在开放地区（美国节点可用，香港/中国大陆不可用）。
 - **LinkedIn 职业档案（读取 / 编辑 Headline·About / 中英文双档案）** → `linkedin/SKILL.md`。脚本 `linkedin/scripts/linkedin-read.mjs`（**只读，改东西前先跑**）、`linkedin/scripts/linkedin-edit.mjs`（改 Headline/About，带 `--dry-run` 与「非空拒绝覆盖」保护）；公共层 `linkedin/scripts/lib/linkedin.mjs`。该站五重坑（**严格 CSP 禁 `page.evaluate`、SDUI 后台标签页不渲染、字段无稳定 id/name、About 是 TipTap 富文本、两种点击语义并存**）已在子技能里逐条收敛，**禁止从零手写**。前置：用户已登录 linkedin.com；改公开档案是对外可见动作，先 `--dry-run`。
 - **临场 Debug（任何站点通用）** → `debug/SKILL.md`（工具 `scripts/browser-debug.mjs`）。页面行为异常（404/风控误判、取不到内容、数量不对、URL 打不开）、需要理解陌生页面结构、或交付前验证提取结果时读取。**先探查后假设、不猜类名、异常先查 DOM 再下结论、输出独立验证**。
+- **Cloudflare 挑战页 / 人机验证（跨站点）** → `captcha/SKILL.md`。识别挑战页（`window._cf_chl_opt`、`Just a moment...`、`/cdn-cgi/challenge-platform/`、`challenges.cloudflare.com` iframe；**状态码可能是 200，先判挑战再看状态码**）→ 立即停止驱动 → `page.ensureActive` 后轮询等待自动通过（官方口径多数访客自动通过）→ 需要点击时激活 tab、截图通知用户完成，再轮询恢复。一键脚本 `captcha/scripts/cf-wait.mjs <tabId>`。**禁止：改 UA/Canvas/WebGL、常规操作挂 CDP、程序化合成点击 checkbox、用 `cf_clearance` 求解服务。**
 
 ---
 

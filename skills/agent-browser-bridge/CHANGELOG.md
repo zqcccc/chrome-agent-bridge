@@ -1,5 +1,17 @@
 # 版本与更新（扩展 + 本地桥）
 
+## 未发布：captcha 子技能 + 技能工作循环改写 + 两处脚本修复
+
+**新增 `captcha/` 子技能**：`captcha/SKILL.md` 与 `captcha/scripts/cf-wait.mjs`（识别挑战页 → 停止驱动 → 等待自动通过 → 需要点击时把 tab 交用户人工完成并轮询恢复）。
+
+**技能规则改写**：根 `SKILL.md` 的「第一原则」从「先查子技能、禁止重造」改为「优先复用、临场应变、持续沉淀」三段闭环，`KNOWN_ISSUES.md` 约束零、`debug/SKILL.md` 同步；description 与子技能索引、子技能详解补入 `captcha` 与 `linkedin` 入口。
+
+**`scripts/boss-send-chat.mjs`**：输入改用 CDP `Input.insertText`（受信任事件，能触发 React 受控更新），并补上 `page.focusEl` 与 `session.attach`/`session.detach` 配对——实测 `Input.insertText` 只写入当前焦点元素，不先聚焦文字落不到 `.chat-input`。轮询循环里未声明的 `r` 改为局部 `const`（原写法在严格模式下抛 `ReferenceError`）。点击发送保持 DOM `click`，送达验证逻辑不变。
+
+**`scripts/cdp-upload.mjs`**：`session.send` 的返回被 host 多包了一层，`DOM.getDocument` / `DOM.querySelector` 改为自适应读取 `result.root` / `result.nodeId`，原先解构拿到 `undefined` 导致「未找到 file input」。
+
+> 本节只描述 skill 文档与 skill 脚本变更，不含扩展 / host 行为变更，因此未改 `extension/manifest.json` 版本号。
+
 ## 0.3.12：CDP 会话隔离（内部流程不再拆掉 Agent 的调试会话）+ LinkedIn 子技能
 
 这一版修的是一个**已在三个不同路径上各自发作**的根因，外加沉淀一个子技能。

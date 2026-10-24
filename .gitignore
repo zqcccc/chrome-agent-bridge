@@ -10,3 +10,6 @@ dist/
 build/
 screenshots/
 .workbuddy-ai
+
+# 会话内临时产物（一次性探查脚本、测试页、探针）
+.scratch/

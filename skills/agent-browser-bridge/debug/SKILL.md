@@ -9,7 +9,7 @@ description: 浏览器页面临场 debug 通用能力。当通过 Agent Browser 
 
 在真实浏览器里干活（抓取、点选、输入、验证）时，**第一版选择器必须来自 DOM 探查，不是来自想象**。本 skill 提供探查工具 + 工作流 + 实测踩坑，适用于任何站点，不限小红书。
 
-> **进入 debug 前先确认是否命中子技能**：小红书 / BOSS 直聘 / ChatGPT / NotebookLM 有专项子技能（见根 `SKILL.md`「第一原则」的索引），其中已内置该站的风控防护与现成脚本。**先把专项脚本跑通再 debug**；直接自己写脚本绕过专项，往往既触发风控又把时间花在已解决的问题上。
+> **进入 debug 前先确认是否命中子技能**：小红书 / BOSS 直聘 / ChatGPT / NotebookLM / LinkedIn / Cloudflare 挑战有专项子技能（见根 `SKILL.md`「第一原则：优先复用、临场应变、持续沉淀」的索引），其中已内置该站的风控防护与现成脚本。**先把专项脚本跑通，遇到改版或异常再按本文探查应变，跑通后把修复回写沉淀。**
 
 ## 首选：插件内置 page.inspect（不用读脚本、不用写 JS）
 
@@ -101,7 +101,7 @@ await bridge.rpc("page.record.stop", { tabId });
    - 过程性问题 → `page.record.start` 开启记录，复现后 `page.record.get` 拉时间线
 3. **最小实验**：`page.evaluate` 执行一段 JS 验证假设（一次一个）；兜底脚本用 `--js "<expr>"`。
 4. **验证**：对输出做独立验证（数量、URL 可访问、正则 test）。
-5. **记录**：把确认的坑写回对应子 skill 或 KNOWN_ISSUES.md，避免下个 Agent 重踩。
+5. **沉淀**：临场应变跑通后，把确认的新选择器、改版兼容分支或新站点脚本回写到对应子 skill、`scripts/` 或 `KNOWN_ISSUES.md`，并清理一次性临时脚本，避免下个 Agent 重踩。
 
 ## 实测踩坑清单（通用化）
 

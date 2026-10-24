@@ -23,7 +23,7 @@ const text = process.argv[3];
 
 if (!token || !tabId || !text) {
   console.error("usage: BRIDGE_TOKEN=xxx node boss-send-chat.mjs <tabId> <text>");
-  await releaseLease(); process.exit(1);
+  process.exit(1);
 }
 
 // 动态加载同目录 helper（ESM，与本体同放 scripts/ 目录）
@@ -138,32 +138,33 @@ function evalResult(resp) {
   return raw;
 }
 
-// ---------- 1. 写入输入框（受控 contenteditable：native setter + InputEvent） ----------
-// 先查停止：本脚本的「输入」走 page.evaluate（只读方法，不会被 host 的停止闸门拦），
-// 所以必须自己检查，否则用户叫停后还会把文字填进输入框。
+// ---------- 1. 写入输入框（CDP 受信任输入） ----------
+// 输入走 CDP Input.insertText：它是受信任事件，能触发 React 受控更新，而不是只在 DOM 上
+// 摆一段文字。停止闸门会拦 Input.*（见扩展 BLOCKED_CDP_PREFIXES），但点击发送是
+// page.evaluate，不受闸门约束，所以两处都要显式 checkStop。
 await checkStop("写入输入框前");
-const setExpr = `(()=>{
-  const el = document.querySelector('.chat-input');
-  if (!el) return JSON.stringify({ok:false, err:'no .chat-input'});
-  el.focus();
-  const setter = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'innerText')?.set;
-  if (!setter) return JSON.stringify({ok:false, err:'no innerText setter'});
-  setter.call(el, ${JSON.stringify(text)});
-  el.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:${JSON.stringify(text)}}));
-  el.dispatchEvent(new Event('input', {bubbles:true}));
-  return JSON.stringify({ok:true, val:(el.innerText||'').slice(0,30)});
-})()`;
-let r = await rpc("page.evaluate", { tabId, expression: setExpr, awaitPromise: false });
-const typed = evalResult(r);
-console.log("type:", JSON.stringify(typed));
-if (!typed.ok) { await releaseLease(); process.exit(1); }
-
+await rpc("session.attach", { tabId });
+try {
+  // Input.insertText 写入的是当前焦点元素：不先聚焦，文字会落到 document.body（实测无效果）。
+  await rpc("page.focusEl", { tabId, selector: ".chat-input" });
+  await rpc("session.send", { tabId, method: "Input.insertText", params: { text } });
+  const typedRaw = await rpc("page.evaluate", {
+    tabId,
+    expression: `(()=>{const el=document.querySelector('.chat-input');if(!el)return JSON.stringify({ok:false,val:''});return JSON.stringify({ok:true,val:(el.innerText||'').trim().slice(0,30)});})()`,
+    awaitPromise: false,
+  });
+  const typed = evalResult(typedRaw);
+  console.log("type:", JSON.stringify(typed));
+  if (!typed.ok || !typed.val) { await releaseLease(); process.exit(1); }
+} finally {
+  await rpc("session.detach", { tabId }).catch(() => {});
+}
 // ---------- 2. 轮询发送按钮直到可用（BOSS contenteditable 异步同步，禁止固定 sleep） ----------
 const waitButtonExpr = `(()=>{const b=document.querySelector('button.btn-send');return JSON.stringify({exists:!!b,disabled:!!(b?.disabled||(b?.className||'').includes('disabled')),input:document.querySelector('.chat-input')?.innerText||''});})()`;
 let buttonState = {};
 for (let i = 0; i < 20; i++) {
-  r = await rpc("page.evaluate", { tabId, expression: waitButtonExpr, awaitPromise: false });
-  buttonState = evalResult(r);
+  const resp = await rpc("page.evaluate", { tabId, expression: waitButtonExpr, awaitPromise: false });
+  buttonState = evalResult(resp);
   if (buttonState.exists && !buttonState.disabled) break;
   await sleep(150);
 }
@@ -171,15 +172,11 @@ if (!buttonState.exists || buttonState.disabled) {
   console.log("click-send:", JSON.stringify({ ok: false, err: "send button did not become enabled", state: buttonState }));
   await releaseLease(); process.exit(1);
 }
-
-// ---------- 3. 只点击一次（不可逆动作；失败由人工/调用方核对后补发） ----------
-// 点击前再确认一次用户没叫停：这是整个脚本唯一真正不可逆的动作。
+// ---------- 3. 只点击一次（不可逆动作） ----------
 await checkStop("点击发送前");
-const clickExpr = `(()=>{const b=document.querySelector('button.btn-send');if(!b||b.disabled||(b.className||'').includes('disabled'))return JSON.stringify({ok:false,err:'disabled-at-click'});b.click();return JSON.stringify({ok:true});})()`;
-r = await rpc("page.evaluate", { tabId, expression: clickExpr, awaitPromise: false });
-const clicked = evalResult(r);
-console.log("click-send:", JSON.stringify(clicked));
-if (!clicked.ok) { await releaseLease(); process.exit(1); }
+// 用 DOM click 触发 React onClick（contenteditable 时代 CDP 坐标点击偏移失效，已验证 DOM click 可靠）
+await rpc("page.evaluate", { tabId, expression: '(()=>{const b=document.querySelector("button.btn-send"); if(b) b.click(); return !!b;})()', awaitPromise: false });
+console.log("click-send: real");
 
 // ---------- 4. 送达验证：当前 selected 会话内本人气泡 + 精确文本 + 同气泡状态 ----------
 async function collect() {

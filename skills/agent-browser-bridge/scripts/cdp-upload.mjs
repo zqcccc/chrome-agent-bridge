@@ -34,13 +34,14 @@ async function main() {
     // 1. 找到 file input 的 nodeId
     let nodeId = null;
     if (selectorArg) {
-      const { root } = await rpc("session.send", { tabId, method: "DOM.getDocument", params: { depth: -1 } });
-      const { nodeId: n } = await rpc("session.send", {
+      const doc = await rpc("session.send", { tabId, method: "DOM.getDocument", params: { depth: -1 } });
+      const rootNode = doc.result ? doc.result.root : doc.root;
+      const q = await rpc("session.send", {
         tabId,
         method: "DOM.querySelector",
-        params: { nodeId: root.nodeId, selector: selectorArg },
+        params: { nodeId: rootNode.nodeId, selector: selectorArg },
       });
-      nodeId = n;
+      nodeId = q.result ? q.result.nodeId : q.nodeId;
     }
     if (!nodeId) throw new Error("未找到 file input；请确认选择器");
 
