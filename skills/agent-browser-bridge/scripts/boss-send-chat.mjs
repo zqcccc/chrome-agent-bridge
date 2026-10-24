@@ -139,25 +139,32 @@ function evalResult(resp) {
 }
 
 // ---------- 1. 写入输入框（CDP 受信任输入） ----------
-// 输入走 CDP Input.insertText：它是受信任事件，能触发 React 受控更新，而不是只在 DOM 上
-// 摆一段文字。停止闸门会拦 Input.*（见扩展 BLOCKED_CDP_PREFIXES），但点击发送是
-// page.evaluate，不受闸门约束，所以两处都要显式 checkStop。
+// 输入走 CDP Input.insertText：它是受信任事件，能触发 Vue/React 受控更新，而不是只在 DOM 上
+// 摆一段文字。停止闸门会拦 Input.*（见扩展 BLOCKED_CDP_PREFIXES），所以这一步天然受拦；
+// 点击发送走 page.evaluate 不受拦，两处都要显式 checkStop。
+// 判定结果带出 try，退出放在 finally 之后：process.exit 会跳过 finally，会把 CDP 会话留在 tab 上。
 await checkStop("写入输入框前");
 await rpc("session.attach", { tabId });
+let typed = null;
 try {
-  // Input.insertText 写入的是当前焦点元素：不先聚焦，文字会落到 document.body（实测无效果）。
+  // Input.insertText 只写入当前焦点元素：不先聚焦，文字会落到 document.body（实测无效果）。
   await rpc("page.focusEl", { tabId, selector: ".chat-input" });
   await rpc("session.send", { tabId, method: "Input.insertText", params: { text } });
   const typedRaw = await rpc("page.evaluate", {
     tabId,
-    expression: `(()=>{const el=document.querySelector('.chat-input');if(!el)return JSON.stringify({ok:false,val:''});return JSON.stringify({ok:true,val:(el.innerText||'').trim().slice(0,30)});})()`,
+    expression: `(()=>{const el=document.querySelector('.chat-input');if(!el)return JSON.stringify({ok:false,val:''});return JSON.stringify({ok:true,val:(el.innerText||'').trim().slice(0,60)});})()`,
     awaitPromise: false,
   });
-  const typed = evalResult(typedRaw);
-  console.log("type:", JSON.stringify(typed));
-  if (!typed.ok || !typed.val) { await releaseLease(); process.exit(1); }
+  typed = evalResult(typedRaw);
 } finally {
   await rpc("session.detach", { tabId }).catch(() => {});
+}
+console.log("type:", JSON.stringify(typed));
+// insertText 是「在光标处追加」：残留草稿会让发送内容变成「草稿+本次文本」，
+// 而 analyzeDelivery 用 includes 匹配仍会判「已送达」，错误被掩盖。这里只接受精确相等。
+if (!typed.ok || !typed.val || typed.val.trim() !== text.trim()) {
+  console.error(`✗ 输入框内容与待发文本不一致：${JSON.stringify(typed)}`);
+  await releaseLease(); process.exit(1);
 }
 // ---------- 2. 轮询发送按钮直到可用（BOSS contenteditable 异步同步，禁止固定 sleep） ----------
 const waitButtonExpr = `(()=>{const b=document.querySelector('button.btn-send');return JSON.stringify({exists:!!b,disabled:!!(b?.disabled||(b?.className||'').includes('disabled')),input:document.querySelector('.chat-input')?.innerText||''});})()`;
@@ -172,11 +179,14 @@ if (!buttonState.exists || buttonState.disabled) {
   console.log("click-send:", JSON.stringify({ ok: false, err: "send button did not become enabled", state: buttonState }));
   await releaseLease(); process.exit(1);
 }
-// ---------- 3. 只点击一次（不可逆动作） ----------
+// ---------- 3. 只点击一次（不可逆动作；失败由人工/调用方核对后补发） ----------
 await checkStop("点击发送前");
-// 用 DOM click 触发 React onClick（contenteditable 时代 CDP 坐标点击偏移失效，已验证 DOM click 可靠）
-await rpc("page.evaluate", { tabId, expression: '(()=>{const b=document.querySelector("button.btn-send"); if(b) b.click(); return !!b;})()', awaitPromise: false });
-console.log("click-send: real");
+// 用 DOM click 触发 React onClick（contenteditable 时代 CDP 坐标点击偏移失效，已验证 DOM click 可靠）。
+// 返回值必须接住：按钮此刻可能已消失，带着「已点击」的假象进验证会掩盖真实状态。
+const clickRaw = await rpc("page.evaluate", { tabId, expression: '(()=>{const b=document.querySelector("button.btn-send"); if(!b||b.disabled||(b.className||"").includes("disabled")) return JSON.stringify({clicked:false,err:"button missing or disabled"}); b.click(); return JSON.stringify({clicked:true});})()', awaitPromise: false });
+const clicked = evalResult(clickRaw);
+console.log("click-send:", JSON.stringify(clicked));
+if (!clicked.clicked) { await releaseLease(); process.exit(1); }
 
 // ---------- 4. 送达验证：当前 selected 会话内本人气泡 + 精确文本 + 同气泡状态 ----------
 async function collect() {

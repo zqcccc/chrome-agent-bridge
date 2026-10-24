@@ -83,8 +83,11 @@ try {
 }
 
 // 页面内同步求值，返回一个对象。page.evaluate 默认在 MAIN world 执行，可以直接读 window._cf_chl_opt。
+// title 必须剥掉桥的接管前缀：每个 page.* 调用都会把 document.title 改成
+// 「● [<Agent 名>] 接管中 | <原标题>」（indicator.js），不剥则标题兜底判据永远不命中。
+// 剥前缀的正则与 indicator.js 的 stripControlPrefix 保持一致。
 const DETECT_EXPR = `(() => ({
-  title: document.title,
+  title: (document.title || "").replace(/^●\\s*\\[[^\\]]+\\]\\s*接管中\\s*\\|\\s*/, ""),
   url: location.href,
   hasCfOpt: !!window._cf_chl_opt,
   cType: window._cf_chl_opt?.cType ?? null,
@@ -100,7 +103,9 @@ function isChallenge(state) {
   // hasChlScript 不参与判定：JS Detections 的注入片段是同一路径前缀（Bot Fight Mode 默认开启），
   // 正常页面也会带该脚本，误判会白等整个自动轮询窗口。它只作为辅助信息透传。
   if (state.hasCfOpt || state.hasTurnstile || state.hasLegacy) return true;
-  if (/^Just a moment|^Checking your browser/.test(String(state.title || ""))) return true;
+  // 标题兜底判据：挑战页脚本可能还没写入 _cf_chl_opt，这是唯一还能命中的信号。
+  // 不用 ^ 锚定：剥掉接管前缀后标题开头仍可能带站点自己加的前缀。
+  if (/Just a moment|Checking your browser/.test(String(state.title || ""))) return true;
   const url = String(state.url || "");
   return url.includes("/cdn-cgi/challenge-platform/") || url.includes("__cf_chl_rt_tk");
 }
@@ -174,10 +179,10 @@ async function saveSceneShot() {
 }
 
 async function handOffToHuman() {
-  // 清掉之前「借前台」的记录：tabs.activate 已把窗口带到前台并让该 tab 成为活动页，
-  // 留着 borrowedActive 会让空闲计时器到时把用户刚解完验证码的标签页切回原页。
-  await rpc.restoreActive(tabId).catch(() => {});
   await rpc.call("tabs.activate", { tabId }, 20000);
+  // 这里不能调 page.restoreActive：restoreBorrowed 会接着把 active 切回 prevTabId，
+  // 等于把用户刚被带到的这个页面又切走。借前台的记录在 --human 路径下本来就不会产生
+  // （main 里跳过 ensureVisible），轮询中的 page.* 会持续续期，无需手动归还。
   await sleep(400);
   await saveSceneShot();
   console.error("等待用户完成人机验证……");
@@ -242,7 +247,10 @@ async function main() {
   console.error(
     `检测到 Cloudflare 挑战（cType=${first.cType ?? "未知"}，title="${first.title}"）。停止驱动，开始等待。`
   );
-  await ensureVisible();
+  // --human 路径不调用 ensureVisible()：它紧接着就 tabs.activate 把窗口带到前台，
+  // 而 ensureActive 借前台登记的 60s 归还计时器不会被 activate 清除，
+  // 用户解完验证码后空闲满 60s 会把这个标签页切回原页。
+  if (!forceHuman) await ensureVisible();
 
   if (forceHuman) {
     console.error("按 --human 进入人工接管。");

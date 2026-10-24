@@ -26,7 +26,7 @@ description: agent-browser-bridge 的子技能——Cloudflare 挑战页（"Just
 | marker | 怎么读 | 可信度 |
 | --- | --- | --- |
 | `window._cf_chl_opt` | `page.evaluate` 默认在 MAIN world 执行，可直接读页面变量；`cType` 实测取值 `managed` / `non-interactive` / `interactive`（旧站点可能是 `jsd`），`cTplC` 为 `1` 表示站点用了自定义模板 | 高 |
-| `document.title === "Just a moment..."` 或以 `Checking your browser` 开头 | `document.title` | 中：`cTplC: 1` 时站点可用 `::CF_WIDGET_BOX::` 自定义模板改写全部文案，文案不能单独作判据 |
+| `document.title` 含 `Just a moment...` 或以 `Checking your browser` 开头 | `document.title`，**先剥掉桥的接管前缀**（`page.*` 会把它改成 `● [Agent 接管中 | <原标题>`，见「脚本用法」） | 中：`cTplC: 1` 时站点可用 `::CF_WIDGET_BOX::` 自定义模板改写全部文案，文案不能单独作判据 |
 | `<script src*="/cdn-cgi/challenge-platform/">` | DOM 查询 | 低：**JS Detections 的注入片段也是这个路径前缀，且 Bot Fight Mode 默认开启**，开了 JSD 的普通页面同样命中。单独出现不能判定为挑战页，必须结合 `_cf_chl_opt`、标题或 URL 中的挑战 marker |
 | `iframe[src*="challenges.cloudflare.com"]`、`.cf-turnstile` 容器、隐藏字段 `cf-turnstile-response` | DOM 查询 | 高；页面内独立 widget 也会命中，需结合 URL 与 `_cf_chl_opt` 区分挑战页与站点自带 widget |
 | URL 含 `/cdn-cgi/challenge-platform/` 或 `__cf_chl_rt_tk` | `location.href` | 高；`__cf_chl_rt_tk` 由挑战页脚本用 `history.replaceState` 附加 |
@@ -37,7 +37,7 @@ description: agent-browser-bridge 的子技能——Cloudflare 挑战页（"Just
 
 ```js
 const DETECT_EXPR = `(() => ({
-  title: document.title,
+  title: (document.title || "").replace(/^●\s*\[[^\]]+\]\s*接管中\s*\|\s*/, ""),
   url: location.href,
   hasCfOpt: !!window._cf_chl_opt,
   cType: window._cf_chl_opt?.cType ?? null,
@@ -55,7 +55,7 @@ function isChallenge(state) {
   if (!state) return false;
   // hasChlScript 单独不作判据：JS Detections 的普通页面也带该脚本，误判会白等 30 秒
   if (state.hasCfOpt || state.hasTurnstile || state.hasLegacy) return true;
-  if (/^Just a moment|^Checking your browser/.test(String(state.title || ""))) return true;
+  if (/Just a moment|Checking your browser/.test(String(state.title || ""))) return true;
   const url = String(state.url || "");
   return url.includes("/cdn-cgi/challenge-platform/") || url.includes("__cf_chl_rt_tk");
 }
@@ -111,7 +111,7 @@ function isChallenge(state) {
 进入条件：调用带 `--human`（`cType` 为 `interactive` 时应直接这样调；`cType` 读不到或为 `null` 时按 Managed 处理），或调用方收到退出码 2 后决定交人、按下述流程自己实现。
 
 ```
-tabs.activate（把窗口带到前台，用户才看得见；先 page.restoreActive 清掉借前台记录，避免空闲后把标签页切回原页）
+tabs.activate（把窗口带到前台，用户才看得见）
   → page.screenshot（留现场）
   → 明确提示「请完成页面上的人机验证」
   → 每 1.5 秒轮询，人工等待 60–120 秒（可配）
@@ -168,7 +168,7 @@ stdout 输出单行 JSON，字段固定：
 - `attempts`：检测次数。
 - `waitedMs`：从开始到结束的毫秒数。
 
-脚本行为：初始检测无挑战直接退出 0；有挑战先 `page.ensureActive`，每 1.5 秒轮询；不带 `--human` 时，自动等待超时即截图、读 Ray ID 写进 stderr，以退出码 2 结束，不转人工、不挂起；带 `--human` 时跳过自动阶段，`tabs.activate` + 截图 + stderr 打印「等待用户完成人机验证」，轮询到人工超时，再读一次 Ray ID 后以退出码 2 结束。全程不刷新、不点击、不导航。页面导航瞬间的 `PAGE_CONTEXT_TIMEOUT` / `NAV_TIMEOUT` 按「本轮未知」跳过，连续 5 次才判失败。
+脚本行为：初始检测无挑战直接退出 0；有挑战时，**不带 `--human`** 先 `page.ensureActive` 恢复渲染再每 1.5 秒轮询，自动等待超时即截图、读 Ray ID 写进 stderr，以退出码 2 结束，不转人工、不挂起；**带 `--human` 跳过 `page.ensureActive`**（紧接着就 `tabs.activate`，再借前台只会留下一条把标签页切回原页的计时器），改为 `tabs.activate` + 截图 + stderr 打印「等待用户完成人机验证」，轮询到人工超时，再读一次 Ray ID 后以退出码 2 结束。全程不刷新、不点击、不导航。页面导航瞬间的 `PAGE_CONTEXT_TIMEOUT` / `NAV_TIMEOUT` 按「本轮未知」跳过，连续 5 次才判失败。
 
 ### 只有 skill 目录时：手写 RPC 等价流程
 
@@ -199,7 +199,9 @@ async function rpc(method, params = {}, timeoutMs = 20000) {
 }
 
 const DETECT_EXPR = `(() => ({
-  title: document.title,
+  // 剥掉桥的接管前缀（indicator.js 会给 document.title 加「● [Agent] 接管中 | 」），
+  // 否则标题兜底判据永远不命中
+  title: (document.title || "").replace(/^●\\s*\\[[^\\]]+\\]\\s*接管中\\s*\\|\\s*/, ""),
   url: location.href,
   hasCfOpt: !!window._cf_chl_opt,
   cType: window._cf_chl_opt?.cType ?? null,
@@ -215,7 +217,7 @@ function isChallenge(state) {
   if (!state) return false;
   // hasChlScript 单独不作判据：JS Detections 的普通页面也带该脚本
   if (state.hasCfOpt || state.hasTurnstile || state.hasLegacy) return true;
-  if (/^Just a moment|^Checking your browser/.test(String(state.title || ""))) return true;
+  if (/Just a moment|Checking your browser/.test(String(state.title || ""))) return true;
   const url = String(state.url || "");
   return url.includes("/cdn-cgi/challenge-platform/") || url.includes("__cf_chl_rt_tk");
 }
@@ -230,8 +232,9 @@ async function waitChallenge(tabId, { autoTimeoutMs = 30000, humanTimeoutMs = 12
   let state = await detect(tabId);
   if (!isChallenge(state)) return { solved: true, challenge: false, state };
 
-  // 后台标签页会暂停 rAF、节流定时器，挑战脚本可能停在半途
-  await rpc("page.ensureActive", { tabId, restoreAfterMs: 60000 });
+  // 后台标签页会暂停 rAF、节流定时器，挑战脚本可能停在半途。
+  // 只在自动等待路径借前台：human 路径紧接着就 tabs.activate，借了只会留下切回原页的计时器。
+  if (!human) await rpc("page.ensureActive", { tabId, restoreAfterMs: 60000 });
 
   if (!human) {
     const autoDeadline = Date.now() + autoTimeoutMs;
