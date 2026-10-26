@@ -22,16 +22,56 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const DEFAULT_PORT = Number(process.env.BRIDGE_PORT || 8778);
+const DEFAULT_PORT = Number(process.env.BRIDGE_PORT || process.env.AGENT_BRIDGE_PORT || 8778);
 
 export function readToken() {
-  if (process.env.BRIDGE_TOKEN) return process.env.BRIDGE_TOKEN;
+  if (process.env.BRIDGE_TOKEN) return process.env.BRIDGE_TOKEN.trim();
+  if (process.env.AGENT_BRIDGE_TOKEN) return process.env.AGENT_BRIDGE_TOKEN.trim();
   const p = path.join(os.homedir(), ".chrome-agent-bridge", "token");
   try {
     return fs.readFileSync(p, "utf8").trim();
   } catch {
     throw new Error(`读不到 token：${p}（桥可能从未安装，按 skill 目录下 INSTALL.md 安装）`);
   }
+}
+
+const activeRpcInstances = new Set();
+let processHooksInstalled = false;
+
+async function cleanupAllRpcInstances() {
+  const tasks = [];
+  for (const inst of activeRpcInstances) {
+    tasks.push(inst.cleanup());
+  }
+  await Promise.allSettled(tasks);
+}
+
+function installProcessHooks() {
+  if (processHooksInstalled) return;
+  processHooksInstalled = true;
+
+  process.once("beforeExit", () => {
+    cleanupAllRpcInstances();
+  });
+
+  // node:test 运行器自己管理异常；仅在独立脚本执行时安装顶层守护
+  if (process.env.NODE_TEST_CONTEXT) return;
+
+  const onFatal = async (err, origin) => {
+    // 若外部脚本自己额外注册了监听器，先清理资源后交由外部监听器处理
+    const listenerCount = process.listenerCount(origin);
+    await cleanupAllRpcInstances();
+    if (listenerCount > 1) return;
+    if (err && err.code === "AGENT_STOPPED") {
+      console.error(`\n⏹ [AGENT_STOPPED] ${err.message || "用户已停止 Agent"}`);
+      process.exit(3);
+    }
+    console.error(err && err.stack ? err.stack : err);
+    process.exit(1);
+  };
+
+  process.on("unhandledRejection", (reason) => { onFatal(reason, "unhandledRejection"); });
+  process.on("uncaughtException", (err) => { onFatal(err, "uncaughtException"); });
 }
 
 /** 三层解包自适应：把任意调用路径的响应收敛成最终值。 */
@@ -65,15 +105,46 @@ export class Rpc {
   constructor({ port = DEFAULT_PORT, token = readToken(), agentId, agentName } = {}) {
     this.port = port;
     this.token = token;
-    this.agentId = agentId || `agent-${process.pid}`;
-    this.agentName = agentName || this.agentId;
+    this.agentId = agentId || process.env.AGENT_ID || `agent-${process.pid}`;
+    this.agentName = agentName || process.env.AGENT_NAME || this.agentId;
     this._attached = new Set();
+    this._claimed = new Set();
     // 每个 tab 的连续失败计数：同一个 tab 上反复出现「上下文类」错误说明它已经废了。
     // 真实案例：某个永远 status:"loading" 的 SPA 上，agent 盲试了 155 次
     // PAGE_CONTEXT_TIMEOUT（evaluate 失败 → prepare 失败 → 再 evaluate），
     // 每次都只多花几秒，但累积起来把一个简单任务拖成了事故。
     this._strikes = new Map();
     this.maxStrikes = 3;
+    activeRpcInstances.add(this);
+    installProcessHooks();
+  }
+
+  /** 释放当前实例持有的全部 CDP 会话与 Tab 租约。 */
+  async cleanup() {
+    for (const tabId of [...this._attached]) {
+      await this.detach(tabId);
+    }
+    for (const tabId of [...this._claimed]) {
+      await this.releaseTab(tabId).catch(() => {});
+    }
+  }
+
+  /** 申请 Tab 互斥租约（退出时自动释放）。 */
+  async claimTab(tabId, ttlMs = 120000) {
+    const r = await this._post("/tabs/claim", JSON.stringify({ tabId, agentId: this.agentId, ttlMs }));
+    this._claimed.add(tabId);
+    return r;
+  }
+
+  /** 释放 Tab 互斥租约。 */
+  async releaseTab(tabId) {
+    this._claimed.delete(tabId);
+    return this._post("/tabs/release", JSON.stringify({ tabId, agentId: this.agentId }));
+  }
+
+  /** 查询 host 内存记录的近期错误（免去 grep host.log）。 */
+  async recentErrors(opts = {}) {
+    return this.call("bridge.recentErrors", opts, 10000);
   }
 
   /** 这个 tab 是否已被判定为「废了」。 */
@@ -260,13 +331,22 @@ export class Rpc {
         // 临时激活以保证渲染（只切标签页不聚焦窗口），以及滚动推进检测。
         ensureActive: versionKnown ? gte(version, "0.3.10") : null,
         scrollChecked: versionKnown ? gte(version, "0.3.10") : null,
+        // v0.3.13+：扩展内原子 CDP 操作（clickReal/typeReal/uploadFile/evalCdp）、
+        // page.read 一键读取、snapshot 元素 ref 与交互 Action Delta。
+        atomicCdp: versionKnown ? gte(version, "0.3.13") : null,
+        pageRead: versionKnown ? gte(version, "0.3.13") : null,
+        snapshotRef: versionKnown ? gte(version, "0.3.13") : null,
+        actionDelta: versionKnown ? gte(version, "0.3.13") : null,
       },
     };
   }
 
   // ---------- 页面求值（CDP，绕过 CSP） ----------
 
-  async attach(tabId) {
+  async attach(tabId, { force = false } = {}) {
+    if (!force && this._attached.has(tabId)) {
+      return { attached: true, tabId, already: true, cached: true };
+    }
     const r = await this.call("session.attach", { tabId }, 15000);
     this._attached.add(tabId);
     return r;
@@ -292,11 +372,27 @@ export class Rpc {
       );
     }
     await this.attach(tabId);
-    const r = await this.call(
-      "session.send",
-      { tabId, method: "Runtime.evaluate", params: { expression, returnByValue: true, awaitPromise, userGesture } },
-      timeoutMs
-    );
+    let r;
+    try {
+      r = await this.call(
+        "session.send",
+        { tabId, method: "Runtime.evaluate", params: { expression, returnByValue: true, awaitPromise, userGesture } },
+        timeoutMs
+      );
+    } catch (e) {
+      // 页面发生过导航或外部 detach 导致调试器已断开时，清缓存并自动重连一次
+      if (e && (e.code === "SESSION_NOT_ATTACHED" || e.code === "SESSION_DETACHED" || e.code === "SESSION_SEND_FAILED")) {
+        this._attached.delete(tabId);
+        await this.attach(tabId, { force: true });
+        r = await this.call(
+          "session.send",
+          { tabId, method: "Runtime.evaluate", params: { expression, returnByValue: true, awaitPromise, userGesture } },
+          timeoutMs
+        );
+      } else {
+        throw e;
+      }
+    }
     const details = r && r.exceptionDetails;
     if (details) {
       const ex = details.exception || {};
@@ -305,6 +401,45 @@ export class Rpc {
     // 成功即清零：说明这个 tab 其实还能用
     this.clearStrikes(tabId);
     return unwrap(r);
+  }
+
+  /** 单次无状态 CDP 求值（扩展内借用调试器并在调用结束后立即释放，不留调试横条）。 */
+  async evalCdp(tabId, expression, opts = {}) {
+    try {
+      return await this.call("page.evalCdp", { tabId, expression, ...opts }, opts.timeoutMs || 30000);
+    } catch (e) {
+      if (e && e.code === "UNKNOWN_METHOD") return this.ev(tabId, expression, opts);
+      throw e;
+    }
+  }
+
+  /** 一键读取网页正文、标题、主链接与阻断状态（自动打开/复用、处理后台未渲染并关闭临时 tab）。 */
+  async readPage(urlOrOpts, opts = {}) {
+    const params = typeof urlOrOpts === "string" ? { url: urlOrOpts, ...opts } : { ...(urlOrOpts || {}) };
+    try {
+      return await this.call("page.read", params, (params.timeoutMs || 45000) + 10000);
+    } catch (e) {
+      if (!e || e.code !== "UNKNOWN_METHOD") throw e;
+      // 旧版扩展降级：用 withPage + ev
+      return this.withPage(params.url, async (tabId, opened) => {
+        const title = await this.ev(tabId, "document.title");
+        const text = await this.ev(tabId, "document.body ? document.body.innerText : ''");
+        return {
+          ok: true,
+          tabId,
+          url: params.url,
+          title,
+          text: String(text || "").slice(0, params.maxLength || 20000),
+          textLength: String(text || "").length,
+          reused: opened.reused,
+        };
+      }, { keepOpen: params.keepOpen, match: params.match });
+    }
+  }
+
+  /** 获取带 [e1] 持久化引用的紧凑页面快照。 */
+  async snapshotCompact(tabId, opts = {}) {
+    return this.call("page.snapshot", { tabId, mode: "compact", ...opts }, opts.timeoutMs || 20000);
   }
 
   /** 把「页面里算好并 JSON.stringify 的对象」安全取回。 */
@@ -324,22 +459,92 @@ export class Rpc {
     }
   }
 
-  // ---------- 点击：两种模式都要有 ----------
+  // ---------- 点击与输入：优先走扩展侧单次原子 RPC，旧版自动回退 ----------
 
-  /** 真实鼠标事件（CDP）。React 受控组件、菜单展开通常需要这个。 */
-  async clickReal(tabId, x, y) {
-    await this.attach(tabId);
-    for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
-      await this.call(
-        "session.send",
-        {
+  /**
+   * 真实鼠标点击（CDP Input.dispatchMouseEvent）。
+   * 支持两种传参：
+   *   1. clickReal(tabId, x, y) —— 坐标点击
+   *   2. clickReal(tabId, selectorOrRef, opts) —— 选择器或 @e1 引用点击（自动滚动居中+算坐标）
+   */
+  async clickReal(tabId, xOrSelector, y, opts = {}) {
+    const params = typeof xOrSelector === "number"
+      ? { tabId, x: Math.round(xOrSelector), y: Math.round(y), ...(opts || {}) }
+      : (typeof xOrSelector === "object" && xOrSelector !== null
+        ? { tabId, ...xOrSelector }
+        : { tabId, selector: String(xOrSelector), ...(typeof y === "object" && y ? y : {}) });
+    try {
+      return await this.call("page.clickReal", params, 20000);
+    } catch (e) {
+      if (!e || e.code !== "UNKNOWN_METHOD") throw e;
+      // 旧版扩展降级
+      let cx = params.x, cy = params.y;
+      if (cx == null || cy == null) {
+        const pos = await this.evJson(
           tabId,
-          method: "Input.dispatchMouseEvent",
-          params: { type, x: Math.round(x), y: Math.round(y), button: type === "mouseMoved" ? "none" : "left", clickCount: 1 },
-        },
-        10000
-      );
-      await sleep(120);
+          `const el=document.querySelector(${JSON.stringify(params.selector)});
+           if(!el) return {ok:false};
+           el.scrollIntoView({block:'center'});
+           const r=el.getBoundingClientRect();
+           return {ok:true, x:r.left+r.width/2, y:r.top+r.height/2};`
+        );
+        if (!pos || !pos.ok) throw new BridgeRpcError("NOT_FOUND", `未找到元素: ${params.selector}`, "clickReal");
+        cx = pos.x; cy = pos.y;
+      }
+      await this.attach(tabId);
+      for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
+        await this.call(
+          "session.send",
+          {
+            tabId,
+            method: "Input.dispatchMouseEvent",
+            params: { type, x: Math.round(cx), y: Math.round(cy), button: type === "mouseMoved" ? "none" : "left", clickCount: 1 },
+          },
+          10000
+        );
+        await sleep(80);
+      }
+      return { ok: true, x: Math.round(cx), y: Math.round(cy) };
+    }
+  }
+
+  /**
+   * 受控组件真实输入（自动聚焦 + 清空 + CDP Input.insertText + 回读校验）。
+   */
+  async typeReal(tabId, selector, text, opts = {}) {
+    const params = { tabId, selector, text, ...opts };
+    try {
+      return await this.call("page.typeReal", params, 20000);
+    } catch (e) {
+      if (!e || e.code !== "UNKNOWN_METHOD") throw e;
+      await this.call("page.focusEl", { tabId, selector, by: opts.by || "css" }, 10000);
+      await this.attach(tabId);
+      await this.call("session.send", { tabId, method: "Input.insertText", params: { text: String(text) } }, 15000);
+      return { ok: true, value: String(text) };
+    }
+  }
+
+  /**
+   * 原子文件上传（给 input[type="file"] 注入本地文件路径，单次 RPC）。
+   */
+  async uploadFile(tabId, selector, files) {
+    const fileList = Array.isArray(files) ? files : [files];
+    try {
+      return await this.call("page.uploadFile", { tabId, selector: selector || 'input[type="file"]', files: fileList }, 30000);
+    } catch (e) {
+      if (!e || e.code !== "UNKNOWN_METHOD") throw e;
+      await this.attach(tabId);
+      const doc = await this.call("session.send", { tabId, method: "DOM.getDocument", params: { depth: -1 } }, 15000);
+      const rootNode = doc.result ? doc.result.root : doc.root;
+      const q = await this.call("session.send", {
+        tabId,
+        method: "DOM.querySelector",
+        params: { nodeId: rootNode.nodeId, selector: selector || 'input[type="file"]' },
+      }, 15000);
+      const nodeId = q.result ? q.result.nodeId : q.nodeId;
+      if (!nodeId) throw new BridgeRpcError("NOT_FOUND", `未找到文件上传元素: ${selector}`, "uploadFile");
+      await this.call("session.send", { tabId, method: "DOM.setFileInputFiles", params: { files: fileList, nodeId } }, 30000);
+      return { ok: true, count: fileList.length, files: fileList };
     }
   }
 

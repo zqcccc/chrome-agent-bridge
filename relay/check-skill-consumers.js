@@ -84,11 +84,13 @@ const INVARIANTS = [
       + "下一个 Agent 拿到 TAB_LEASED 却不知道是谁占的。所有退出路径都要释放。",
   },
   {
-    name: "顶层 await 的两个进程级 hook",
-    // 顶层 await 的脚本：reject 走 uncaughtException（不是 unhandledRejection）
+    name: "顶层 await 的两个进程级 hook（或通过 lib/bridge.mjs 继承）",
+    // 顶层 await 的脚本：reject 走 uncaughtException（不是 unhandledRejection）。
+    // 若脚本通过 lib/bridge.mjs 的 Rpc 调用，Rpc 构造时已自动安装 unhandledRejection + uncaughtException 双钩子；
+    // 若脚本自己裸调 /rpc 且用顶层 await，则必须在脚本内显式注册这两个钩子。
     appliesTo: (src) => /^await /m.test(src),
-    check: (src) => /process\.on\("unhandledRejection"/.test(src) && /process\.on\("uncaughtException"/.test(src),
-    detail: "脚本用了顶层 await，但没同时注册 unhandledRejection 与 uncaughtException。"
+    check: (src) => /lib\/bridge\.mjs/.test(src) || (/process\.on\("unhandledRejection"/.test(src) && /process\.on\("uncaughtException"/.test(src)),
+    detail: "脚本用了顶层 await 且未复用 lib/bridge.mjs，但没同时注册 unhandledRejection 与 uncaughtException。"
       + "实测：顶层 await 的 reject 走 **uncaughtException**，只注册前者会漏 —— "
       + "表现为用户叫停时打出 Node 堆栈、退出码不是约定的 3。",
   },

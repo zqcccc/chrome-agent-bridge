@@ -46,11 +46,33 @@ const PORT = (() => {
   return env ? Number(env) : 8778;
 })();
 
-// ---------- 日志 ----------
+// ---------- 日志（含 5MB 自动轮转） ----------
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
+let logWriteCount = 0;
+
+function maybeRotateLog() {
+  try {
+    const st = fs.statSync(LOG_FILE);
+    if (st.size <= LOG_MAX_BYTES) return;
+    // 保留尾部 64KB（含启动标识与最近记录），将完整旧日志轮转到 host.log.1
+    const keepSize = 64 * 1024;
+    const fd = fs.openSync(LOG_FILE, "r");
+    const buf = Buffer.alloc(keepSize);
+    const bytesRead = fs.readSync(fd, buf, 0, keepSize, Math.max(0, st.size - keepSize));
+    fs.closeSync(fd);
+    const tailText = buf.slice(0, bytesRead).toString("utf8");
+    const firstNewline = tailText.indexOf("\n");
+    const cleanTail = firstNewline >= 0 ? tailText.slice(firstNewline + 1) : tailText;
+    try { fs.renameSync(LOG_FILE, LOG_FILE + ".1"); } catch (e) { /* noop */ }
+    fs.writeFileSync(LOG_FILE, `[${new Date().toISOString()}] [host] log rotated (previous size=${st.size} bytes -> host.log.1)\n` + cleanTail, "utf8");
+  } catch (e) { /* noop */ }
+}
+
 function log(...parts) {
   const line = `[${new Date().toISOString()}] ${parts.join(" ")}`;
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
+    if (logWriteCount++ % 200 === 0) maybeRotateLog();
     fs.appendFileSync(LOG_FILE, line + "\n");
   } catch (e) { /* noop */ }
   if (STANDALONE) console.log(line);
@@ -267,6 +289,64 @@ function genRequestId() {
   return crypto.randomUUID();
 }
 
+// ---------- 近期错误环形缓冲（免 grep 30 万行 host.log） ----------
+const RECENT_ERRORS_MAX = 100;
+const recentErrors = []; // [{ at, ts, method, tabId, channel, reqId, elapsedMs, code, message, details, note }]
+
+function recordRecentError(ctx) {
+  if (!ctx || !ctx.code) return;
+  const rawTab = ctx.tabId;
+  const normTab = rawTab != null && /^\d+$/.test(String(rawTab)) ? Number(rawTab) : (rawTab != null ? rawTab : null);
+  const item = {
+    at: new Date().toISOString(),
+    ts: Date.now(),
+    method: ctx.method || "-",
+    tabId: normTab,
+    channel: ctx.channel || "-",
+    reqId: ctx.reqId || "-",
+    elapsedMs: ctx.elapsedMs != null ? ctx.elapsedMs : null,
+    code: ctx.code,
+    message: ctx.message ? String(ctx.message).slice(0, 300) : undefined,
+    details: ctx.details || undefined,
+    note: ctx.note || undefined,
+  };
+  recentErrors.push(item);
+  if (recentErrors.length > RECENT_ERRORS_MAX) {
+    recentErrors.splice(0, recentErrors.length - RECENT_ERRORS_MAX);
+  }
+}
+
+function queryRecentErrors(params = {}) {
+  if (params && params.clear) {
+    const cleared = recentErrors.length;
+    recentErrors.length = 0;
+    return { cleared, count: 0, total: 0, errors: [], byCode: {} };
+  }
+  const limit = Math.max(1, Math.min(Number(params && params.limit) || 20, RECENT_ERRORS_MAX));
+  const wantTab = params && params.tabId != null && params.tabId !== "" ? String(params.tabId) : null;
+  const wantCode = params && params.code ? String(params.code).toUpperCase() : null;
+  const wantMethod = params && params.method ? String(params.method) : null;
+
+  const byCode = {};
+  for (const e of recentErrors) {
+    byCode[e.code] = (byCode[e.code] || 0) + 1;
+  }
+
+  let list = recentErrors;
+  if (wantTab !== null) list = list.filter((e) => String(e.tabId) === wantTab);
+  if (wantCode) list = list.filter((e) => e.code === wantCode);
+  if (wantMethod) list = list.filter((e) => e.method === wantMethod);
+
+  const sliced = list.slice(-limit).reverse(); // 最新在前
+  return {
+    count: sliced.length,
+    total: recentErrors.length,
+    matched: list.length,
+    byCode,
+    errors: sliced,
+  };
+}
+
 // 结构化诊断日志：不含 token / 页面内容
 function rpcLog(level, ctx) {
   const line = [
@@ -278,6 +358,9 @@ function rpcLog(level, ctx) {
     ctx.note ? `note=${ctx.note}` : "",
   ].filter(Boolean).join(" ");
   log("rpc " + line);
+  if (level === "warn" && ctx && ctx.code) {
+    recordRecentError(ctx);
+  }
 }
 
 // ---------- 客户端断开：取消尚未派发的请求 ----------
@@ -355,6 +438,7 @@ const SIDE_EFFECT_METHODS = new Set([
   "page.click", "page.type", "page.press", "page.select", "page.scroll",
   "page.hover", "page.focusEl", "page.navigate", "page.back", "page.forward",
   "page.reload", "page.waitFor", "page.activateAndShot", "page.ensureActive",
+  "page.clickReal", "page.typeReal", "page.uploadFile",
   "tabs.create", "tabs.reload", "tabs.activate",
 ]);
 
@@ -457,6 +541,7 @@ async function requestExtension(method, params, timeoutMs = 60000, agentId = "an
   if (method === "agent.stop") return agentStop(params, { agentId, agentName: effectiveAgentName });
   if (method === "agent.resume") return agentResume(params, { agentId, agentName: effectiveAgentName });
   if (method === "agent.stopStatus") return agentStopStatus(params);
+  if (method === "bridge.recentErrors") return queryRecentErrors(params);
 
   // 停止状态：拒绝新的**写**操作（不是只广播一条事件）。
   if (isBlockedByStop(method, params)) {
@@ -639,7 +724,16 @@ function rejectPending(requestId, error) {
   if (!p) return; // stale 响应，丢弃
   clearTimeout(p.timer);
   pending.delete(requestId);
-  rpcLog("warn", { method: p.method, tabId: p.tabId, channel: p.channel, reqId: requestId, elapsedMs: Date.now() - p.startedAt, code: (error && error.code) || "EXT_ERROR" });
+  rpcLog("warn", {
+    method: p.method,
+    tabId: p.tabId,
+    channel: p.channel,
+    reqId: requestId,
+    elapsedMs: Date.now() - p.startedAt,
+    code: (error && error.code) || "EXT_ERROR",
+    message: error && error.message,
+    details: error && error.details,
+  });
   // 透传 details（如 SCROLL_NO_GROWTH 的 atBottom/wasHidden）：调用方要能**可编程判断**，
   // 而不是去解析 message 文本。这里不能重建对象时漏掉它（历史 bug：details 被静默丢弃）。
   const e = err((error && error.code) || "EXT_ERROR", (error && error.message) || String(error), {
@@ -905,6 +999,7 @@ function httpServer() {
         stopped: stopState.size > 0,
         stops: [...stopState].map(([key, st]) => ({ key, ...st })),
         inFlight: inflight.size,
+        recentErrorCount: recentErrors.length,
         agents: [...agents].map(([agentId, a]) => ({ agentId, ...a })),
         tabLeases: [...tabLeases].map(([tabId, lease]) => ({ tabId, ...lease })),
         uptimeSec: Math.round(process.uptime()),
@@ -912,6 +1007,18 @@ function httpServer() {
         port: PORT,
         tokenPrefix: TOKEN.slice(0, 6),
       });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/errors") {
+      const q = {
+        tabId: url.searchParams.get("tabId"),
+        code: url.searchParams.get("code"),
+        method: url.searchParams.get("method"),
+        limit: url.searchParams.get("limit"),
+        clear: url.searchParams.get("clear") === "1" || url.searchParams.get("clear") === "true",
+      };
+      send(200, { ok: true, ...queryRecentErrors(q) });
       return;
     }
 

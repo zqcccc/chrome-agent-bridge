@@ -19,7 +19,8 @@
 | 错误码 | 真实含义 | 该怎么办 |
 | --- | --- | --- |
 | `AGENT_STOPPED` | **用户在页面上点了「停止 Agent」** | 不是页面问题。停止一切写操作并汇报进度（`e.detail("scope")`） |
-| `EVAL_ERROR` 且 message 提到 CSP / unsafe-eval | 用了 `page.evaluate` 做字符串求值，被页面 CSP 拦 | 改走 CDP 求值（`rpc.ev()` / `scripts/cdp-eval.mjs`） |
+| `STALE_ELEMENT_REF` | 快照短标号（如 `@e12`）对应的 DOM 节点已被页面移除 | 重新调用 `page.snapshot` 获取最新 `ref` 后再操作 |
+| `EVAL_ERROR` 且 message 提到 CSP / unsafe-eval | 用了 `page.evaluate` 做字符串求值，被页面 CSP 拦 | 改走 CDP 求值（`rpc.evalCdp()` / `rpc.ev()` / `scripts/cdp-eval.mjs`） |
 | `SESSION_SEND_FAILED`：Debugger is not attached | **扩展 bug（≤ v0.3.11）**：内部 CDP 流程拆了 Agent 的调试会话 | 升级到 ≥ 0.3.12；或全程只用 `ev()`、不混用 `page.evaluate` |
 | `SESSION_NOT_ATTACHED` | 没先 `session.attach` 就 `session.send` | 用 `rpc.ev()` / `withSession()`（它们会 attach） |
 | `TAB_UNHEALTHY` | 同 tab 已连续 3 次上下文级失败（本库主动熔断） | **换 tab**（`tabs.resolve` / `withPage`），不要原地重试 |

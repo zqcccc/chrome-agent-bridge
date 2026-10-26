@@ -318,3 +318,54 @@ test("契约: 停止状态查询走只读方法 agent.stopStatus（停止期间�
     assert.match(src, /agent\.stopStatus/, `${f} 必须用 agent.stopStatus 查停止状态`);
   }
 });
+
+test("content.js: snapshot compact 模式分配稳定 ref、支持 @e1 点击并返回 delta，脱离 DOM 后报 STALE_ELEMENT_REF", async () => {
+  const s = loadScript(path.join(EXT, "content.js"));
+  class FakeElement {}
+  s.window.Element = FakeElement;
+  s.window.CSS = { escape: (x) => String(x) };
+  s.window.MouseEvent = class { constructor(type, opts) { this.type = type; Object.assign(this, opts); } };
+  s.window.Event = class { constructor(type, opts) { this.type = type; Object.assign(this, opts); } };
+
+  const btn = Object.assign(new FakeElement(), {
+    nodeType: 1,
+    tagName: "BUTTON",
+    id: "apply-btn",
+    innerText: "立即沟通",
+    textContent: "立即沟通",
+    isConnected: true,
+    disabled: false,
+    parentElement: null,
+    getAttribute: (k) => (k === "role" ? "button" : null),
+    getBoundingClientRect: () => ({ x: 100, y: 200, left: 100, top: 200, width: 80, height: 32 }),
+    scrollIntoView: () => {},
+    dispatchEvent: () => true,
+    click: () => { s.window.location.href = "https://example.com/chat"; },
+  });
+  s.document.querySelectorAll = (sel) => (sel === "*" ? [btn] : []);
+  s.document.querySelector = (sel) => (sel === "#apply-btn" ? btn : null);
+
+  // 1. compact 快照生成 [e1] 且二次快照保持同一 ref
+  const snap1 = await s.dispatch({ type: "bridge.action", action: "snapshot", args: { mode: "compact" } });
+  assert.equal(snap1.ok, true, JSON.stringify(snap1));
+  assert.equal(snap1.result.elementCount, 1);
+  assert.match(snap1.result.compact, /\[e1\] button "立即沟通" @\(140,216\)/);
+
+  const snap2 = await s.dispatch({ type: "bridge.action", action: "snapshot", args: { mode: "elements" } });
+  assert.equal(snap2.result.elements[0].ref, "e1", "同一 DOM 节点多次 snapshot 应保持相同 ref");
+
+  // 2. 用 @e1 点击，且返回 delta（检测到 URL 改变）
+  const clickRes = await s.dispatch({ type: "bridge.action", action: "click", args: { selector: "@e1" } });
+  assert.equal(clickRes.ok, true, JSON.stringify(clickRes));
+  assert.equal(clickRes.result.ref, "e1");
+  assert.equal(clickRes.result.delta.urlChanged, true);
+  assert.equal(clickRes.result.delta.url, "https://example.com/chat");
+
+  // 3. 节点从 DOM 移除后，再用 ref 定位应报 STALE_ELEMENT_REF
+  btn.isConnected = false;
+  const staleRes = await s.dispatch({ type: "bridge.action", action: "click", args: { ref: "e1" } });
+  assert.equal(staleRes.ok, false);
+  assert.equal(staleRes.error.code, "STALE_ELEMENT_REF");
+  assert.equal(staleRes.error.details.ref, "e1");
+  assert.equal(staleRes.error.details.stale, true);
+});

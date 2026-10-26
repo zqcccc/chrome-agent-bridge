@@ -26,8 +26,8 @@ function mockRpc() {
   const seen = [];
   return {
     seen,
-    ev: async (_tabId, expr) => { seen.push(expr); return "1"; },
-    evJson: async (_tabId, expr) => { seen.push(expr); return { ok: true, len: 5, count: 0, items: [] }; },
+    ev: async (_tabId, expr) => { seen.push(expr); return { ok: true, len: 5, count: 1, items: [], dialog: 1, loader: false }; },
+    evJson: async (_tabId, expr) => { seen.push(expr); return { ok: true, len: 5, count: 1, items: [], dialog: 1, loader: false }; },
     call: async () => ({}),
     clickReal: async () => {},
     attach: async () => {},
@@ -71,7 +71,7 @@ console.log("\n== 2. Headline 写入（无 aria-label 的 TipTap 字段） ==");
 console.log("\n== 3. 区块读取（id 解析不能依赖被吃坏的正则） ==");
 {
   const rpc = mockRpc();
-  await readSection(rpc, 1, { slug: "https://www.linkedin.com/in/example", section: "experience" });
+  await readSection(rpc, 1, { slug: "https://www.linkedin.com/in/example", section: "experience", timeoutMs: 200 });
   assertAllParse(rpc.seen, "readSection");
 
   // 关键断言：id 解析必须用字符串切分（本仓库踩过 \d 被吃成 d 的坑）

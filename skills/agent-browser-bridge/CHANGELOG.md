@@ -1,6 +1,27 @@
 # 版本与更新（扩展 + 本地桥）
 
-## 未发布：captcha 子技能 + 技能工作循环改写 + 两处脚本修复
+## 0.3.13：Agent 易用性全面升级（原子 CDP · 交互 Delta · 元素 ref · 一键读取 · 阻断诊断 · 内存错情）
+
+围绕 `host.log` 33.5 万行真实运行数据暴露的高频痛点，一次性升级扩展、本地桥、客户端与 CLI：
+
+1. **扩展内原子 CDP 操作（消除 80% 冗余往返与调试横条常驻）**：
+   - 新增 `page.evalCdp`、`page.clickReal`（支持 `{ selector }` / `{ ref }` 或 `{ x, y }`）、`page.typeReal`（自动聚焦 + 清空 + `Input.insertText` + 回读校验 `verified`）、`page.uploadFile`（单次完成 `DOM.getDocument` → `querySelector` → `setFileInputFiles`）。
+   - `scripts/lib/bridge.mjs` 的 `attach(tabId)` 缓存已建立的会话，消除重复 `session.attach` 往返；页面导航断连时自动重连重试；进程退出自动释放全部 CDP 会话与 Tab 租约，内置 `unhandledRejection` / `uncaughtException` 停止码（3）守护。
+2. **交互动作返回增量状态摘要（Action Delta）**：
+   - `page.click`、`page.clickReal`、`page.type`、`page.typeReal`、`page.press`、`page.select` 均在响应中附带 `delta: { urlChanged, url, titleChanged, modalOpened, modalClosed, activeTag, activeValue, mutationCount }`，单次调用即可验证操作是否生效。
+3. **`page.snapshot` 持久化元素引用（`ref`）与 `compact` 紧凑模式**：
+   - 在 isolated world 内存中为可见交互元素分配稳定短标号（如 `e1`、`e2`，不改页面 DOM 属性、零指纹暴露），支持 `mode: "compact"` 输出单行紧凑列表（节省 70% 上下文 Token）。
+   - `click` / `type` / `hover` / `select` / `clickReal` / `typeReal` 支持 `{ ref: "e12" }` 或选择器 `"@e12"` 直接定位；元素脱离 DOM 时报 `STALE_ELEMENT_REF`，消除下标漂移误点。
+4. **一键读取 `page.read` 与跨站点通用 `blocker` 阻断诊断**：
+   - `page.read`（及 CLI `read <url>`）一次调用完成打开/复用后台标签页、等待就绪、提取正文与主链接；若后台标签页因 rAF 暂停未渲染正文，自动临时调用 `page.ensureActive` 唤醒重读并归还标签页，读取完毕自动关闭临时标签页。
+   - `page.inspect { focus: "overview" }` 与 `page.read` 自动识别 `cloudflare` / `captcha` / `login_wall` / `dismissible_modal` 四类阻断状态。
+5. **本地桥 `host.log` 5MB 自动轮转与 `bridge.recentErrors`（`/errors`）**：
+   - `relay/host.js` 在日志超过 5MB 时自动保留尾部 64KB 并轮转至 `host.log.1`。
+   - 新增 host 内存近期错误环形缓冲（最近 100 条），支持 `GET /errors`、RPC `bridge.recentErrors` 与 `cli.mjs errors [tabId]` 按 `tabId` / `code` 过滤查询并输出错误码统计分布 `byCode`。
+6. **统一 `agent/client.mjs` 与 `scripts/lib/bridge.mjs` 环境变量与能力，精简 `SKILL.md`**：
+   - 两套客户端统一兼容 `BRIDGE_TOKEN` / `AGENT_BRIDGE_TOKEN` 与 `BRIDGE_PORT` / `AGENT_BRIDGE_PORT`；`cli.mjs shot` 默认输出改为 `.scratch/screenshots/`。
+
+## 0.3.12+（文档与子技能）：captcha 子技能 + 技能工作循环改写 + 两处脚本修复
 
 **新增 `captcha/` 子技能**：`captcha/SKILL.md` 与 `captcha/scripts/cf-wait.mjs`（识别挑战页 → 停止驱动 → 等待自动通过 → 需要点击时把 tab 交用户人工完成并轮询恢复）。
 
@@ -235,7 +256,7 @@ WS 分片与背压 / host-扩展副作用清单契约）、`test-content-stop.mj
 
 | 部件 | 版本 | 版本号来源 |
 |---|---|---|
-| 扩展 | **0.3.12** | `extension/manifest.json`（唯一事实来源） |
+| 扩展 | **0.3.13** | `extension/manifest.json`（唯一事实来源） |
 | 本地桥 host | 同扩展 | 启动时读 `extension/manifest.json`（不单独维护） |
 | 本 skill | 随 ClawHub 发布 | — |
 
@@ -460,6 +481,7 @@ await rpc.scrollLoad(tabId, { y: 99999, expectGrowth: true });
 | 「● Agent 接管中」标题/badge 不消失 | 0.3.1 |
 | `tabs.prepare` 返回 `UNKNOWN_METHOD` | 0.3.0 |
 | `page.waitForReady` 返回 `UNKNOWN_METHOD` | 0.3.3 |
+| `page.read` / `page.clickReal` / `page.typeReal` / `page.uploadFile` / `page.evalCdp` 返回 `UNKNOWN_METHOD` | **0.3.13** |
 | `tabs.resolve` 返回 `UNKNOWN_METHOD` | 0.3.9 |
 | chatgpt.com / github.com 上 `page.evaluate` 被 CSP 拦 | 0.3.3 |
 

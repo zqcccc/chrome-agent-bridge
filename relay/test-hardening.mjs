@@ -263,7 +263,7 @@ test("#1 token: 空 token 文件 → 重新生成随机值（而不是空凭据�
   assert.ok(await waitReady(h.port), `host 应启动；输出: ${h.out()}`);
   const token = fs.readFileSync(path.join(dir, "token"), "utf8").trim();
   assert.ok(token.length >= 16, `应生成足够长的随机 token，实际长度 ${token.length}`);
-  const ok = await httpReq(h.port, "POST", "/rpc", { method: "tabs.list" }, { Authorization: `Bearer ${token}` });
+  const ok = await httpReq(h.port, "POST", "/rpc", { method: "agent.stopStatus" }, { Authorization: `Bearer ${token}` });
   assert.equal(ok.status, 200, "新 token 必须立即生效");
   await stopHost(h);
 });
@@ -273,9 +273,9 @@ test("#1 token: 环境变量提供的合法 token 可用（且不碰用户真实
   const token = crypto.randomBytes(24).toString("hex");
   const h = await startHost({ home, env: { AGENT_BRIDGE_TOKEN: token } });
   assert.ok(await waitReady(h.port), `host 应启动；输出: ${h.out()}`);
-  const bad = await httpReq(h.port, "POST", "/rpc", { method: "tabs.list" }, { Authorization: "Bearer dev" });
+  const bad = await httpReq(h.port, "POST", "/rpc", { method: "agent.stopStatus" }, { Authorization: "Bearer dev" });
   assert.equal(bad.status, 401, "固定密码 dev 必须无效");
-  const good = await httpReq(h.port, "POST", "/rpc", { method: "tabs.list" }, { Authorization: `Bearer ${token}` });
+  const good = await httpReq(h.port, "POST", "/rpc", { method: "agent.stopStatus" }, { Authorization: `Bearer ${token}` });
   assert.equal(good.status, 200);
   await stopHost(h);
 });
@@ -940,5 +940,39 @@ test("#4 客户端：stop/resume 走独立路由（扩展离线时也能停）",
   assert.equal(blocked.code, "AGENT_STOPPED");
   const r = await bridge.resume(null);
   assert.equal(r.result.stopped, false);
+  await stopHost(h);
+});
+
+test("#6 host 内存近期错误环形缓冲：bridge.recentErrors 与 GET /errors 可按 tabId/code 查询", async () => {
+  const home = tmpHome();
+  const h = await startHost({ home });
+  assert.ok(await waitReady(h.port));
+  const token = fs.readFileSync(path.join(home, ".chrome-agent-bridge", "token"), "utf8").trim();
+  const ext = await fakeExtension(h.port, token, async () => null, { manual: true });
+  const bridge = new Bridge({ port: h.port, token, timeoutMs: 5000, agentId: "t-errbuf" });
+
+  // 制造一条带 details 的业务错误
+  const p = bridge.rpc("page.click", { tabId: 88, ref: "e99" }).catch((e) => e);
+  const req = await ext.ws.next();
+  ext.ws.send({
+    id: req.id,
+    ok: false,
+    error: { code: "STALE_ELEMENT_REF", message: "元素 e99 已从 DOM 移除", details: { ref: "e99", stale: true } },
+  });
+  await p;
+
+  const errs = await bridge.recentErrors({ tabId: 88, limit: 5 });
+  assert.equal(errs.count, 1);
+  assert.equal(errs.byCode.STALE_ELEMENT_REF, 1);
+  assert.equal(errs.errors[0].code, "STALE_ELEMENT_REF");
+  assert.equal(errs.errors[0].tabId, 88);
+  assert.deepEqual(errs.errors[0].details, { ref: "e99", stale: true });
+
+  const httpErrs = await httpReq(h.port, "GET", "/errors?code=STALE_ELEMENT_REF", null, { Authorization: `Bearer ${token}` });
+  assert.equal(httpErrs.status, 200);
+  assert.equal(httpErrs.body.ok, true);
+  assert.equal(httpErrs.body.count, 1);
+
+  ext.close();
   await stopHost(h);
 });

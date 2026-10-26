@@ -14,7 +14,8 @@ import http from "node:http";
 const TOKEN_FILE = path.join(os.homedir(), ".chrome-agent-bridge", "token");
 
 function loadToken() {
-  if (process.env.AGENT_BRIDGE_TOKEN) return process.env.AGENT_BRIDGE_TOKEN;
+  if (process.env.BRIDGE_TOKEN) return process.env.BRIDGE_TOKEN.trim();
+  if (process.env.AGENT_BRIDGE_TOKEN) return process.env.AGENT_BRIDGE_TOKEN.trim();
   try { return fs.readFileSync(TOKEN_FILE, "utf8").trim(); } catch (e) { return ""; }
 }
 
@@ -48,7 +49,7 @@ export class BridgeTimeoutError extends BridgeError {
 export class Bridge {
   constructor(opts = {}) {
     this.host = opts.host || process.env.AGENT_BRIDGE_HOST || "127.0.0.1";
-    this.port = opts.port || Number(process.env.AGENT_BRIDGE_PORT) || 8778;
+    this.port = opts.port || Number(process.env.BRIDGE_PORT || process.env.AGENT_BRIDGE_PORT) || 8778;
     this.token = opts.token || loadToken();
     this.timeoutMs = opts.timeoutMs || 60000;
     this.agentId = opts.agentId || process.env.AGENT_ID || `agent-${process.pid}`;
@@ -138,6 +139,7 @@ export class Bridge {
 
   // ---------- 状态 ----------
   status() { return this._request("/status"); }
+  recentErrors(opts = {}) { return this.rpc("bridge.recentErrors", opts); }
   // ---------- 标签页 ----------
   async list() { const r = await this.rpc("tabs.list"); return r.tabs; }
   async active() { const r = await this.rpc("tabs.active"); return r.tab; }
@@ -170,12 +172,34 @@ export class Bridge {
     const r = await this.rpc("page.evaluate", { tabId, expression, world: opts.world, awaitPromise: opts.awaitPromise });
     return r.result;
   }
-  async click(tabId, selector, opts = {}) { return this.rpc("page.click", { tabId, selector, by: opts.by || "css" }); }
-  async type(tabId, selector, text, opts = {}) { return this.rpc("page.type", { tabId, selector, text, by: opts.by || "css", clear: opts.clear }); }
+  async evalCdp(tabId, expression, opts = {}) {
+    const r = await this.rpc("page.evalCdp", { tabId, expression, awaitPromise: opts.awaitPromise, userGesture: opts.userGesture });
+    return r && r.result !== undefined ? r.result : r;
+  }
+  async read(urlOrOpts, opts = {}) {
+    const params = typeof urlOrOpts === "string" ? { url: urlOrOpts, ...opts } : { ...(urlOrOpts || {}) };
+    return this.rpc("page.read", params, { timeoutMs: (params.timeoutMs || 45000) + 10000 });
+  }
+  async click(tabId, selector, opts = {}) { return this.rpc("page.click", { tabId, selector, by: opts.by || "css", ref: opts.ref }); }
+  async clickReal(tabId, targetOrX, y, opts = {}) {
+    const params = typeof targetOrX === "number"
+      ? { tabId, x: Math.round(targetOrX), y: Math.round(y), ...(opts || {}) }
+      : { tabId, selector: String(targetOrX), ...(typeof y === "object" && y ? y : {}) };
+    return this.rpc("page.clickReal", params);
+  }
+  async type(tabId, selector, text, opts = {}) { return this.rpc("page.type", { tabId, selector, text, by: opts.by || "css", clear: opts.clear, ref: opts.ref }); }
+  async typeReal(tabId, selector, text, opts = {}) { return this.rpc("page.typeReal", { tabId, selector, text, ...opts }); }
+  async uploadFile(tabId, selector, files) {
+    const list = Array.isArray(files) ? files : [files];
+    return this.rpc("page.uploadFile", { tabId, selector: selector || 'input[type="file"]', files: list });
+  }
   async press(tabId, key, opts = {}) { return this.rpc("page.press", { tabId, key, ...opts }); }
   async scroll(tabId, opts = {}) { return this.rpc("page.scroll", { tabId, ...opts }); }
-  async hover(tabId, selector, opts = {}) { return this.rpc("page.hover", { tabId, selector, by: opts.by || "css" }); }
-  async select(tabId, selector, value, opts = {}) { return this.rpc("page.select", { tabId, selector, value, by: opts.by || "css", multiple: opts.multiple }); }
+  async scrollChecked(tabId, opts = {}) { return this.rpc("page.scroll", { tabId, ...opts, checked: true }); }
+  async ensureActive(tabId, opts = {}) { return this.rpc("page.ensureActive", { tabId, ...opts }); }
+  async restoreActive(tabId) { return this.rpc("page.restoreActive", { tabId }); }
+  async hover(tabId, selector, opts = {}) { return this.rpc("page.hover", { tabId, selector, by: opts.by || "css", ref: opts.ref }); }
+  async select(tabId, selector, value, opts = {}) { return this.rpc("page.select", { tabId, selector, value, by: opts.by || "css", multiple: opts.multiple, ref: opts.ref }); }
   async waitFor(tabId, opts = {}) { return this.rpc("page.waitFor", { tabId, ...opts }); }
 
   // 截图：默认存到本地文件，返回 { path, format, captureMode, image }
@@ -184,6 +208,7 @@ export class Bridge {
     const r = await this.rpc("page.screenshot", { tabId, format, quality: opts.quality, captureBeyondViewport: opts.captureBeyondViewport });
     if (outPath) {
       const b64 = r.image.split(",")[1];
+      fs.mkdirSync(path.dirname(path.resolve(outPath)), { recursive: true });
       fs.writeFileSync(outPath, Buffer.from(b64, "base64"));
       return { ...r, path: outPath };
     }

@@ -32,8 +32,8 @@ const cmp = (a, b) => {
 };
 check(`扩展版本 >= ${MIN_VERSION.join(".")}（已加载修复后的代码）`, cmp(ver, MIN_VERSION.join(".")) >= 0, `实际 ${ver}`);
 
-// 1. 之前 128 次 UNKNOWN_METHOD 的三个真方法
-for (const m of ["page.waitForReady", "page.waitForUrl", "page.waitForSelector"]) {
+// 1. 之前 128 次 UNKNOWN_METHOD 的三个真方法 + v0.3.13 新增原子方法
+for (const m of ["page.waitForReady", "page.waitForUrl", "page.waitForSelector", "page.evalCdp", "page.clickReal", "page.typeReal", "page.uploadFile", "page.read", "bridge.recentErrors"]) {
   const r = await rpc(m, { tabId: 1, timeoutMs: 1, match: "x", selector: "body" });
   const isUnknown = r.error?.code === "UNKNOWN_METHOD";
   check(`${m} 已注册`, !isUnknown, isUnknown ? "仍是 UNKNOWN_METHOD（扩展未重载）" : `返回 ${r.error?.code || "ok"}`);

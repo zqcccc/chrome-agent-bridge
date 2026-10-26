@@ -15,6 +15,7 @@
 //   node cli.mjs cursor <tabId> move <x> <y>
 "use strict";
 
+import path from "node:path";
 import { Bridge, BridgeError } from "./client.mjs";
 
 const bridge = new Bridge();
@@ -99,15 +100,46 @@ async function main() {
       console.log(`#${r.tabId}  ${r.tab.url}  ${r.reused ? (r.navigated ? "复用已有 tab" : "已在该 tab 打开") : "静默新开后台 tab"}  ${r.reason}`);
       break;
     }
+    case "read": {
+      const target = rest[0];
+      if (!target) return die(new Error("用法: cli read <url|--tab tabId> [--keep-open] [--json]"));
+      const keepOpen = rest.includes("--keep-open");
+      const asJson = rest.includes("--json");
+      let params = { keepOpen };
+      if (target === "--tab") {
+        params.tabId = Number(rest[1]);
+      } else if (/^\d+$/.test(target)) {
+        params.tabId = Number(target);
+      } else {
+        params.url = target;
+      }
+      const r = await bridge.read(params);
+      if (asJson) {
+        console.log(JSON.stringify(r, null, 2));
+        break;
+      }
+      console.log(`== ${r.title || "(无标题)"} ==`);
+      console.log(`URL: ${r.url}  (tab #${r.tabId}${r.closed ? ", 已自动关闭" : ""}${r.activatedForRender ? ", 已自动唤醒渲染" : ""})`);
+      if (r.blocker) console.log(`⚠ 阻断告警: [${r.blocker.type}] ${r.blocker.reason} → ${r.blocker.action}`);
+      console.log(`\n${(r.text || "").slice(0, 6000)}`);
+      if (r.links && r.links.length) {
+        console.log(`\n── 主要链接（前 ${Math.min(10, r.links.length)} 条）──`);
+        for (const l of r.links.slice(0, 10)) console.log(`  · ${short(l.text, 40)} -> ${l.href}`);
+      }
+      break;
+    }
     case "snap": {
       const [tabId, mode] = rest;
-      if (!tabId) return die(new Error("用法: cli snap <tabId> [mode]"));
-      const s = await bridge.snapshot(Number(tabId), { mode: mode || "elements" });
+      if (!tabId) return die(new Error("用法: cli snap <tabId> [compact|elements|a11y|text|full]"));
+      const s = await bridge.snapshot(Number(tabId), { mode: mode || "compact" });
       console.log(`${s.url}  (${s.title})  ready=${s.readyState}`);
-      if (s.elements) {
+      if (s.compact) {
+        console.log(`交互元素 ${s.elementCount ?? (s.elements ? s.elements.length : 0)} 个（可用 @e1 直接 click/type）:`);
+        console.log(s.compact.split("\n").slice(0, 50).join("\n"));
+      } else if (s.elements) {
         console.log(`交互元素 ${s.elements.length} 个:`);
         for (const el of s.elements.slice(0, 40)) {
-          console.log(`  [${el.index}] <${el.tag}> role=${el.role || "-"} text="${short(el.label || el.text, 30)}" ${el.sensitive ? "🔒敏感 " : ""}css=${short(el.css, 40)}`);
+          console.log(`  [${el.ref || el.index}] <${el.tag}> role=${el.role || "-"} text="${short(el.label || el.text, 30)}" ${el.sensitive ? "🔒敏感 " : ""}css=${short(el.css, 40)}`);
         }
       }
       if (s.text) console.log(`\n页面文本(${s.text.length}字符):\n${s.text.slice(0, 600)}`);
@@ -116,7 +148,8 @@ async function main() {
     case "shot": {
       const [tabId, out] = rest;
       if (!tabId) return die(new Error("用法: cli shot <tabId> [out.png]"));
-      const r = await bridge.screenshot(Number(tabId), out || `/tmp/bridge-shot-${Date.now()}.png`);
+      const defaultOut = path.join(process.cwd(), ".scratch", "screenshots", `bridge-shot-${Date.now()}.png`);
+      const r = await bridge.screenshot(Number(tabId), out || defaultOut);
       console.log(`saved ${r.path} (${r.captureMode})`);
       break;
     }
@@ -125,6 +158,22 @@ async function main() {
       if (!tabId || !exprParts.length) return die(new Error("用法: cli eval <tabId> <expression>"));
       const r = await bridge.evaluate(Number(tabId), exprParts.join(" "));
       console.log(JSON.stringify(r, null, 2).slice(0, 3000));
+      break;
+    }
+    case "eval-cdp": {
+      const [tabId, ...exprParts] = rest;
+      if (!tabId || !exprParts.length) return die(new Error("用法: cli eval-cdp <tabId> <expression>"));
+      const r = await bridge.evalCdp(Number(tabId), exprParts.join(" "));
+      console.log(typeof r === "string" ? r : JSON.stringify(r, null, 2));
+      break;
+    }
+    case "errors": {
+      const tabId = rest[0] && /^\d+$/.test(rest[0]) ? Number(rest[0]) : undefined;
+      const r = await bridge.recentErrors({ tabId, limit: 20 });
+      console.log(`近期错误：共 ${r.total} 条（匹配 ${r.matched} 条）  分布: ${JSON.stringify(r.byCode)}`);
+      for (const e of r.errors) {
+        console.log(`  [${e.at}] tab=${e.tabId ?? "-"} ${e.method} -> ${e.code}${e.elapsedMs != null ? ` (${e.elapsedMs}ms)` : ""}${e.message ? `: ${short(e.message, 80)}` : ""}`);
+      }
       break;
     }
     case "record": {
@@ -191,16 +240,54 @@ async function main() {
     }
     case "click": {
       const [tabId, selector, by] = rest;
-      if (!tabId || !selector) return die(new Error("用法: cli click <tabId> <selector> [css|xpath|text|index]"));
+      if (!tabId || !selector) return die(new Error("用法: cli click <tabId> <selector|@ref> [css|xpath|text|index|ref]"));
       const r = await bridge.click(Number(tabId), selector, { by });
       console.log("clicked:", JSON.stringify(r));
       break;
     }
+    case "click-real": {
+      const [tabId, arg1, arg2] = rest;
+      if (!tabId || !arg1) return die(new Error("用法: cli click-real <tabId> <selector|@ref | x y>"));
+      const isCoord = /^-?\d+(\.\d+)?$/.test(arg1) && arg2 !== undefined && /^-?\d+(\.\d+)?$/.test(arg2);
+      const r = isCoord
+        ? await bridge.clickReal(Number(tabId), Number(arg1), Number(arg2))
+        : await bridge.clickReal(Number(tabId), arg1, arg2 ? { by: arg2 } : {});
+      console.log("clicked (cdp):", JSON.stringify(r));
+      break;
+    }
     case "type": {
       const [tabId, selector, ...textParts] = rest;
-      if (!tabId || !selector) return die(new Error("用法: cli type <tabId> <selector> <text>"));
+      if (!tabId || !selector) return die(new Error("用法: cli type <tabId> <selector|@ref> <text>"));
       const r = await bridge.type(Number(tabId), selector, textParts.join(" "));
       console.log("typed:", JSON.stringify(r));
+      break;
+    }
+    case "type-real": {
+      const [tabId, selector, ...textParts] = rest;
+      if (!tabId || !selector || !textParts.length) return die(new Error("用法: cli type-real <tabId> <selector|@ref> <text>"));
+      const r = await bridge.typeReal(Number(tabId), selector, textParts.join(" "));
+      console.log("typed (cdp):", JSON.stringify(r));
+      break;
+    }
+    case "upload": {
+      const [tabId, selector, ...files] = rest;
+      if (!tabId || !selector || !files.length) return die(new Error("用法: cli upload <tabId> <selector> <file1> [file2...]"));
+      const r = await bridge.uploadFile(Number(tabId), selector, files);
+      console.log("uploaded:", JSON.stringify(r));
+      break;
+    }
+    case "ensure-active": {
+      const [tabId, restoreMs] = rest;
+      if (!tabId) return die(new Error("用法: cli ensure-active <tabId> [restoreAfterMs]"));
+      const r = await bridge.ensureActive(Number(tabId), restoreMs ? { restoreAfterMs: Number(restoreMs) } : {});
+      console.log(JSON.stringify(r));
+      break;
+    }
+    case "restore-active": {
+      const [tabId] = rest;
+      if (!tabId) return die(new Error("用法: cli restore-active <tabId>"));
+      const r = await bridge.restoreActive(Number(tabId));
+      console.log(JSON.stringify(r));
       break;
     }
     case "reload-ext": {
@@ -271,7 +358,7 @@ async function main() {
       break;
     }
     default:
-      console.log(`未知命令: ${cmd}\n可用命令: status / tabs / active / open / snap / shot / eval / wait / reload-ext / verify / click / type / press / scroll / cursor / listen`);
+      console.log(`未知命令: ${cmd}\n可用命令: status / errors / tabs / active / open / read / snap / shot / eval / eval-cdp / inspect / record / wait / reload-ext / verify / click / click-real / type / type-real / upload / press / scroll / ensure-active / restore-active / stop / resume / stop-status / cursor / listen`);
   }
 }
 

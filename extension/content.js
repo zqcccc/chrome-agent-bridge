@@ -151,12 +151,69 @@
     return t.slice(0, max);
   }
 
+  // ---------- 持久化元素引用（ref） ----------
+  // 在 isolated world 内存中维护稳定短标号（如 e1, e2），不向页面 DOM 注入任何属性（零指纹暴露）。
+  // 同一个 DOM 节点在多次 snapshot 之间保持同一 ref；节点脱离文档后定位时直报 STALE_ELEMENT_REF，
+  // 彻底解决 by="index" 因页面局部动态变化导致下标错位误点的问题。
+  const refMap = new Map();       // "e1" -> Element
+  const elToRef = typeof WeakMap !== "undefined" ? new WeakMap() : null;
+  let refSeq = 0;
+
+  function getOrAssignRef(el) {
+    if (!el || typeof el !== "object") return null;
+    if (elToRef && elToRef.has(el)) {
+      const existing = elToRef.get(el);
+      refMap.set(existing, el);
+      return existing;
+    }
+    const id = "e" + (++refSeq);
+    if (elToRef) elToRef.set(el, id);
+    refMap.set(id, el);
+    // 防止单页长期运行无限增长：超过 5000 条时清理已脱离 DOM 的旧引用
+    if (refMap.size > 5000) {
+      for (const [k, node] of refMap) {
+        if (!node || node.isConnected === false) refMap.delete(k);
+      }
+    }
+    return id;
+  }
+
+  function lookupRef(rawRef) {
+    const key = String(rawRef || "").trim().replace(/^@/, "");
+    if (!key) throw { code: "BAD_SELECTOR", message: "缺少元素 ref" };
+    const el = refMap.get(key);
+    if (!el) {
+      throw {
+        code: "NOT_FOUND",
+        message: `未找到元素 ref=${key}（请先调用 page.snapshot 获取最新 ref）`,
+        details: { ref: key, stale: false },
+      };
+    }
+    if (el.isConnected === false) {
+      refMap.delete(key);
+      throw {
+        code: "STALE_ELEMENT_REF",
+        message: `元素 ${key} 已从 DOM 移除，请重新调用 page.snapshot`,
+        details: { ref: key, stale: true },
+      };
+    }
+    return el;
+  }
+
   // ---------- 元素查找 ----------
   function findElement(sel, scope = document) {
+    if (sel && sel.ref) return lookupRef(sel.ref);
     const by = sel.by || "css";
     const value = sel.selector !== undefined ? sel.selector : sel.value;
     if (value === undefined || value === null || value === "") {
       throw { code: "BAD_SELECTOR", message: "缺少 selector" };
+    }
+
+    if (by === "ref") return lookupRef(value);
+    if (by === "css" && typeof value === "string") {
+      const trimmed = value.trim();
+      if (/^@e\d+$/.test(trimmed)) return lookupRef(trimmed.slice(1));
+      if (/^e\d+$/.test(trimmed) && refMap.has(trimmed)) return lookupRef(trimmed);
     }
 
     let el = null;
@@ -255,7 +312,9 @@
 
       if (INTERACTIVE_TAGS.includes(tag) || isInteractive(el)) {
         const name = readableName(el);
+        const ref = getOrAssignRef(el);
         out.push({
+          ref,
           index: out.length,
           tag,
           role: role || inferRole(el),
@@ -280,6 +339,30 @@
       }
     }
     return out;
+  }
+
+  function formatCompactElements(elements, maxItems = 200) {
+    const lines = [];
+    const list = (elements || []).slice(0, maxItems);
+    for (const el of list) {
+      const parts = [`[${el.ref || el.index}]`, el.role || el.tag];
+      const label = (el.label || el.text || el.placeholder || "").replace(/\s+/g, " ").trim();
+      if (label) parts.push(JSON.stringify(label.slice(0, 60)));
+      if (el.value !== null && el.value !== undefined && el.value !== "" && el.value !== label) {
+        parts.push(`val=${JSON.stringify(String(el.value).slice(0, 40))}`);
+      }
+      if (el.href && /^https?:/i.test(el.href)) {
+        parts.push(`href=${JSON.stringify(el.href.slice(0, 80))}`);
+      }
+      if (el.disabled) parts.push("[disabled]");
+      if (el.checked === true) parts.push("[checked]");
+      if (el.rect) parts.push(`@(${el.rect.centerX},${el.rect.centerY})`);
+      lines.push(parts.join(" "));
+    }
+    if ((elements || []).length > maxItems) {
+      lines.push(`... 其余 ${elements.length - maxItems} 个元素已省略`);
+    }
+    return lines.join("\n");
   }
 
   function inferRole(el) {
@@ -360,8 +443,11 @@
       time: Date.now(),
     };
 
-    if (mode === "elements" || mode === "full") {
-      result.elements = collectElements(document);
+    if (mode === "elements" || mode === "full" || mode === "compact") {
+      const els = collectElements(document);
+      if (mode !== "compact") result.elements = els;
+      result.elementCount = els.length;
+      result.compact = formatCompactElements(els, opts.maxElements || 200);
     }
 
     if (mode === "a11y" || mode === "full") {
@@ -372,7 +458,7 @@
       result.truncated = out.nodes > maxNodes;
     }
 
-    if (includeText && (mode === "text" || mode === "full")) {
+    if (includeText && (mode === "text" || mode === "full" || mode === "compact")) {
       result.text = (document.body && document.body.innerText || "").slice(0, textMax);
     }
 
@@ -383,34 +469,149 @@
     return result;
   }
 
+  // ---------- 交互增量状态（Action Delta） ----------
+  const MODAL_SELECTOR = '[role="dialog"], [aria-modal="true"], dialog[open], .note-detail-mask, [class*="modal"][class*="mask"], [class*="dialog"][class*="open"]';
+
+  function hasVisibleModal() {
+    try {
+      const nodes = document.querySelectorAll(MODAL_SELECTOR);
+      for (const n of nodes) {
+        if (visible(n)) return true;
+      }
+    } catch (e) { /* noop */ }
+    return false;
+  }
+
+  function readElementCurrentValue(el) {
+    if (!el || typeof el !== "object") return null;
+    if (isSensitive(el)) return "[value redacted]";
+    if (el.value !== undefined && typeof el.value === "string") return el.value.slice(0, 200);
+    if (el.isContentEditable) return String(el.innerText || el.textContent || "").trim().slice(0, 200);
+    return null;
+  }
+
+  async function withActionDelta(runFn) {
+    const beforeUrl = location.href;
+    const beforeTitle = document.title;
+    const beforeModal = hasVisibleModal();
+    const mutStats = { added: 0, removed: 0, textChanged: 0 };
+    let obs = null;
+    try {
+      if (typeof MutationObserver !== "undefined" && document.documentElement) {
+        obs = new MutationObserver((muts) => {
+          for (const m of muts) {
+            if (m.type === "childList") {
+              mutStats.added += (m.addedNodes ? m.addedNodes.length : 0);
+              mutStats.removed += (m.removedNodes ? m.removedNodes.length : 0);
+            } else if (m.type === "characterData") {
+              mutStats.textChanged++;
+            }
+          }
+        });
+        obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+      }
+    } catch (e) { /* 桩环境忽略 */ }
+
+    try {
+      const res = await runFn();
+      // 真实浏览器中留 45ms 让同步事件触发的微任务/React 状态落地；Node 沙箱单测 0ms 直通
+      const isNodeTest = typeof navigator !== "undefined" && navigator.userAgent === "node-test";
+      if (!isNodeTest) {
+        await new Promise((r) => setTimeout(r, 45));
+      }
+      if (obs) { obs.disconnect(); obs = null; }
+      const afterUrl = location.href;
+      const afterTitle = document.title;
+      const afterModal = hasVisibleModal();
+      const activeEl = document.activeElement;
+      const delta = {
+        urlChanged: afterUrl !== beforeUrl,
+        url: afterUrl,
+        titleChanged: afterTitle !== beforeTitle,
+        modalOpened: !beforeModal && afterModal,
+        modalClosed: beforeModal && !afterModal,
+        activeTag: activeEl && activeEl.tagName ? activeEl.tagName.toLowerCase() : null,
+        activeValue: readElementCurrentValue(activeEl),
+        mutationCount: mutStats.added + mutStats.removed + mutStats.textChanged,
+        mutations: mutStats,
+      };
+      return Object.assign({}, res, { delta });
+    } finally {
+      if (obs) { try { obs.disconnect(); } catch (e) { /* noop */ } }
+    }
+  }
+
   // ---------- 操作 ----------
   function doClick(args) {
-    const el = findElement(args);
-    if (el instanceof HTMLAnchorElement && el.target && el.target !== "_self") {
-      // 保留原有新标签页行为
+    return withActionDelta(() => {
+      const el = findElement(args);
+      const ref = getOrAssignRef(el);
+      if (typeof HTMLAnchorElement !== "undefined" && el instanceof HTMLAnchorElement && el.target && el.target !== "_self") {
+        // 保留原有新标签页行为
+        clickElement(el);
+        return { ok: true, ref, tag: el.tagName, text: shortText(el, 80) };
+      }
       clickElement(el);
-      return { ok: true, tag: el.tagName, text: shortText(el, 80) };
-    }
-    clickElement(el);
-    return { ok: true, tag: el.tagName, text: shortText(el, 80), xpath: getXPath(el) };
+      return { ok: true, ref, tag: el.tagName, text: shortText(el, 80), xpath: getXPath(el) };
+    });
   }
 
   function doType(args) {
+    return withActionDelta(() => {
+      const el = findElement(args);
+      const ref = getOrAssignRef(el);
+      const text = args.text !== undefined ? args.text : args.value;
+      if (text === undefined) throw { code: "BAD_PARAMS", message: "缺少 text" };
+      el.focus();
+      if (el.isContentEditable) {
+        if (args.clear !== false) el.textContent = "";
+        const sel = window.getSelection();
+        if (sel && sel.selectAllChildren) sel.selectAllChildren(el);
+        if (typeof document.execCommand === "function") {
+          document.execCommand("insertText", false, text);
+        } else {
+          el.textContent = text;
+        }
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+      } else {
+        if (args.clear !== false) dispatchInput(el, "");
+        dispatchInput(el, text);
+      }
+      const curVal = readElementCurrentValue(el);
+      return { ok: true, ref, value: curVal };
+    });
+  }
+
+  // 供 background 原子 CDP 操作（page.clickReal / page.typeReal）调用的目标解析与预处理
+  function doResolveTarget(args) {
     const el = findElement(args);
-    const text = args.text !== undefined ? args.text : args.value;
-    if (text === undefined) throw { code: "BAD_PARAMS", message: "缺少 text" };
-    el.focus();
-    if (el.isContentEditable) {
-      el.textContent = "";
-      const sel = window.getSelection();
-      sel.selectAllChildren(el);
-      document.execCommand("insertText", false, text);
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-    } else {
-      if (args.clear !== false) dispatchInput(el, "");
-      dispatchInput(el, text);
+    const ref = getOrAssignRef(el);
+    if (typeof el.scrollIntoView === "function") {
+      el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
     }
-    return { ok: true, value: el.value !== undefined ? el.value.slice(0, 200) : null };
+    if (args.focus && typeof el.focus === "function") {
+      el.focus({ preventScroll: true });
+    }
+    if (args.clear) {
+      if (el.isContentEditable) {
+        el.textContent = "";
+        try { el.dispatchEvent(new Event("input", { bubbles: true })); } catch (e) { /* noop */ }
+      } else if (el.value !== undefined) {
+        dispatchInput(el, "");
+      }
+    }
+    const r = rectOf(el);
+    return {
+      ok: true,
+      ref,
+      tag: el.tagName,
+      text: shortText(el, 80),
+      isContentEditable: !!el.isContentEditable,
+      value: readElementCurrentValue(el),
+      x: r.centerX,
+      y: r.centerY,
+      rect: r,
+    };
   }
 
   const KEYMAP = {
@@ -422,26 +623,28 @@
   };
 
   function doPress(args) {
-    const keyRaw = args.key || args.value;
-    if (!keyRaw) throw { code: "BAD_PARAMS", message: "缺少 key" };
-    const key = KEYMAP[String(keyRaw).toLowerCase()] || String(keyRaw);
-    const target = args.selector ? findElement(args) : document.activeElement || document.body;
-    const opts = {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      key,
-      code: args.code || null,
-      ctrlKey: !!args.ctrl || !!args.control,
-      metaKey: !!args.meta || !!args.command,
-      altKey: !!args.alt,
-      shiftKey: !!args.shift,
-      repeat: false,
-    };
-    target.dispatchEvent(new KeyboardEvent("keydown", opts));
-    target.dispatchEvent(new KeyboardEvent("keypress", opts));
-    target.dispatchEvent(new KeyboardEvent("keyup", opts));
-    return { ok: true, key, target: target.tagName };
+    return withActionDelta(() => {
+      const keyRaw = args.key || args.value;
+      if (!keyRaw) throw { code: "BAD_PARAMS", message: "缺少 key" };
+      const key = KEYMAP[String(keyRaw).toLowerCase()] || String(keyRaw);
+      const target = (args.selector || args.ref) ? findElement(args) : document.activeElement || document.body;
+      const opts = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        key,
+        code: args.code || null,
+        ctrlKey: !!args.ctrl || !!args.control,
+        metaKey: !!args.meta || !!args.command,
+        altKey: !!args.alt,
+        shiftKey: !!args.shift,
+        repeat: false,
+      };
+      target.dispatchEvent(new KeyboardEvent("keydown", opts));
+      target.dispatchEvent(new KeyboardEvent("keypress", opts));
+      target.dispatchEvent(new KeyboardEvent("keyup", opts));
+      return { ok: true, key, target: target.tagName };
+    });
   }
 
   function doScroll(args) {
@@ -481,21 +684,24 @@
   }
 
   function doSelect(args) {
-    const el = findElement(args);
-    if (!(el instanceof HTMLSelectElement)) {
-      throw { code: "NOT_SELECT", message: `元素不是 <select>（${el.tagName}）` };
-    }
-    const values = Array.isArray(args.values) ? args.values : [args.value || args.values];
-    const labels = Array.isArray(args.labels) ? args.labels : [];
-    for (let i = 0; i < el.options.length; i++) {
-      const opt = el.options[i];
-      if (values.includes(opt.value) || labels.includes(opt.text) || opt.text === args.label) {
-        opt.selected = true;
-        if (args.multiple) el.multiple = true;
+    return withActionDelta(() => {
+      const el = findElement(args);
+      const ref = getOrAssignRef(el);
+      if (typeof HTMLSelectElement !== "undefined" && !(el instanceof HTMLSelectElement) && el.tagName !== "SELECT") {
+        throw { code: "NOT_SELECT", message: `元素不是 <select>（${el.tagName}）` };
       }
-    }
-    el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-    return { ok: true, selected: Array.from(el.selectedOptions).map((o) => o.value) };
+      const values = Array.isArray(args.values) ? args.values : [args.value || args.values];
+      const labels = Array.isArray(args.labels) ? args.labels : [];
+      for (let i = 0; i < (el.options ? el.options.length : 0); i++) {
+        const opt = el.options[i];
+        if (values.includes(opt.value) || labels.includes(opt.text) || opt.text === args.label) {
+          opt.selected = true;
+          if (args.multiple) el.multiple = true;
+        }
+      }
+      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      return { ok: true, ref, selected: Array.from(el.selectedOptions || []).map((o) => o.value) };
+    });
   }
 
   function doWaitFor(args) {
@@ -685,7 +891,7 @@
   // 停止后 Agent 还要能观察页面才能判断「该等用户还是该恢复」。
   // （这与 relay/host.js 的 SIDE_EFFECT_METHODS、background.js 的闸门是同一个原则：
   //   拦写、不拦读，并且不能把恢复/观察的路径一起堵死。）
-  const MUTATING_ACTIONS = new Set(["click", "type", "press", "scroll", "hover", "focusEl", "select", "waitFor"]);
+  const MUTATING_ACTIONS = new Set(["click", "type", "press", "scroll", "hover", "focusEl", "select", "waitFor", "resolveTarget"]);
 
   // ---------- 消息入口 ----------
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -712,6 +918,7 @@
           case "focusEl": return doFocusEl(args);
           case "select": return doSelect(args);
           case "waitFor": return doWaitFor(args);
+          case "resolveTarget": return doResolveTarget(args);
           default: throw { code: "UNKNOWN_ACTION", message: `未知动作: ${action}` };
         }
       })

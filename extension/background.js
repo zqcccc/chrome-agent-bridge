@@ -240,6 +240,8 @@ const ERROR_DETAIL_KEYS = [
   // 停止类错误的细节（AGENT_STOPPED）：调用方靠 resumeWith 知道怎么恢复，
   // 靠 scope 知道是「整机停了」还是「只有这个 tab 停了」。
   "resumeWith", "scope", "stoppedAt", "reason", "action",
+  // 元素引用与页面阻断诊断细节
+  "ref", "stale", "blocker",
 ];
 function errorDetails(e) {
   if (!e || typeof e !== "object") return undefined;
@@ -371,6 +373,7 @@ const SIDE_EFFECT_METHODS = new Set([
   "page.click", "page.type", "page.press", "page.select", "page.scroll",
   "page.hover", "page.focusEl", "page.navigate", "page.back", "page.forward",
   "page.reload", "page.waitFor", "page.activateAndShot", "page.ensureActive",
+  "page.clickReal", "page.typeReal", "page.uploadFile",
   "tabs.create", "tabs.reload", "tabs.activate",
 ]);
 
@@ -521,6 +524,7 @@ function clearAllTabControlBadges() {
 const INTERACTIVE_METHODS = new Set([
   "page.click", "page.type", "page.press", "page.scroll",
   "page.hover", "page.focusEl", "page.waitFor", "page.select",
+  "page.clickReal", "page.typeReal", "page.uploadFile",
 ]);
 function isPageControlMethod(method) {
   return typeof method === "string" && method.startsWith("page.") && !method.startsWith("page.indicator.");
@@ -631,6 +635,8 @@ async function dispatch(method, params, caller) {
 
     case "page.snapshot": return pageSnapshot(params.tabId, params);
     case "page.evaluate": return pageEvaluate(params.tabId, params);
+    case "page.evalCdp": return pageEvalCdp(params.tabId, params);
+    case "page.read": return pageRead(params);
     case "page.inspect": return pageInspect(params.tabId, params);
     case "page.record.start": return pageRecordStart(params.tabId);
     case "page.record.stop": return pageRecordStop(params.tabId);
@@ -638,7 +644,10 @@ async function dispatch(method, params, caller) {
     case "page.record.get": return pageRecordGet(params.tabId, params);
     case "page.record.clear": return pageRecordClear(params.tabId);
     case "page.click": return pageAction(params.tabId, "click", params);
+    case "page.clickReal": return pageClickReal(params.tabId, params);
     case "page.type": return pageAction(params.tabId, "type", params);
+    case "page.typeReal": return pageTypeReal(params.tabId, params);
+    case "page.uploadFile": return pageUploadFile(params.tabId, params);
     case "page.press": return pageAction(params.tabId, "press", params);
     case "page.scroll": return params.checked ? pageScrollChecked(params.tabId, params) : pageAction(params.tabId, "scroll", params);
     case "page.hover": return pageAction(params.tabId, "hover", params);
@@ -1514,10 +1523,40 @@ async function pageAction(tabId, action, params) {
 //     正则直接写 \d/\s 即可，完全避开模板字符串转义坑（单反斜杠被丢弃成 d 的静默失败）。
 //   - 只读操作，不点任何元素、不滚动页面、不产生副作用。
 const INSPECT_FUNCS = {
-  // 页面概览：URL/标题/弹窗/滚动/卡片/搜索框/可滚动容器
+  // 页面概览：URL/标题/弹窗/阻断状态/滚动/卡片/搜索框/可滚动容器
   overview: function (p) {
-    const mask = document.querySelector(".note-detail-mask") || document.querySelector('[class*="modal"][class*="mask"]');
+    const isVis = (el) => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const st = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && st.display !== "none" && st.visibility !== "hidden" && st.opacity !== "0";
+    };
+    const modalCandidates = Array.from(document.querySelectorAll('.note-detail-mask, [class*="modal"][class*="mask"], [role="dialog"], [aria-modal="true"], dialog[open], .reds-alert'));
+    const mask = modalCandidates.find(isVis) || modalCandidates[0] || null;
     const mr = mask ? mask.getBoundingClientRect() : null;
+    const modalVisible = !!(mask && isVis(mask));
+
+    // 通用阻断诊断：区分 Cloudflare / 验证码 / 强登录墙 / 可一键关闭的软提示弹窗
+    let blocker = null;
+    const titleStr = document.title || "";
+    const urlStr = location.href || "";
+    const headText = (document.body && document.body.innerText || "").slice(0, 1500);
+    if (window._cf_chl_opt || /Just a moment|Checking your browser|Attention Required/i.test(titleStr) || document.querySelector('iframe[src*="challenges.cloudflare.com"], [src*="/cdn-cgi/challenge-platform/"]')) {
+      blocker = { type: "cloudflare", reason: "Cloudflare 挑战页", action: "使用 captcha/scripts/cf-wait.mjs 等待或交用户验证" };
+    } else if (/website-login\/captcha|\/captcha|security[_-]verification/i.test(urlStr) || /请完成安全验证|Security Verification|拖动下方滑块|完成拼图验证/i.test(headText)) {
+      blocker = { type: "captcha", reason: "人机验证/滑块验证码", action: "立即停止重试，通知用户手动完成验证" };
+    } else if (modalVisible && mask) {
+      const mText = (mask.innerText || "").replace(/\s+/g, " ").trim().slice(0, 300);
+      const btns = Array.from(mask.querySelectorAll('button, [role="button"], a, [class*="btn"], [class*="close"]')).filter(isVis);
+      const dismissBtn = btns.find((b) => /^(我知道了|知道了|稍后再试|跳过|关闭|暂不|以后再说|同意|确认|Got it|Dismiss|Close|×|✕)$/i.test((b.innerText || b.getAttribute("aria-label") || "").trim()));
+      if (dismissBtn && !/验证码|滑块|扫码登录/.test(mText)) {
+        const dismissText = (dismissBtn.innerText || dismissBtn.getAttribute("aria-label") || "").trim().slice(0, 30);
+        blocker = { type: "dismissible_modal", reason: mText.slice(0, 120), dismissText, action: "可点击关闭按钮继续" };
+      } else if (mask.querySelector('input[type="password"]') || /扫码登录|请先登录|登录后查看|Sign in to/i.test(mText)) {
+        blocker = { type: "login_wall", reason: mText.slice(0, 120), action: "需要登录，请告知用户手动登录" };
+      }
+    }
+
     const cards = document.querySelectorAll('section[class*="item"], article, [class*="card"]');
     const scrollables = [];
     const all = document.querySelectorAll("*");
@@ -1531,12 +1570,16 @@ const INSPECT_FUNCS = {
     document.querySelectorAll('input[type="search"], input[placeholder*="搜索"], [class*="search"] input, [class*="search-input"]').forEach((el) => {
       if (searchBoxes.length < 3) searchBoxes.push({ placeholder: el.getAttribute("placeholder") || "", cls: String(el.className || "").slice(0, 40) });
     });
+    const headings = Array.from(document.querySelectorAll("h1, h2, h3")).slice(0, 8).map((h) => (h.innerText || "").replace(/\s+/g, " ").trim().slice(0, 80)).filter(Boolean);
     return {
-      url: location.href.slice(0, 200),
-      title: (document.title || "").slice(0, 80),
+      url: urlStr.slice(0, 200),
+      title: titleStr.slice(0, 80),
       readyState: document.readyState,
+      hidden: document.hidden,
       hasModal: !!mask,
-      modalVisible: mr ? (mr.width > 0 && mr.height > 0) : false,
+      modalVisible,
+      blocker,
+      headings,
       scrollY: window.scrollY,
       docScrollHeight: document.documentElement.scrollHeight,
       innerHeight: window.innerHeight,
@@ -1544,7 +1587,7 @@ const INSPECT_FUNCS = {
       scrollables,
       searchBoxes,
       iframes: document.querySelectorAll("iframe").length,
-      bodyTextLen: (document.body.innerText || "").length
+      bodyTextLen: (document.body && document.body.innerText || "").length
     };
   },
 
@@ -1606,9 +1649,16 @@ const INSPECT_FUNCS = {
     return out;
   },
 
-  // 弹窗详情（存在/尺寸/内部滚动区/评论数/互动）
+  // 弹窗详情（存在/尺寸/内部滚动区/按钮清单/评论数/互动）
   modal: function () {
-    const mask = document.querySelector(".note-detail-mask") || document.querySelector('[class*="modal"][class*="mask"]');
+    const isVis = (el) => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const st = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && st.display !== "none" && st.visibility !== "hidden" && st.opacity !== "0";
+    };
+    const candidates = Array.from(document.querySelectorAll('.note-detail-mask, [class*="modal"][class*="mask"], [role="dialog"], [aria-modal="true"], dialog[open], .reds-alert'));
+    const mask = candidates.find(isVis) || candidates[0] || null;
     if (!mask) return { hasModal: false };
     const r = mask.getBoundingClientRect();
     const scrollers = [];
@@ -1617,13 +1667,24 @@ const INSPECT_FUNCS = {
         scrollers.push({ tag: el.tagName, cls: String(el.className || "").slice(0, 50), client: el.clientHeight, scroll: el.scrollHeight });
       }
     });
+    const buttons = Array.from(mask.querySelectorAll('button, [role="button"], [class*="btn"], [class*="close"]'))
+      .filter(isVis)
+      .slice(0, 10)
+      .map((b) => ({
+        tag: b.tagName,
+        text: (b.innerText || b.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim().slice(0, 40),
+        cls: String(b.className || "").slice(0, 40),
+      }));
     const comments = mask.querySelectorAll('[class*="comment-item"]').length;
-    const titleEl = mask.querySelector(".title");
+    const titleEl = mask.querySelector('.title, h1, h2, h3, [class*="title"], [class*="header"]');
     const bar = mask.querySelector(".engage-bar");
     return {
       hasModal: true,
+      visible: isVis(mask),
       w: Math.round(r.width), h: Math.round(r.height),
-      title: titleEl ? (titleEl.innerText || "").slice(0, 60) : "",
+      title: titleEl ? (titleEl.innerText || "").replace(/\s+/g, " ").trim().slice(0, 60) : "",
+      text: (mask.innerText || "").replace(/\s+/g, " ").trim().slice(0, 240),
+      buttons,
       commentCount: comments,
       engageText: bar ? (bar.innerText || "").replace(/\s+/g, " ").slice(0, 60) : "",
       scrollers
@@ -1936,6 +1997,341 @@ function cdpEvaluate(tabId, params) {
     const v = resp.result && resp.result.value;
     return { result: v, via: "cdp" };
   }).catch(() => null);   // attach 失败（用户 DevTools 占用等）→ 与旧行为一致，返回 null
+}
+
+// ---------- 高层原子 CDP 与一键读取 RPC（v0.3.13+） ----------
+// 为什么提供扩展内原子方法：
+//   host.log 实测 session.attach 7.1 万次、session.send 8.5 万次，而 detach 仅 1 万次。
+//   原本一次真实点击要 4 次 HTTP RPC（attach + move + down + up），文件上传要 5 次，
+//   受控输入要 4 次，且漏 detach 会让 Chrome 顶部调试横条常驻。
+//   收敛到扩展内通过 withBorrowedDebugger 一次性执行：单次 RPC 完成、用完自动归还调试器。
+
+async function pageEvalCdp(tabId, params) {
+  requireTabId(tabId);
+  if (!params || !params.expression) throw { code: "BAD_PARAMS", message: "缺少 expression" };
+  const awaitPromise = !!params.awaitPromise;
+  const userGesture = params.userGesture !== false;
+  return withBorrowedDebugger(tabId, async (send) => {
+    const resp = await withTimeout(
+      send("Runtime.evaluate", {
+        expression: params.expression,
+        awaitPromise,
+        returnByValue: true,
+        userGesture,
+      }),
+      params.timeoutMs || EVAL_TIMEOUT_MS,
+      "TIMEOUT",
+      `page.evalCdp 超时`
+    );
+    if (resp && resp.exceptionDetails) {
+      const ex = resp.exceptionDetails.exception || {};
+      throw { code: "EVAL_ERROR", message: ex.description || ex.value || JSON.stringify(resp.exceptionDetails) };
+    }
+    const r = resp && resp.result;
+    return { result: r && r.value !== undefined ? r.value : r, via: "cdp" };
+  });
+}
+
+async function samplePageDeltaState(tabId) {
+  try {
+    const r = await pageEvalCdp(tabId, {
+      expression: `(() => {
+        const a = document.activeElement;
+        const val = a ? (a.value !== undefined && typeof a.value === "string" ? a.value.slice(0, 200) : (a.isContentEditable ? (a.innerText || "").trim().slice(0, 200) : null)) : null;
+        const modals = document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog[open], .note-detail-mask, [class*="modal"][class*="mask"]');
+        let hasModal = false;
+        for (const m of modals) {
+          const rect = m.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0 && getComputedStyle(m).display !== "none") { hasModal = true; break; }
+        }
+        return { url: location.href, title: document.title, hasModal, activeTag: a && a.tagName ? a.tagName.toLowerCase() : null, activeValue: val };
+      })()`,
+    });
+    return r && r.result ? r.result : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function resolveTargetForCdp(tabId, params, opts = {}) {
+  try {
+    return await contentCall(tabId, "resolveTarget", {
+      selector: params.selector,
+      by: params.by || "css",
+      ref: params.ref,
+      focus: !!opts.focus,
+      clear: !!opts.clear,
+    });
+  } catch (e) {
+    // 若因严格 CSP / content 异常失败但提供了 CSS 选择器，用 CDP 兜底定位
+    if (e && (e.code === "NOT_FOUND" || e.code === "STALE_ELEMENT_REF" || e.code === "BAD_SELECTOR" || e.code === "AGENT_STOPPED")) {
+      throw e;
+    }
+    if (!params || !params.selector) throw e;
+    const r = await pageEvalCdp(tabId, {
+      expression: `(() => {
+        const el = document.querySelector(${JSON.stringify(params.selector)});
+        if (!el) return { ok: false };
+        el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        if (${JSON.stringify(!!opts.focus)} && typeof el.focus === "function") el.focus({ preventScroll: true });
+        if (${JSON.stringify(!!opts.clear)}) {
+          if (el.isContentEditable) el.textContent = "";
+          else if (el.value !== undefined) el.value = "";
+        }
+        const rect = el.getBoundingClientRect();
+        return {
+          ok: true,
+          tag: el.tagName,
+          text: (el.innerText || el.value || "").trim().slice(0, 80),
+          x: Math.round(rect.left + rect.width / 2),
+          y: Math.round(rect.top + rect.height / 2),
+        };
+      })()`,
+    });
+    if (!r || !r.result || !r.result.ok) {
+      throw { code: "NOT_FOUND", message: `未找到元素 (selector=${params.selector})` };
+    }
+    return r.result;
+  }
+}
+
+async function pageClickReal(tabId, params) {
+  requireTabId(tabId);
+  let x = params && typeof params.x === "number" ? Math.round(params.x) : null;
+  let y = params && typeof params.y === "number" ? Math.round(params.y) : null;
+  let targetMeta = {};
+  if (x === null || y === null) {
+    if (!params || (!params.selector && !params.ref)) {
+      throw { code: "BAD_PARAMS", message: "page.clickReal 需要提供 { selector } / { ref } 或坐标 { x, y }" };
+    }
+    const resolved = await resolveTargetForCdp(tabId, params);
+    x = Math.round(resolved.x);
+    y = Math.round(resolved.y);
+    targetMeta = { ref: resolved.ref || null, tag: resolved.tag || null, text: resolved.text || null };
+  }
+  const button = (params && params.button) || "left";
+  const clickCount = (params && params.clickCount) || 1;
+  const delayMs = params && params.delayMs !== undefined ? Math.max(0, Number(params.delayMs)) : 50;
+
+  indicatorCall(tabId, { action: "click", x, y }).catch(() => {});
+  const before = await samplePageDeltaState(tabId);
+
+  await withBorrowedDebugger(tabId, async (send) => {
+    await send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", clickCount: 0 });
+    if (delayMs > 0) await sleepMs(delayMs);
+    await send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, clickCount });
+    if (delayMs > 0) await sleepMs(delayMs);
+    await send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button, clickCount });
+  });
+
+  await sleepMs(60);
+  const after = await samplePageDeltaState(tabId);
+  const delta = before && after ? {
+    urlChanged: after.url !== before.url,
+    url: after.url,
+    titleChanged: after.title !== before.title,
+    modalOpened: !before.hasModal && after.hasModal,
+    modalClosed: before.hasModal && !after.hasModal,
+    activeTag: after.activeTag,
+    activeValue: after.activeValue,
+  } : undefined;
+
+  return { ok: true, x, y, ...targetMeta, via: "cdp", delta };
+}
+
+async function pageTypeReal(tabId, params) {
+  requireTabId(tabId);
+  const text = params && (params.text !== undefined ? params.text : params.value);
+  if (text === undefined) throw { code: "BAD_PARAMS", message: "缺少 text" };
+  let targetMeta = {};
+  if (params && (params.selector || params.ref)) {
+    const resolved = await resolveTargetForCdp(tabId, params, { focus: true, clear: params.clear !== false });
+    targetMeta = { ref: resolved.ref || null, tag: resolved.tag || null };
+  }
+  const before = await samplePageDeltaState(tabId);
+  const str = String(text);
+
+  await withBorrowedDebugger(tabId, async (send) => {
+    if (str.length > 0) {
+      await send("Input.insertText", { text: str });
+    }
+    if (params && params.pressEnter) {
+      await sleepMs(40);
+      await send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+      await send("Input.dispatchKeyEvent", { type: "char", text: "\r", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+      await send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+    }
+  });
+
+  await sleepMs(50);
+  const after = await samplePageDeltaState(tabId);
+  const actualVal = after ? after.activeValue : null;
+  const snippet = str.slice(0, 20);
+  const verified = str.length === 0 ? (actualVal === "" || actualVal === null) : (typeof actualVal === "string" && actualVal.includes(snippet));
+  const delta = before && after ? {
+    urlChanged: after.url !== before.url,
+    url: after.url,
+    titleChanged: after.title !== before.title,
+    modalOpened: !before.hasModal && after.hasModal,
+    modalClosed: before.hasModal && !after.hasModal,
+    activeTag: after.activeTag,
+    activeValue: actualVal,
+  } : undefined;
+
+  return { ok: true, ...targetMeta, value: actualVal, verified, via: "cdp", delta };
+}
+
+async function pageUploadFile(tabId, params) {
+  requireTabId(tabId);
+  const rawFiles = params && params.files;
+  const files = Array.isArray(rawFiles) ? rawFiles.filter(Boolean) : (typeof rawFiles === "string" && rawFiles ? [rawFiles] : []);
+  if (!files.length) throw { code: "BAD_PARAMS", message: "缺少上传文件列表 files" };
+  const selector = (params && params.selector) || 'input[type="file"]';
+
+  await withBorrowedDebugger(tabId, async (send) => {
+    const doc = await send("DOM.getDocument", { depth: -1 });
+    const rootNodeId = doc && doc.root && doc.root.nodeId;
+    if (!rootNodeId) throw { code: "INTERNAL", message: "无法获取 DOM 根节点" };
+    const q = await send("DOM.querySelector", { nodeId: rootNodeId, selector });
+    const nodeId = q && q.nodeId;
+    if (!nodeId) {
+      throw { code: "NOT_FOUND", message: `未找到文件上传元素 (selector=${selector})` };
+    }
+    await send("DOM.setFileInputFiles", { nodeId, files });
+  });
+
+  return { ok: true, selector, count: files.length, files, via: "cdp" };
+}
+
+// 一键读取网页正文：自动打开/复用后台 tab → 等就绪 → 提取正文/标题/链接/阻断诊断 →
+// 若因后台渲染暂停导致正文为空则自动 ensureActive 重读 → 自动关闭本次新建的 tab。
+const READ_EXTRACT_FUNC = function (opts) {
+  const maxLen = (opts && opts.maxLength) || 20000;
+  const maxLinks = (opts && opts.maxLinks) || 30;
+  const includeLinks = !(opts && opts.includeLinks === false);
+  const mainEl = document.querySelector("article, main, [role='main'], .main-content, #content, #main") || document.body;
+  const fullText = (document.body && document.body.innerText || "").trim();
+  const mainText = (mainEl && mainEl.innerText || fullText).trim();
+  const chosenText = mainText.length >= fullText.length * 0.35 ? mainText : fullText;
+  const headings = Array.from(document.querySelectorAll("h1, h2, h3"))
+    .slice(0, 15)
+    .map((h) => ({ level: h.tagName.toLowerCase(), text: (h.innerText || "").replace(/\s+/g, " ").trim().slice(0, 100) }))
+    .filter((h) => h.text);
+  const links = [];
+  if (includeLinks) {
+    const seen = new Set();
+    const aNodes = (mainEl || document).querySelectorAll("a[href]");
+    for (let i = 0; i < aNodes.length && links.length < maxLinks; i++) {
+      const a = aNodes[i];
+      const href = a.href || "";
+      if (!/^https?:/i.test(href) || seen.has(href)) continue;
+      const r = a.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) continue;
+      const text = (a.innerText || a.getAttribute("aria-label") || a.title || "").replace(/\s+/g, " ").trim().slice(0, 80);
+      if (!text) continue;
+      seen.add(href);
+      links.push({ text, href: href.slice(0, 200) });
+    }
+  }
+  const descMeta = document.querySelector('meta[name="description"], meta[property="og:description"]');
+  return {
+    url: location.href,
+    title: document.title || "",
+    description: descMeta ? (descMeta.getAttribute("content") || "").slice(0, 300) : null,
+    readyState: document.readyState,
+    hidden: document.hidden,
+    textLength: chosenText.length,
+    truncated: chosenText.length > maxLen,
+    text: chosenText.slice(0, maxLen),
+    headings,
+    links,
+  };
+};
+
+async function runReadExtract(tabId, opts) {
+  try {
+    const resp = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: READ_EXTRACT_FUNC,
+        args: [opts || {}],
+      }),
+      EVAL_TIMEOUT_MS,
+      "PAGE_CONTEXT_TIMEOUT",
+      "page.read 提取超时"
+    );
+    const out = resp && resp[0] && resp[0].result;
+    if (out) return out;
+  } catch (e) { /* 降级走 CDP */ }
+  const cdpOut = await pageEvalCdp(tabId, {
+    expression: `(${READ_EXTRACT_FUNC.toString()})(${JSON.stringify(opts || {})})`,
+  });
+  return cdpOut && cdpOut.result;
+}
+
+async function pageRead(params) {
+  const opts = params || {};
+  let tabId = opts.tabId != null ? Number(opts.tabId) : null;
+  let reused = true;
+  const timeoutMs = opts.timeoutMs || NAV_TIMEOUT_MS;
+
+  if (!tabId) {
+    if (!opts.url) throw { code: "BAD_PARAMS", message: "page.read 需要提供 url 或 tabId" };
+    const opened = await tabsResolve({
+      url: opts.url,
+      match: opts.match || "host",
+      waitLoad: true,
+      timeoutMs,
+    });
+    tabId = opened.tabId;
+    reused = opened.reused !== false;
+  } else if (opts.url) {
+    await pageNavigate(tabId, opts.url, { waitLoad: true, timeoutMs });
+  }
+
+  const shouldClose = !reused && !opts.keepOpen;
+  let activatedForRender = false;
+  try {
+    await waitForReady(tabId, Math.min(timeoutMs, 15000)).catch(() => null);
+    if (opts.waitMs && Number(opts.waitMs) > 0) {
+      await sleepMs(Math.min(Number(opts.waitMs), 10000));
+    }
+    let data = await runReadExtract(tabId, opts);
+    let inspectOverview = null;
+    try {
+      const insp = await pageInspect(tabId, { focus: "overview" });
+      inspectOverview = insp && insp.result;
+    } catch (e) { /* noop */ }
+
+    const blocker = inspectOverview ? inspectOverview.blocker : null;
+    // 后台标签页因 rAF 暂停导致 SPA 未渲染正文时，自动临时激活一次重读
+    if (data && data.textLength < 80 && data.hidden && !blocker) {
+      try {
+        const ens = await pageEnsureActive(tabId, { restoreAfterMs: 8000 });
+        activatedForRender = !!(ens && ens.activated);
+        await sleepMs(550);
+        data = await runReadExtract(tabId, opts);
+      } catch (e) { /* noop */ }
+      if (activatedForRender) {
+        await pageRestoreActive(tabId).catch(() => null);
+      }
+    }
+
+    return {
+      ok: true,
+      tabId,
+      reused,
+      closed: shouldClose,
+      activatedForRender,
+      blocker,
+      ...(data || {}),
+    };
+  } finally {
+    if (shouldClose && tabId != null) {
+      await tabsClose(tabId).catch(() => null);
+    }
+  }
 }
 
 // ---------- CDP Session ----------

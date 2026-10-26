@@ -188,7 +188,7 @@ chrome-agent-bridge/
 ```bash
 clawhub login
 clawhub publish ./skills/agent-browser-bridge \
-  --slug agent-browser-bridge --version 0.3.12 \
+  --slug agent-browser-bridge --version 0.3.13 \
   --tags latest,browser,chrome --changelog "见 CHANGELOG.md"
 ```
 
