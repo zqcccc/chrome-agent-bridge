@@ -34,56 +34,28 @@ AI Agent 不应假设用户已经完成配置。首次接入时按下面顺序�
 node --version
 ```
 
-### 2. 加载 Chrome 扩展
+### 2. 注册 Native host 并软链 Skill（Agent 直接执行）
 
-1. 打开 `chrome://extensions`。
-2. 开启右上角“开发者模式”。
-3. 点击“加载已解压的扩展程序”。
-4. 选择项目中的 `extension/` 目录。
-5. 复制扩展卡片显示的 32 位扩展 ID。
-6. 确认扩展开关为 On。
-
-不要把某个用户的扩展 ID 写入脚本或文档；每次应读取用户本机显示的 ID。
-
-### 3. 注册并启动 Native host
-
-在项目根目录执行：
+在克隆好的项目目录执行：
 
 ```bash
-cd /path/to/chrome-agent-bridge/relay
-bash install-host.sh <用户的扩展ID>
+bash /path/to/chrome-agent-bridge/relay/install-host.sh
+mkdir -p ~/.agents/skills
+ln -sfn /path/to/chrome-agent-bridge/skills/agent-browser-bridge ~/.agents/skills/agent-browser-bridge
 ```
 
-注意：`install-host.sh` 是 Shell 脚本，不要使用 `node install-host.sh`。
+- `install-host.sh` 是 Shell 脚本（不要用 `node install-host.sh`）。不传参时会自动根据 `extension/` 的真实路径算出 Chrome 的 32 位扩展 ID 并完成 Native Messaging Host 注册（也可显式传 `bash install-host.sh <用户的扩展ID>`）。
+- 若当前 Agent 使用 `~/.claude/skills` 等目录，可同步建立软链，或运行 `clawhub install agent-browser-bridge`。
+- 首次启动会生成本地 Token：`~/.chrome-agent-bridge/token`。Token 是本机能力凭证，不要发送给第三方、写入聊天记录、提交到 Git 或放到网页中。
 
-完全退出并重新打开 Chrome，或重新加载扩展。Native 模式下不要先运行 `npm start`，Chrome 会按需启动 host。
+### 3. 引导用户加载 Chrome 扩展并重启 Chrome
 
-首次启动会生成本地 Token：
+提示用户完成以下两步（扩展默认配置即为 `channel: "auto"`、`127.0.0.1:8778`，无需手动打开 `options.html` 修改设置）：
 
-```text
-~/.chrome-agent-bridge/token
-```
+1. 打开 `chrome://extensions`，开启右上角「开发者模式」，点击「加载已解压的扩展程序」，选择项目中的 `extension/` 目录。
+2. 按 `⌘Q` 完全退出并重新打开 Chrome（Native 模式下不要运行 `npm start`，Chrome 会按需启动 host）。
 
-Token 是本机能力凭证，不要发送给第三方、写入聊天记录、提交到 Git 或放到网页中。
-
-### 4. 配置扩展
-
-打开：
-
-```text
-chrome-extension://<用户的扩展ID>/options.html
-```
-
-填写：
-
-- 通道：`native`
-- Host：`127.0.0.1`
-- Port：`8778`
-- Native 模式下扩展不需要填写 Token；Agent CLI 从 `~/.chrome-agent-bridge/token` 读取 Token
-
-保存并重连。
-
-### 6. 验证连接
+### 4. 验证连接
 
 先检查 relay：
 
@@ -97,15 +69,16 @@ curl -s http://127.0.0.1:8778/status
 {"ok":true,"extConnected":true}
 ```
 
-再使用 CLI：
+再使用 CLI 验证并跑回归自检：
 
 ```bash
 cd /path/to/chrome-agent-bridge
 node agent/cli.mjs status
 node agent/cli.mjs tabs
+node agent/cli.mjs verify
 ```
 
-只有当 `extConnected` 为 `true` 且 `tabs` 能返回标签页后，才认为接入成功。
+只有当 `extConnected` 为 `true`、`tabs` 能返回标签页且 `verify` 通过后，才认为接入成功。
 
 ## AI Agent 的日常操作规范
 

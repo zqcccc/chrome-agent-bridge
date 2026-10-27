@@ -2,9 +2,42 @@
 
 **一句话：你在 Chrome 里能做的事，让 AI 替你做。**
 
-装上它之后，你的 AI 助手（Claude Code / Codex / 任何支持 Skill 的 Agent）就能直接操作你正在用的 Chrome：打开网页、读内容、点击、填表、截图、抓取登录后才能看到的数据——用的是**你自己的浏览器和登录态**，不是无头模拟器。
+装上它之后，你的 AI 助手（Claude Code / Codex / OpenClaw / Cursor 等）就能直接操作你正在用的 Chrome：打开网页、读内容、点击、填表、截图、抓取登录后才能看到的数据——用的是**你自己的浏览器和登录态**，不是无头模拟器。
 
 [安全说明](SECURITY.md) · [给 AI Agent 的接入指南](docs/AI-INTEGRATION.md) · [MIT License](LICENSE)
+
+---
+
+## 一句话安装（复制发给你的 AI Agent）
+
+把下面这段话直接发给你的 AI 助手，它会自己克隆代码、装好 Skill、注册本地桥，并引导你完成最后一步：
+
+```text
+请帮我安装 Agent Browser Bridge：将 https://github.com/zqcccc/chrome-agent-bridge.git 克隆到本地，按仓库内 skills/agent-browser-bridge/INSTALL.md 完成 Skill 软链与 Native Host 注册，然后引导我在 Chrome 加载 extension/ 目录并验证连接。
+```
+
+AI 配好本地环境后，你只需要按它的提示在 `chrome://extensions` 里点一下「加载已解压的扩展程序」选中 `extension/` 目录，再按 `⌘Q` 重启一次 Chrome 即可。
+
+<details>
+<summary>手动安装步骤（不想让 AI 代劳时）</summary>
+
+1. **克隆并注册本地桥 + Skill**：
+   ```bash
+   git clone https://github.com/zqcccc/chrome-agent-bridge.git ~/code/chrome-agent-bridge
+   bash ~/code/chrome-agent-bridge/relay/install-host.sh
+   mkdir -p ~/.agents/skills
+   ln -sfn ~/code/chrome-agent-bridge/skills/agent-browser-bridge ~/.agents/skills/agent-browser-bridge
+   ```
+2. **在 Chrome 加载扩展**：
+   - 打开 `chrome://extensions`，右上角开启「开发者模式」
+   - 点「加载已解压的扩展程序」，选择 `~/code/chrome-agent-bridge/extension` 目录
+   - 按 `⌘Q` **完全退出 Chrome 再重新打开**
+3. **验证连接**：
+   ```bash
+   curl -s http://127.0.0.1:8778/status   # 看到 "extConnected":true 即成功
+   ```
+
+</details>
 
 ---
 
@@ -24,76 +57,15 @@
 
 ---
 
-## 30 秒安装
-
-### 第 1 步：装 Chrome 扩展
-
-1. 下载本仓库：`git clone https://github.com/zqcccc/chrome-agent-bridge.git`
-2. 打开 `chrome://extensions`，右上角开「开发者模式」
-3. 点「加载已解压的扩展程序」，选仓库里的 `extension/` 目录
-4. 复制卡片上显示的**扩展 ID**（32 位字母，每人不同）
-
-### 第 2 步：注册本地桥（一条命令）
-
-```bash
-cd chrome-agent-bridge/relay
-bash install-host.sh <刚才复制的扩展ID>
-```
-
-然后**完全退出 Chrome 再重新打开**（不是关窗口，是 Cmd+Q）。
-
-这条命令会做两件事：告诉 Chrome「这个扩展可以跟我本机的桥通信」，并首次启动时在 `~/.chrome-agent-bridge/token` 生成一个本地密钥。
-
-### 第 3 步：验证
-
-```bash
-curl -s http://127.0.0.1:8778/status
-```
-
-看到 `"extConnected":true` 就装好了。
-
-### 第 4 步（可选）：让 AI 知道怎么用它
-
-装配套 Skill，AI 才会主动用这个桥：
-
-```bash
-clawhub install agent-browser-bridge
-```
-
-装完之后，你直接跟 AI 说「去小红书搜 XX」就行，不用教它。
-
-> 不用 ClawHub 也行：把这句丢给你的 AI 即可（它会自己读文档完成配置）：
->
-> ```text
-> 请从 https://github.com/zqcccc/chrome-agent-bridge.git 克隆 Agent Browser Bridge，
-> 并阅读仓库中的 docs/AI-INTEGRATION.md、SECURITY.md 和 skills/agent-browser-bridge/SKILL.md，
-> 按照接入指南完成 macOS + Google Chrome 的本地配置。
-> 请在执行任何修改系统、Chrome 设置或网页不可逆操作前先向我说明并获得确认；
-> 不要输出或提交 ~/.chrome-agent-bridge/token。
-> 最后用 /status 和 agent/cli.mjs tabs 验证连接。
-> ```
-
----
-
 ## 更新
 
-三个部件分开更新，各管各的：
+同样把下面这句话发给你的 AI：
 
-| 部件 | 怎么更新 | 频率 |
-|---|---|---|
-| **Skill**（AI 的操作手册） | `clawhub update` | 最勤，跟着功能走 |
-| **扩展**（Chrome 里那个） | `git pull` 后在 `chrome://extensions` 点一下刷新（或 `node agent/cli.mjs reload-ext`） | 有新能力时 |
-| **本地桥 host** | `git pull` 后重跑 `bash install-host.sh <扩展ID>`，重启 Chrome | 跟扩展一起 |
-
-扩展因为没上架 Chrome 商店，不会自动更新。**该不该更新、更新了什么**，写在 skill 里的 [`skills/agent-browser-bridge/CHANGELOG.md`](skills/agent-browser-bridge/CHANGELOG.md)——用之前让 AI 查一下当前版本对不对。
-
-查自己装的扩展版本：
-
-```bash
-export BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token)
-node agent/cli.mjs verify
-# ✓ 扩展版本 >= 0.3.3（已加载修复后的代码）  → 实际 0.3.9
+```text
+请帮我更新本机的 Agent Browser Bridge：在本地 chrome-agent-bridge 仓库执行 git pull，运行 node agent/cli.mjs reload-ext 自动重载 Chrome 扩展（若 relay/host.js 有变更则重启本地 host 进程），最后运行 node agent/cli.mjs verify 确认版本与自检全绿。
 ```
+
+扩展未上架 Chrome 商店，不会自动更新。更新了什么、某个报错是不是版本太旧，记录在 [`skills/agent-browser-bridge/CHANGELOG.md`](skills/agent-browser-bridge/CHANGELOG.md)。
 
 ---
 
