@@ -24,6 +24,7 @@ description: 用真实 Chrome 打开、读取、操作任意网页——**拿到
 | **ChatGPT chatgpt.com**（网页端提问、读回复、选模型、生图；严格 CSP 禁 `page.evaluate`） | `chatgpt/SKILL.md` | `chatgpt-ask.mjs`、`cdp-eval.mjs` |
 | **NotebookLM**（新建笔记本、上传来源、提问、Studio 产物） | `notebooklm/SKILL.md` | `notebooklm/upload.mjs`、`notebooklm/ask.mjs`、`notebooklm/scripts/*.mjs`、`scripts/cdp-upload.mjs` |
 | **LinkedIn linkedin.com**（读档案、改 Headline/About、增删改经历与项目、中英双语档案） | `linkedin/SKILL.md` | `linkedin/scripts/linkedin-read.mjs`、`linkedin/scripts/linkedin-edit.mjs`、`linkedin/scripts/lib/linkedin.mjs` |
+| **脉脉 maimai.cn**（捞远程招聘帖当信源：动态/职言搜索、帖子详情、微信邮箱提取；桌面网页无求职者职位库） | `maimai/SKILL.md` | 参考实现 `job-loop/maimai-scan.mjs`（resume-boilerplate 项目内） |
 | **Cloudflare 挑战页 / 人机验证**（`Just a moment...`、Turnstile、`/cdn-cgi/challenge-platform/`） | `captcha/SKILL.md` | `captcha/scripts/cf-wait.mjs` |
 | **任何站点：页面异常 / 结构陌生 / 交付前验证** | `debug/SKILL.md` | 内置 `page.inspect` / `page.record` RPC；兜底 `browser-debug.mjs` |
 | **在 Firefox 里操作**（`BRIDGE_BROWSER=firefox`、`BIDI_UNAVAILABLE`、`CDP_UNSUPPORTED`） | `firefox/SKILL.md` | 同上全部脚本（设 `BRIDGE_BROWSER=firefox`） |
