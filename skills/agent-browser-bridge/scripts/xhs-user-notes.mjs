@@ -20,6 +20,7 @@
 //   - 需要逐条详情时，用笔记 ID 配 xhs-note-full.mjs 抓取。
 import fs from "node:fs";
 import path from "node:path";
+import { BRIDGE_ORIGIN } from "./lib/bridge.mjs";
 
 const token = process.env.BRIDGE_TOKEN;
 const [, , tabIdArg, ...rest] = process.argv;
@@ -38,7 +39,7 @@ if (!token || !tabId) {
 }
 
 const rpc = async (method, params = {}, timeoutMs = 30000) => {
-  const res = await fetch("http://127.0.0.1:8778/rpc", {
+  const res = await fetch(`${BRIDGE_ORIGIN}/rpc`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify({ method, params, timeoutMs }),

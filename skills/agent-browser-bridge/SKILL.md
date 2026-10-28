@@ -7,6 +7,8 @@ description: 用真实 Chrome 打开、读取、操作任意网页——**拿到
 
 架构：Chrome 扩展（MV3）↔ 本地桥 host（`relay/host.js`，`127.0.0.1:8778`）↔ Agent 客户端（HTTP/WS JSON-RPC）。驱动用户日常 Chrome（真实登录态、真实指纹、真实环境）。
 
+**也支持 Firefox**：同一套 RPC 方法、参数、返回结构与错误码，只是 host 端口为 `8779`。设环境变量 `BRIDGE_BROWSER=firefox`（或 `BRIDGE_PORT=8779`）后，`scripts/lib/bridge.mjs` 与 `scripts/` 下全部脚本都连 Firefox；不设时连 Chrome。Firefox 的前置条件与差异见 `firefox/SKILL.md`。
+
 ---
 
 ## 开工前必读（按顺序执行）
@@ -24,6 +26,7 @@ description: 用真实 Chrome 打开、读取、操作任意网页——**拿到
 | **LinkedIn linkedin.com**（读档案、改 Headline/About、增删改经历与项目、中英双语档案） | `linkedin/SKILL.md` | `linkedin/scripts/linkedin-read.mjs`、`linkedin/scripts/linkedin-edit.mjs`、`linkedin/scripts/lib/linkedin.mjs` |
 | **Cloudflare 挑战页 / 人机验证**（`Just a moment...`、Turnstile、`/cdn-cgi/challenge-platform/`） | `captcha/SKILL.md` | `captcha/scripts/cf-wait.mjs` |
 | **任何站点：页面异常 / 结构陌生 / 交付前验证** | `debug/SKILL.md` | 内置 `page.inspect` / `page.record` RPC；兜底 `browser-debug.mjs` |
+| **在 Firefox 里操作**（`BRIDGE_BROWSER=firefox`、`BIDI_UNAVAILABLE`、`CDP_UNSUPPORTED`） | `firefox/SKILL.md` | 同上全部脚本（设 `BRIDGE_BROWSER=firefox`） |
 
 ### 2. 开工体检：`scripts/preflight.mjs`
 
@@ -38,7 +41,8 @@ TAB=$(node <skill 目录>/scripts/preflight.mjs --pick github)  # 直接拿匹�
 等价状态检查（不依赖脚本）：
 
 ```bash
-curl -s http://127.0.0.1:8778/status
+curl -s http://127.0.0.1:8778/status    # Chrome
+curl -s http://127.0.0.1:8779/status    # Firefox（返回 "browser":"firefox"）
 ```
 
 - `version` 即扩展与 host 的统一版本号（源于 `extension/manifest.json`）。拿到 `UNKNOWN_METHOD` 一律是扩展版本不够新，对照 `CHANGELOG.md`。
@@ -309,7 +313,7 @@ HTTP 等价：`GET http://127.0.0.1:8778/errors?limit=20&tabId=<id>`（带 `Auth
 
 ### 9. 底层 CDP 直通：`session.attach` / `session.send` / `session.detach`
 
-当需要模拟移动设备视口、裁剪截图或拦截网络等未单独封装的 DevTools 能力时，使用 `rpc.withSession(tabId, fn)` 确保异常路径必 `detach`：
+当需要模拟移动设备视口、裁剪截图或拦截网络等未单独封装的 DevTools 能力时，使用 `rpc.withSession(tabId, fn)` 确保异常路径必 `detach`（Firefox 只支持其中一个子集，其余方法报 `CDP_UNSUPPORTED`，见 `firefox/SKILL.md`）：
 
 ```js
 await rpc.withSession(tabId, async () => {

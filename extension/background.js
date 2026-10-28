@@ -3,7 +3,12 @@
 //   主通道：Native Messaging（chrome.runtime.connectNative → 本地 host）
 //   兜底通道：WebSocket 直连本地 host
 // 职责：连接管理、RPC 命令执行、事件转发、alarms 保活
-const DEFAULT_CONFIG = { host: "127.0.0.1", port: 8778, token: "", channel: "auto" };
+// 同一份代码跑在 Chrome 与 Firefox 上（Firefox 版由 relay/build-firefox.js 只改 manifest 生成）。
+// 浏览器差异只有两处：host 端口不同；Firefox 没有 chrome.debugger，CDP 命令经 host 翻译成 WebDriver BiDi。
+const BROWSER = chrome.runtime.getURL("").startsWith("moz-extension:") ? "firefox" : "chrome";
+const CDP_VIA_HOST = !chrome.debugger;
+const DEFAULT_PORTS = { chrome: 8778, firefox: 8779 };
+const DEFAULT_CONFIG = { host: "127.0.0.1", port: DEFAULT_PORTS[BROWSER], token: "", channel: "auto" };
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 const NAV_TIMEOUT_MS = 45000;
@@ -38,7 +43,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 
 function wsUrl() {
-  return `ws://${config.host || "127.0.0.1"}:${config.port || 8778}/agent?token=${encodeURIComponent(normalizeToken(config.token))}`;
+  return `ws://${config.host || "127.0.0.1"}:${config.port || DEFAULT_PORTS[BROWSER]}/agent?token=${encodeURIComponent(normalizeToken(config.token))}`;
 }
 // token 归一：宿主写入时可能被 URI 编码过（表现为末尾出现 %25 —— '%' 被二次编码）。
 // 原样再 encodeURIComponent 一次就会双重编码，WS 握手必然 401/认证失败。
@@ -179,6 +184,44 @@ function sendToHost(obj) {
   return false;
 }
 
+// ---------- 扩展 → host 的请求（Firefox 的 CDP 替身走这里） ----------
+const HOST_CALL_TIMEOUT_MS = 35000;   // 大于 host 侧单条 BiDi 命令超时（30s），让 host 先报出具体原因
+const hostPending = new Map();        // id -> { resolve, reject, timer }
+
+function hostCall(method, params) {
+  const id = `ext-${crypto.randomUUID()}`;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      hostPending.delete(id);
+      reject({ code: "TIMEOUT", message: `host 响应超时(${HOST_CALL_TIMEOUT_MS}ms): ${method}` });
+    }, HOST_CALL_TIMEOUT_MS);
+    hostPending.set(id, { resolve, reject, timer });
+    const sent = nativePort
+      ? sendToHost({ type: "request", requestId: id, method, params })
+      : sendToHost({ id, method, params });
+    if (!sent) {
+      clearTimeout(timer);
+      hostPending.delete(id);
+      reject({ code: "EXT_DISCONNECTED", message: `未连接 host，无法执行 ${method}` });
+    }
+  });
+}
+
+function settleHostCall(id, error, result) {
+  const p = hostPending.get(id);
+  if (!p) return false;
+  clearTimeout(p.timer);
+  hostPending.delete(id);
+  if (error) {
+    const e = new Error(error.message || String(error));
+    if (error.code) e.code = error.code;
+    p.reject(e);
+  } else {
+    p.resolve(result);
+  }
+  return true;
+}
+
 // 已知「页面上下文失效」的 tab：导航超时 / 注入失败后打标记（tabId -> 时间戳）。
 // 命中时 evaluate 立即快速失败，而不是让每个后续调用都挂满 CONTENT_CALL_TIMEOUT_MS
 // （实测一个坏 tab 会连累后续每个调用各挂满 60s）。导航成功或 prepare 成功后清除。
@@ -225,8 +268,9 @@ function logRpcError(method, e) {
 function normalizeErrCode(e) {
   if (e && e.code) return e.code;
   const m = String((e && e.message) || e || "");
-  if (/No tab with id/i.test(m)) return "TAB_GONE";
-  if (/Cannot access contents of the page|Cannot access a chrome:/i.test(m)) return "UNSUPPORTED_URL";
+  // 右侧是 Firefox 对同一类失败的措辞
+  if (/No tab with id|Invalid tab ID/i.test(m)) return "TAB_GONE";
+  if (/Cannot access contents of the page|Cannot access a chrome:|Missing host permission for the tab/i.test(m)) return "UNSUPPORTED_URL";
   if (/Receiving end does not exist|Frame with ID .* was removed/i.test(m)) return "PAGE_CONTEXT_TIMEOUT";
   if (/Another debugger|already attached/i.test(m)) return "DEBUGGER_BUSY";
   return "INTERNAL";
@@ -276,6 +320,10 @@ function handleNativeMsg(msg) {
     return;
   }
   if (msg.type === "pong") return;
+  if (msg.type === "response" && msg.responseToRequestId) {
+    settleHostCall(msg.responseToRequestId, msg.error, msg.payload);
+    return;
+  }
   if (msg.type === "request" && msg.requestId !== undefined && msg.method) {
     const caller = { agentName: msg.agentName, agentId: msg.agentId };
     dispatch(msg.method, msg.params || {}, caller)
@@ -304,6 +352,10 @@ function handleWsMsg(msg) {
   if (msg.type === "hello" || msg.type === "pong") return;
   if (msg.type === "event") {
     handleHostEvent(msg.event, msg.payload);
+    return;
+  }
+  if (msg.id !== undefined && !msg.method) {
+    settleHostCall(msg.id, msg.ok ? null : msg.error, msg.result);
     return;
   }
   if (msg.id !== undefined && msg.method) {
@@ -420,6 +472,11 @@ function handleHostEvent(event, payload) {
       const tabId = payload && payload.tabId !== undefined ? payload.tabId : null;
       clearStopped(tabId);
       broadcastToTabs({ type: "bridge.stopState", stopped: false, tabId });
+      break;
+    }
+    // Firefox：BiDi context 销毁 / BiDi 断开，等价于 chrome.debugger.onDetach
+    case "bidi.detached": {
+      if (payload && payload.tabId !== undefined) cdpSessions.delete(payload.tabId);
       break;
     }
     default:
@@ -729,6 +786,9 @@ async function bridgeStatus() {
   return {
     name: manifest.name,
     version: manifest.version,
+    browser: BROWSER,
+    // CDP 命令的执行方式：chrome.debugger（Chrome）或经 host 翻译成 WebDriver BiDi（Firefox）
+    cdp: CDP_VIA_HOST ? "bidi" : "chrome.debugger",
     channel: activeChannel,
     connected: isChannelOpen(),
     relayUrl: wsUrl().replace(/token=.*/, "token=***"),
@@ -1271,6 +1331,8 @@ async function ensureInjected(tabId, opts) {
   } catch (e) {
     if (e && e.code !== "PAGE_CONTEXT_TIMEOUT") throw e;
     if (opts && opts.noRecover) throw e;
+    // 渲染器冻结是 Chrome Memory Saver 的行为，解冻靠 CDP Page.setWebLifecycleState，Firefox 没有对应物
+    if (CDP_VIA_HOST) throw e;
     // 疑似渲染器被冻结：解冻后重试一次。
     // 冷却中 / CDP 不可用（用户 DevTools 占用等）则原样抛出，调用方拿到快速失败。
     if (!(await recoverFrozenTab(tabId))) throw e;
@@ -1449,6 +1511,12 @@ async function pageEvaluate(tabId, params) {
         // 默认 MAIN world；只在显式 ISOLATED 时切换。BOSS 读 DOM 用 ISOLATED 也安全可控。
         world: params.world === "ISOLATED" ? "ISOLATED" : "MAIN",
         func: (expression, awaitPromise) => {
+      // Firefox 的 e.stack 不含「类型: 消息」首行（Chrome 含），补上，否则 CSP 判定与报错都缺消息
+      const errText = (e) => {
+        const head = String(e);
+        const stack = String((e && e.stack) || "");
+        return stack.startsWith(head) ? stack : (stack ? `${head}\n${stack}` : head);
+      };
       const wrap = (v) => {
         if (v === undefined) return { __type: "undefined" };
         if (v === null) return null;
@@ -1473,13 +1541,13 @@ async function pageEvaluate(tabId, params) {
       };
       if (awaitPromise) {
         return new Promise((resolve) => {
-          Promise.resolve().then(() => eval(expression)).then((v) => resolve(wrap(v))).catch((e) => resolve({ __type: "error", message: String(e && e.stack || e) }));
+          Promise.resolve().then(() => eval(expression)).then((v) => resolve(wrap(v))).catch((e) => resolve({ __type: "error", message: errText(e) }));
         });
       }
       try {
         return wrap(eval(expression));
       } catch (e) {
-        return { __type: "error", message: String(e && e.stack || e) };
+        return { __type: "error", message: errText(e) };
       }
     },
       args: [params.expression, !!params.awaitPromise],
@@ -1502,7 +1570,8 @@ async function pageEvaluate(tabId, params) {
     // 直接抛 EvalError。CDP Runtime.evaluate 走 DevTools 通道，不受页面 CSP 与 Trusted Types 约束，
     // 因此这里自动兜底重试一次，而不是把 EVAL_ERROR 抛给调用方。
     const msg = String(out.message || "");
-    const cspBlocked = /Content Security Policy|unsafe-eval|Trusted Type/i.test(msg);
+    // Firefox 措辞：「call to eval() blocked by CSP」
+    const cspBlocked = /Content Security Policy|unsafe-eval|Trusted Type|blocked by CSP/i.test(msg);
     if (cspBlocked) {
       const viaCdp = await cdpEvaluate(tabId, params);
       if (viaCdp) return viaCdp;
@@ -1877,6 +1946,64 @@ function cdpScreenshot(tabId, format, quality, captureBeyondViewport) {
 // 只有集合内的 tab 才允许 session.send，且 session.detach / 调试目标卸载时移除。
 const cdpSessions = new Set();
 
+// ---------- 调试器通道：chrome.debugger 或 host 上的 BiDi 替身 ----------
+// 两种实现都统一成「Promise + Error(message)」：下游按 message 判定的正则
+// （already attached / Another debugger / not attached / Detached）对两者都成立，
+// host 翻译层的报错措辞与 chrome.debugger 保持一致。
+// Firefox 侧新增的两种失败带 code 透传：CDP_UNSUPPORTED（翻译层不支持该方法）、
+// BIDI_UNAVAILABLE（Firefox 没带 --remote-debugging-port 启动，或 BiDi 会话被别的工具占用）。
+const HOST_CDP_ERROR_CODES = new Set(["CDP_UNSUPPORTED", "BIDI_UNAVAILABLE"]);
+
+function chromeDebuggerCall(invoke) {
+  return new Promise((resolve, reject) => {
+    invoke((resp) => {
+      const err = chrome.runtime.lastError;
+      if (err) reject(new Error(err.message || "debugger call failed"));
+      else resolve(resp);
+    });
+  });
+}
+
+// tabId → BiDi context 配对用的一次性页面标记（见 relay/bidi-cdp.js）
+function setBidiMarker(tabId, attr, value) {
+  return withTimeout(
+    chrome.scripting.executeScript({
+      target: { tabId },
+      func: (a, v) => {
+        if (v === null) document.documentElement.removeAttribute(a);
+        else document.documentElement.setAttribute(a, v);
+      },
+      args: [attr, value],
+    }),
+    INJECT_TIMEOUT_MS,
+    "PAGE_CONTEXT_TIMEOUT",
+    `写入 BiDi 配对标记超时(${INJECT_TIMEOUT_MS}ms)`
+  );
+}
+
+async function dbgAttach(tabId) {
+  if (!CDP_VIA_HOST) return chromeDebuggerCall((cb) => chrome.debugger.attach({ tabId }, "1.3", cb));
+  const r = await hostCall("bidi.attach", { tabId });
+  if (!r.needMarker) return;
+  const marker = crypto.randomUUID();
+  await setBidiMarker(tabId, r.markerAttr, marker);
+  try {
+    await hostCall("bidi.attach", { tabId, marker });
+  } finally {
+    await setBidiMarker(tabId, r.markerAttr, null).catch(() => { /* 页面已导航：标记随文档消失 */ });
+  }
+}
+
+function dbgDetach(tabId) {
+  if (!CDP_VIA_HOST) return chromeDebuggerCall((cb) => chrome.debugger.detach({ tabId }, cb));
+  return hostCall("bidi.detach", { tabId });
+}
+
+function dbgSend(tabId, method, params) {
+  if (!CDP_VIA_HOST) return chromeDebuggerCall((cb) => chrome.debugger.sendCommand({ tabId }, method, params || {}, cb));
+  return hostCall("bidi.send", { tabId, method, params: params || {} });
+}
+
 /**
  * 借用调试器跑一段 CDP 操作，结束后**只归还自己借的那一份**。
  *
@@ -1906,32 +2033,24 @@ const cdpSessions = new Set();
  */
 async function withBorrowedDebugger(tabId, fn) {
   requireTabId(tabId);
-  const send = (method, params) =>
-    new Promise((resolve, reject) => {
-      chrome.debugger.sendCommand({ tabId }, method, params || {}, (resp) => {
-        const err = chrome.runtime.lastError;
-        if (err) reject(new Error(err.message || "sendCommand failed"));
-        else resolve(resp);
-      });
-    });
+  const send = (method, params) => dbgSend(tabId, method, params);
 
   // 情形 1：agent 自己持有会话 → 复用它，绝不拆
   if (cdpSessions.has(tabId)) return fn(send);
 
-  const attached = await new Promise((resolve) => {
-    chrome.debugger.attach({ tabId }, "1.3", () => {
-      const err = chrome.runtime.lastError;
-      if (!err) return resolve({ ok: true, owned: true });
+  const attached = await dbgAttach(tabId).then(
+    () => ({ ok: true, owned: true }),
+    (err) => {
       const m = String(err.message || "");
       // 情形 3：本扩展已附加（上一次 detach 漏掉 / 并发重复 attach）
-      if (/already attached/i.test(m)) return resolve({ ok: true, owned: false });
-      resolve({
+      if (/already attached/i.test(m)) return { ok: true, owned: false };
+      return {
         ok: false,
-        code: /Another debugger|already has/i.test(m) ? "DEBUGGER_BUSY" : "ATTACH_FAILED",
+        code: err.code || (/Another debugger|already has/i.test(m) ? "DEBUGGER_BUSY" : "ATTACH_FAILED"),
         message: m,
-      });
-    });
-  });
+      };
+    }
+  );
 
   if (!attached.ok) {
     const e = new Error(attached.message || attached.code);
@@ -1945,7 +2064,7 @@ async function withBorrowedDebugger(tabId, fn) {
   } finally {
     // 只归还自己借的那一份：复用来的会话拆掉会把 agent 后续调用全废掉
     if (attached.owned) {
-      try { chrome.debugger.detach({ tabId }, () => { /* noop */ }); } catch (e) { /* noop */ }
+      await dbgDetach(tabId).catch(() => { /* tab 已关闭等：会话已随之消失 */ });
     }
   }
 }
@@ -2338,48 +2457,43 @@ async function pageRead(params) {
 async function sessionAttach(tabId) {
   requireTabId(tabId);
   if (cdpSessions.has(tabId)) return { attached: true, tabId, already: true };
-  await new Promise((resolve, reject) => {
-    chrome.debugger.attach({ tabId }, "1.3", () => {
-      const err = chrome.runtime.lastError;
-      if (!err) { cdpSessions.add(tabId); return resolve(); }
-      const m = String(err.message || "");
-      // 我们自己已附加过（上一次 detach 漏掉 / 并发重复 attach）：视作已就绪，不报错。
-      if (/already attached/i.test(m)) { cdpSessions.add(tabId); return resolve(); }
+  try {
+    await dbgAttach(tabId);
+  } catch (err) {
+    const m = String(err.message || "");
+    // 我们自己已附加过（上一次 detach 漏掉 / 并发重复 attach）：视作已就绪，不报错。
+    if (!/already attached/i.test(m)) {
       // 真正的占用者是用户手动打开的 DevTools：不能抢，明确告知。
       if (/Another debugger|already has/i.test(m)) {
-        return reject({ code: "DEBUGGER_BUSY", message: `该标签页已被其他调试器占用（通常是用户打开的 DevTools）：${m}` });
+        throw { code: "DEBUGGER_BUSY", message: `该标签页已被其他调试器占用（通常是用户打开的 DevTools）：${m}` };
       }
-      reject({ code: "SESSION_ATTACH_FAILED", message: m });
-    });
-  });
+      throw { code: HOST_CDP_ERROR_CODES.has(err.code) ? err.code : "SESSION_ATTACH_FAILED", message: m };
+    }
+  }
+  cdpSessions.add(tabId);
   return { attached: true, tabId };
 }
 async function sessionDetach(tabId) {
   requireTabId(tabId);
   cdpSessions.delete(tabId);
-  await new Promise((resolve) => {
-    chrome.debugger.detach({ tabId }, () => resolve());
-  });
+  await dbgDetach(tabId).catch(() => { /* 未附加 / tab 已关闭：detach 本就是幂等的 */ });
   return { detached: true, tabId };
 }
-function sessionSend(tabId, params) {
+async function sessionSend(tabId, params) {
   requireTabId(tabId);
   if (!params || !params.method) throw { code: "BAD_PARAMS", message: "缺少 CDP method" };
   if (!cdpSessions.has(tabId)) {
     throw { code: "SESSION_NOT_ATTACHED", message: `未附加调试器（tab ${tabId}），请先调用 session.attach` };
   }
-  return new Promise((resolve, reject) => {
-    chrome.debugger.sendCommand({ tabId }, params.method, params.params || {}, (resp) => {
-      const err = chrome.runtime.lastError;
-      if (err) {
-        const m = String(err.message || "");
-        // 页面导航导致调试目标被卸载：清理本地记录，避免后续调用连环失败
-        if (/Detached while handling|not attached|Detached/i.test(m)) cdpSessions.delete(tabId);
-        return reject({ code: /Detached/i.test(m) ? "SESSION_DETACHED" : "SESSION_SEND_FAILED", message: m });
-      }
-      resolve({ result: resp });
-    });
-  });
+  try {
+    return { result: await dbgSend(tabId, params.method, params.params || {}) };
+  } catch (err) {
+    const m = String(err.message || "");
+    // 页面导航导致调试目标被卸载：清理本地记录，避免后续调用连环失败
+    if (/Detached while handling|not attached|Detached/i.test(m)) cdpSessions.delete(tabId);
+    const code = HOST_CDP_ERROR_CODES.has(err.code) ? err.code : (/Detached/i.test(m) ? "SESSION_DETACHED" : "SESSION_SEND_FAILED");
+    throw { code, message: m };
+  }
 }
 
 // 调试目标被卸载（页面导航 / tab 关闭 / 用户关闭 DevTools）时同步清理本地记录，

@@ -1,5 +1,21 @@
 # 版本与更新（扩展 + 本地桥）
 
+## 0.3.14：Firefox 版（同一套 RPC，CDP 经 WebDriver BiDi 执行）
+
+1. **Firefox 扩展**：与 Chrome 版共用 `extension/` 源码，`relay/build-firefox.js` 只派生 manifest（输出 `dist/firefox/`）。
+   浏览器差异在运行时按能力判断；`bridge.status` 新增 `browser`、`cdp`（`chrome.debugger` / `bidi`）字段。
+2. **CDP→BiDi 翻译层**（`relay/bidi-cdp.js`）：Firefox 扩展没有 `chrome.debugger`，`page.clickReal` / `page.typeReal` /
+   `page.uploadFile` / `page.evalCdp` / `page.screenshot` 与 `session.send` 的 CDP 命令由 host 经 Firefox Remote Agent 执行，
+   返回形状与 Chrome 一致。支持的 CDP 方法与差异见 `firefox/SKILL.md`；不支持的方法报 `CDP_UNSUPPORTED`。
+3. **每个浏览器一个 host**：host 按拉起方识别浏览器，Firefox 默认端口 `8779`、日志 `host-firefox.log`；`/status` 新增 `browser`、`bidi` 字段。
+4. **客户端选浏览器**：`scripts/lib/bridge.mjs`、`agent/client.mjs`、`agent/verify-bridge.mjs` 与 `scripts/` 下全部脚本
+   支持 `BRIDGE_BROWSER=chrome|firefox`（`BRIDGE_PORT` 优先）。此前这些脚本把 `8778` 写死。
+5. **安装与启动**：`install-host.sh --browser firefox` 注册 Firefox native host；`relay/firefox-launch.js` 以 Remote Agent 模式启动
+   Firefox 并把扩展装成临时扩展。`relay/sign-firefox.js` 走 AMO 自分发（unlisted）签名，产出可永久安装的 `.xpi`。`firefox-launch.js --install-xpi` 免确认框永久安装签名版。
+6. **Chrome 侧行为不变**：调试器调用收敛到 `dbgAttach / dbgDetach / dbgSend`，`withBorrowedDebugger` 归还会话时改为等待 detach 完成。
+
+新增错误码：`BIDI_UNAVAILABLE`、`CDP_UNSUPPORTED`（仅 Firefox）。
+
 ## 0.3.13：Agent 易用性全面升级（原子 CDP · 交互 Delta · 元素 ref · 一键读取 · 阻断诊断 · 内存错情）
 
 围绕 `host.log` 33.5 万行真实运行数据暴露的高频痛点，一次性升级扩展、本地桥、客户端与 CLI：
@@ -256,7 +272,7 @@ WS 分片与背压 / host-扩展副作用清单契约）、`test-content-stop.mj
 
 | 部件 | 版本 | 版本号来源 |
 |---|---|---|
-| 扩展 | **0.3.13** | `extension/manifest.json`（唯一事实来源） |
+| 扩展 | **0.3.14** | `extension/manifest.json`（唯一事实来源） |
 | 本地桥 host | 同扩展 | 启动时读 `extension/manifest.json`（不单独维护） |
 | 本 skill | 随 ClawHub 发布 | — |
 
@@ -483,6 +499,7 @@ await rpc.scrollLoad(tabId, { y: 99999, expectGrowth: true });
 | `page.waitForReady` 返回 `UNKNOWN_METHOD` | 0.3.3 |
 | `page.read` / `page.clickReal` / `page.typeReal` / `page.uploadFile` / `page.evalCdp` 返回 `UNKNOWN_METHOD` | **0.3.13** |
 | `tabs.resolve` 返回 `UNKNOWN_METHOD` | 0.3.9 |
+| `/status` 没有 `browser` 字段，或 `BRIDGE_BROWSER=firefox` 连不上 8779 | **0.3.14** |
 | chatgpt.com / github.com 上 `page.evaluate` 被 CSP 拦 | 0.3.3 |
 
 `UNKNOWN_METHOD` 一律是「扩展版本不够新」的信号——不是站点问题，也不是脚本 bug。

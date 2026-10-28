@@ -12,6 +12,15 @@ import path from "node:path";
 import http from "node:http";
 
 const TOKEN_FILE = path.join(os.homedir(), ".chrome-agent-bridge", "token");
+// Chrome 与 Firefox 各有一个 host（RPC 相同，端口不同）。BRIDGE_BROWSER 选浏览器，BRIDGE_PORT 优先。
+const BROWSER_PORTS = { chrome: 8778, firefox: 8779 };
+
+function defaultPort() {
+  if (process.env.BRIDGE_PORT || process.env.AGENT_BRIDGE_PORT) return Number(process.env.BRIDGE_PORT || process.env.AGENT_BRIDGE_PORT);
+  const browser = process.env.BRIDGE_BROWSER || "chrome";
+  if (!BROWSER_PORTS[browser]) throw new Error(`BRIDGE_BROWSER 仅支持 ${Object.keys(BROWSER_PORTS).join(" / ")}，收到 ${browser}`);
+  return BROWSER_PORTS[browser];
+}
 
 function loadToken() {
   if (process.env.BRIDGE_TOKEN) return process.env.BRIDGE_TOKEN.trim();
@@ -49,7 +58,7 @@ export class BridgeTimeoutError extends BridgeError {
 export class Bridge {
   constructor(opts = {}) {
     this.host = opts.host || process.env.AGENT_BRIDGE_HOST || "127.0.0.1";
-    this.port = opts.port || Number(process.env.BRIDGE_PORT || process.env.AGENT_BRIDGE_PORT) || 8778;
+    this.port = opts.port || defaultPort();
     this.token = opts.token || loadToken();
     this.timeoutMs = opts.timeoutMs || 60000;
     this.agentId = opts.agentId || process.env.AGENT_ID || `agent-${process.pid}`;

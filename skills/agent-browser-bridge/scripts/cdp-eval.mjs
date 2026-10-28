@@ -11,6 +11,7 @@
 // 返回值: 表达式求值结果（returnByValue）。若表达式返回 Promise, 需加 --awaitPromise。
 // 注意: Runtime.evaluate 运行在页面主世界, 可访问 window/document/React 内部状态;
 //       DOM 操作与主世界一致, 不受扩展隔离世界限制。
+import { BRIDGE_ORIGIN } from "./lib/bridge.mjs";
 const token = process.env.BRIDGE_TOKEN;
 const [, , tabIdArg, exprArg, ...rest] = process.argv;
 let timeoutMs = 20000, awaitPromise = false, rawJson = false;
@@ -26,7 +27,7 @@ if (!token || !tabId || !exprArg) {
 }
 
 const rpc = async (method, params = {}, t = timeoutMs) => {
-  const res = await fetch("http://127.0.0.1:8778/rpc", {
+  const res = await fetch(`${BRIDGE_ORIGIN}/rpc`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify({ method, params, timeoutMs: t }),

@@ -20,6 +20,7 @@
 //   - 评论: .comment-item（一级）/ .comment-item-sub（楼中楼），滚动 .note-scroller 触底加载
 import fs from "node:fs";
 import path from "node:path";
+import { BRIDGE_ORIGIN } from "./lib/bridge.mjs";
 
 const token = process.env.BRIDGE_TOKEN;
 const [, , tabIdArg, ...rest] = process.argv;
@@ -38,7 +39,7 @@ if (!token || !args.tabId) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rpc = async (method, params = {}, timeoutMs = 20000) => {
-  const res = await fetch("http://127.0.0.1:8778/rpc", {
+  const res = await fetch(`${BRIDGE_ORIGIN}/rpc`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify({ method, params, timeoutMs }),

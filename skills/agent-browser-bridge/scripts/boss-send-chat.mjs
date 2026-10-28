@@ -30,11 +30,12 @@ if (!token || !tabId || !text) {
 import { pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { BRIDGE_ORIGIN } from "./lib/bridge.mjs";
 const __dirname = import.meta.dirname || dirname(fileURLToPath(import.meta.url));
 const helpersUrl = pathToFileURL(join(__dirname, "boss-verify-helpers.mjs")).href;
 const { COLLECT_BUBBLES_EXPR, analyzeDelivery, decideOutcome } = await import(helpersUrl);
 
-const RPC = "http://127.0.0.1:8778/rpc";
+const RPC = `${BRIDGE_ORIGIN}/rpc`;
 async function rpc(method, params) {
   const resp = await fetch(RPC, {
     method: "POST",
@@ -104,7 +105,7 @@ async function checkStop(where) {
 }
 
 async function claimTab() {
-  const resp = await fetch("http://127.0.0.1:8778/tabs/claim", {
+  const resp = await fetch(`${BRIDGE_ORIGIN}/tabs/claim`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, "X-Agent-Id": agentId },
     body: JSON.stringify({ tabId, agentId, ttlMs: 120000 }),
@@ -117,7 +118,7 @@ async function releaseLease() {
   if (!leased) return;
   leased = false;
   try {
-    await fetch("http://127.0.0.1:8778/tabs/release", {
+    await fetch(`${BRIDGE_ORIGIN}/tabs/release`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, "X-Agent-Id": agentId },
       body: JSON.stringify({ tabId, agentId }),

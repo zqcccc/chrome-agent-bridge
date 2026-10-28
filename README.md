@@ -139,6 +139,16 @@ await bridge.rpc("page.snapshot", { mode: "a11y" });
 await bridge.rpc("page.click", { selector: "#submit" });
 ```
 
+### Firefox
+
+同一套 RPC 也能操作 Firefox（host 端口 8779）。安装见 [`skills/agent-browser-bridge/INSTALL.md`](skills/agent-browser-bridge/INSTALL.md)「Firefox」一节；之后 AI 侧只需设 `BRIDGE_BROWSER=firefox`：
+
+```bash
+bash relay/install-host.sh --browser firefox   # 注册一次
+node relay/firefox-launch.js                   # 每次打开 Firefox 都用它（以 Remote Agent 模式启动并装上扩展）
+BRIDGE_BROWSER=firefox node agent/cli.mjs tabs
+```
+
 完整的 RPC 清单、错误码、多 Agent 并行与 Tab 租约、CDP 直通等，见 [docs/AI-INTEGRATION.md](docs/AI-INTEGRATION.md) 和 [`skills/agent-browser-bridge/SKILL.md`](skills/agent-browser-bridge/SKILL.md)。
 
 ---
@@ -147,7 +157,7 @@ await bridge.rpc("page.click", { selector: "#submit" });
 
 ```
 chrome-agent-bridge/
-├── extension/               # Chrome MV3 扩展
+├── extension/               # MV3 扩展（Chrome 直接加载；Firefox 版由 relay/build-firefox.js 生成到 dist/firefox）
 ├── relay/                   # 本地桥（native host + HTTP/WS 服务）
 ├── agent/                   # AI 客户端（cli.mjs / client.mjs）
 ├── docs/AI-INTEGRATION.md   # 给 AI Agent 的接入与操作指南
@@ -160,7 +170,7 @@ chrome-agent-bridge/
 ```bash
 clawhub login
 clawhub publish ./skills/agent-browser-bridge \
-  --slug agent-browser-bridge --version 0.3.13 \
+  --slug agent-browser-bridge --version 0.3.14 \
   --tags latest,browser,chrome --changelog "见 CHANGELOG.md"
 ```
 
@@ -172,7 +182,7 @@ cd relay && npm test
 
 ## 已知边界
 
-- 只支持 macOS + Google Chrome
+- 只支持 macOS；浏览器支持 Google Chrome 与 Firefox（Firefox 需用 `relay/firefox-launch.js` 启动，差异见 [`skills/agent-browser-bridge/firefox/SKILL.md`](skills/agent-browser-bridge/firefox/SKILL.md)）
 - `chrome://` 等受保护页面不能注入脚本
 - 超长页面整页截图较慢，默认只截视口
 - 扩展 MV3 的 service worker 会周期性休眠，导致短暂断连（host 已内置自动等待重连，AI 无感知）

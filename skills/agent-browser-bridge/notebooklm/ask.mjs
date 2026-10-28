@@ -9,6 +9,7 @@
  *
  * 环境: BRIDGE_TOKEN
  */
+import { BRIDGE_ORIGIN } from "../scripts/lib/bridge.mjs";
 const token = process.env.BRIDGE_TOKEN;
 const [, , tabIdArg, question, ...rest] = process.argv;
 if (!token || !tabIdArg || !question) {
@@ -23,7 +24,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.error("[nblm-ask]", ...a);
 
 async function rpc(method, params = {}, t = 30000) {
-  const res = await fetch("http://127.0.0.1:8778/rpc", {
+  const res = await fetch(`${BRIDGE_ORIGIN}/rpc`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify({ method, params, timeoutMs: t }),

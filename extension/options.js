@@ -2,8 +2,11 @@
   const $ = (id) => document.getElementById(id);
   const show = (id, text) => { const el = $(id); el.textContent = text; el.style.display = "block"; };
   const hide = (id) => { $(id).style.display = "none"; };
+  // 与 background.js 的 DEFAULT_PORTS 一致：Chrome 8778 / Firefox 8779
+  const DEFAULT_PORT = chrome.runtime.getURL("").startsWith("moz-extension:") ? 8779 : 8778;
 
   async function init() {
+    $("port").placeholder = String(DEFAULT_PORT);
     const resp = await chrome.runtime.sendMessage({ type: "bridge.config:get" });
     if (resp && resp.config) {
       $("channel").value = resp.config.channel || "auto";
@@ -23,7 +26,7 @@
     const config = {
       channel: $("channel").value,
       host: $("host").value.trim() || "127.0.0.1",
-      port: parseInt($("port").value.trim() || "8778", 10),
+      port: parseInt($("port").value.trim() || String(DEFAULT_PORT), 10),
       token: $("token").value.trim(),
     };
     const resp = await chrome.runtime.sendMessage({ type: "bridge.config:set", config });

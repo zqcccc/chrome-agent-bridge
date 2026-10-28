@@ -17,6 +17,7 @@
 //     - 卡片整块是 a[href*="/user/profile/"] 链接
 //   - 自己的账号会以「我」卡片置顶（无 xsec_token）
 //   - 点卡片会导航到该用户主页（可在同 tab 内继续跑 xhs-user-notes.mjs）
+import { BRIDGE_ORIGIN } from "./lib/bridge.mjs";
 const token = process.env.BRIDGE_TOKEN;
 const [, , tabIdArg, keywordArg, ...rest] = process.argv;
 let maxResults = 10;
@@ -30,7 +31,7 @@ if (!token || !tabId || !keywordArg) {
 }
 
 const rpc = async (method, params = {}, timeoutMs = 20000) => {
-  const res = await fetch("http://127.0.0.1:8778/rpc", {
+  const res = await fetch(`${BRIDGE_ORIGIN}/rpc`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify({ method, params, timeoutMs }),

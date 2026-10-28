@@ -28,6 +28,8 @@
 | `UNKNOWN_METHOD` | 扩展版本不够新 | 不是站点问题也不是脚本 bug；对照 `CHANGELOG.md` 的症状表 |
 | `DEBUGGER_BUSY` | 用户手动开着 DevTools | 不抢，告知用户关掉 DevTools 再试 |
 | `UNSUPPORTED_URL` | 受保护协议（`chrome://` 等） | 桥不能注入也不能截图，换页面 |
+| `BIDI_UNAVAILABLE` | **仅 Firefox**：Firefox 没以 Remote Agent 模式启动，或 BiDi 会话被别的自动化工具占用 | 不要重试；告知用户退出 Firefox 后按 `firefox/SKILL.md` 重新启动 |
+| `CDP_UNSUPPORTED` | **仅 Firefox**：`session.send` 用了翻译层不支持的 CDP 方法 | 查 `firefox/SKILL.md` 支持表，换方法或改用 Chrome |
 
 > **「页面看起来正常但取不到内容」优先怀疑懒渲染，不是选择器。** 实测 LinkedIn 档案页在
 > 后台标签页下 SDUI 完全不渲染（条目 0 条、不报错），先 `page.ensureActive` 再读。

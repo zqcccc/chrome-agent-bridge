@@ -4,9 +4,12 @@
 "use strict";
 const TOKEN = process.env.BRIDGE_TOKEN;
 if (!TOKEN) { console.error("缺 BRIDGE_TOKEN"); process.exit(1); }
+// 与 client.mjs 一致：BRIDGE_PORT 优先，否则按 BRIDGE_BROWSER 选（chrome 8778 / firefox 8779）
+const PORT = Number(process.env.BRIDGE_PORT || process.env.AGENT_BRIDGE_PORT || { chrome: 8778, firefox: 8779 }[process.env.BRIDGE_BROWSER || "chrome"]);
+if (!PORT) { console.error(`BRIDGE_BROWSER 仅支持 chrome / firefox，收到 ${process.env.BRIDGE_BROWSER}`); process.exit(1); }
 
 async function rpc(method, params, timeoutMs = 12000) {
-  const r = await fetch("http://127.0.0.1:8778/rpc", {
+  const r = await fetch(`http://127.0.0.1:${PORT}/rpc`, {
     method: "POST",
     headers: { "Authorization": `Bearer ${TOKEN}`, "Content-Type": "application/json" },
     body: JSON.stringify({ method, params, timeoutMs }),

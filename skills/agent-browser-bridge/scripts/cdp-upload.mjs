@@ -7,6 +7,7 @@
  *
  * 前置: session.attach 必须先调用（Runtime.evaluate 才能用；DOM.* 也需要 attach）
  */
+import { BRIDGE_ORIGIN } from "./lib/bridge.mjs";
 const token = process.env.BRIDGE_TOKEN;
 const [, , tabIdArg, selectorArg, ...files] = process.argv;
 const tabId = Number(tabIdArg);
@@ -14,7 +15,7 @@ if (!token || !tabId || !files.length) {
   console.error('usage: BRIDGE_TOKEN=xxx node cdp-upload.mjs <tabId> <selector|""> <file...>');
   process.exit(1);
 }
-const BASE = "http://127.0.0.1:8778/rpc";
+const BASE = `${BRIDGE_ORIGIN}/rpc`;
 
 async function rpc(method, params, t = 20000) {
   const res = await fetch(BASE, {

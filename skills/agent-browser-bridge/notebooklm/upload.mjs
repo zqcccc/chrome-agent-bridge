@@ -18,6 +18,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { BRIDGE_ORIGIN } from "../scripts/lib/bridge.mjs";
 
 const token = process.env.BRIDGE_TOKEN;
 const args = process.argv.slice(2);
@@ -26,7 +27,7 @@ if (!token) {
   process.exit(1);
 }
 
-const BRIDGE = "http://127.0.0.1:8778/rpc";
+const BRIDGE = `${BRIDGE_ORIGIN}/rpc`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.error("[nblm]", ...a);
 

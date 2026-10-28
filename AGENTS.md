@@ -26,7 +26,7 @@ node agent/cli.mjs verify            # 回归自检，改完跑一次（12 项�
 
 - 原理：RPC `extension.reload` → 扩展**先回响应、再**延迟调 `chrome.runtime.reload()`。顺序不能反——自重载会立即终止自身执行，先回响应否则调用方永远收不到结果。
 - **响应必然丢失，属正常**：扩展 reload 会连带关闭 native channel，host 进程随之退出并由 Chrome 重新拉起，该次 HTTP 响应收不到。CLI 已改由轮询 `/status` 确认重连；自己写脚本时照此处理，别把丢响应当失败。
-- 改 `relay/host.js` 要重启 host（Chrome 按需重新拉起，约 1s）：`pkill -f "chrome-agent-bridge/relay/host.js"`。
+- 改 `relay/host.js` 要重启 host（Chrome 按需重新拉起，约 1s）：`pkill -f "chrome-agent-bridge/relay/host.js"`。这条会同时结束 Chrome 与 Firefox 的 host；只能用默认的 SIGTERM，不要 `-9`（原因见下文「Firefox 版」）。
 - 兜底：自重载失效时才到 chrome://extensions 手工点刷新。
 
 ### 怎么确认新代码真的加载了
@@ -205,6 +205,56 @@ details 被静默丢弃**，Agent 只能解析 message 文本才能判断——�
 ### 兜底：未捕获的 promise rejection
 
 service worker 里漏网的 rejection 会变成面板上的 `Uncaught (in promise)`，掩盖真实问题。已在启动时注册 `unhandledrejection` 监听统一记录为 warn。新增顶层 promise 时仍要自己 catch，别依赖这个兜底。
+
+### Firefox 版（v0.3.14）
+
+**源码只有一份**。`extension/` 同时是 Chrome 版与 Firefox 版的源码；`relay/build-firefox.js` 只改 manifest
+（`service_worker` → `background.scripts`、去掉 `debugger` 权限、加 gecko id），输出到 `dist/firefox/`（gitignore）。
+浏览器差异在 `background.js` 里按能力判断：`BROWSER`（端口 8778 / 8779）与 `CDP_VIA_HOST = !chrome.debugger`。
+**不要为 Firefox 复制一份扩展代码。**
+
+开发循环（Firefox 加载的是 `dist/firefox/`，改完必须先重新构建）：
+
+```bash
+node relay/build-firefox.js
+BRIDGE_BROWSER=firefox node agent/cli.mjs reload-ext   # 临时扩展 reload 会从 dist/firefox 重新读入（已实测）
+BRIDGE_BROWSER=firefox node agent/cli.mjs verify
+node relay/test-firefox-e2e.mjs                         # 真机回归：自己起独立 profile 的 Firefox，跑完关掉
+```
+
+host 日志：`~/.chrome-agent-bridge/host-firefox.log`（Chrome 仍是 `host.log`）。
+
+**CDP 的去向**：Firefox 扩展没有 `chrome.debugger`。扩展里的 `dbgAttach / dbgDetach / dbgSend` 在 Firefox 上把调用
+经 native 通道反向发给 host（`bidi.attach / bidi.detach / bidi.send`），由 `relay/bidi-cdp.js` 翻译成 WebDriver BiDi。
+改这块要注意：
+
+1. **翻译层的报错措辞照抄 chrome.debugger**（`already attached` / `not attached` / `Detached while handling command`）。
+   `withBorrowedDebugger`、`sessionAttach`、`sessionSend` 靠正则匹配这些措辞决定会话状态，改了措辞就会出现
+   「会话已失效但扩展以为还在」。只有 Firefox 独有的失败带 code：`CDP_UNSUPPORTED`、`BIDI_UNAVAILABLE`。
+2. **扩展或 skill 脚本新用了一个 CDP 方法，必须在 `bidi-cdp.js` 加翻译**，否则 `test-bidi-unit.mjs` 的覆盖检查会红。
+   不支持的方法报 `CDP_UNSUPPORTED`，不要返回 `{}` 冒充成功（`*.enable` 尤其如此：返回成功会让调用方一直等不来事件）。
+3. **返回形状对齐 CDP returnByValue**：Map / Set / Date / Node 按值返回是 `{}`；对象里的 undefined 属性省略；
+   异常时 `result` 与 `exceptionDetails.exception` 是同一个对象。改值还原逻辑先跑 `test-bidi-unit.mjs`。
+4. **tabId ↔ BiDi context 配对**：两套编号无关。首次 attach 时扩展往 `<html>` 写一次性属性 `data-abb-bidi`，
+   host 在各顶层 context 的 sandbox 里读它来配对，结果缓存到 context 销毁（导航不换 context id）。
+
+**踩过的坑（都已实测）**：
+
+- **Firefox 断开 WebSocket 不释放 BiDi 会话**，且同一时间只允许一个会话：断开后再连，`session.new` 一直报
+  `Maximum number of active sessions`，按 sessionId 重连也不行，只能重启 Firefox。所以 host 在 stdin 关闭、SIGTERM、
+  SIGINT 时都先 `session.end` 再退出（`shutdownAndExit`）；`kill -9` 会让会话残留。`test-firefox-e2e.mjs` 第 8 节专测这条。
+- **Firefox 的 `e.stack` 不含「类型: 消息」首行**（Chrome 含），CSP 拦截的措辞也不同（`call to eval() blocked by CSP`）。
+  `page.evaluate` 的 CSP 兜底判定曾因此失效，现在注入函数里用 `errText()` 补齐首行。
+- **Firefox 对 contenteditable 调 `focus()` 不放置光标**，`execCommand("insertText")` 没有落点、静默不输入。
+  `Input.insertText` 的翻译在选区不在焦点元素内时把光标放到末尾。
+- **CDP 的 Emulation 覆盖随 detach 失效，BiDi 的 `setViewport` 不会**，翻译层在 detach 时还原。
+- **Remote Agent 开启期间 `navigator.webdriver === true`**。这是方案的固有代价，已写进 skill 文档，别试图在桥里掩盖。
+- Firefox MV3 后台是事件页，实测有 native 端口与 30s keepalive 时空闲 2 分钟不会被挂起。
+- **签名与永久安装**：`relay/sign-firefox.js` 走 AMO unlisted 签名（凭据在 `~/.chrome-agent-bridge/amo-credentials`，600）。
+  永久安装用 BiDi `webExtension.install` 的私有参数 `"moz:permanent": true`（`firefox-launch.js --install-xpi`），
+  不弹确认框，`<all_urls>` 也一并授予（记录在 profile 的 `extension-preferences.json`，`extensions.json` 的
+  `userPermissions.origins` 显示为空是正常的）。`open -a Firefox x.xpi` 会弹确认框，而 Firefox 界面元素不暴露给
+  macOS 辅助功能，自动化点不到，别走这条。AMO 不接受重复版本号，重签前先升 manifest 版本。
 
 ## 其他开发规范
 

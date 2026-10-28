@@ -50,3 +50,56 @@ node <仓库根>/agent/cli.mjs verify
 
 - 扩展不会自动更新。升级流程见 `CHANGELOG.md`（`git pull` + `node agent/cli.mjs reload-ext` + `node agent/cli.mjs verify`）。
 - 推荐只用 Native 模式，不要另外 `npm start` 起 standalone host（会占用 8778 端口，导致 native host 启动失败）。
+
+## Firefox（可选，在 Chrome 安装完成后进行）
+
+前提：Firefox ≥ 140、Node.js ≥ 22（host 用 Node 内置 WebSocket 连接 Firefox 的 Remote Agent）。
+Firefox 版扩展**未签名**，正式版 Firefox 只能把它装成「临时扩展」，Firefox 重启后会消失——
+所以每次都用启动器启动 Firefox，由它以 Remote Agent 模式启动 Firefox 并重新装上扩展。
+
+| 步骤 | 谁做 | 说明 |
+|---|---|---|
+| 1. 注册 Firefox native host | **Agent**（先征得用户同意） | 写入 `~/Library/Application Support/Mozilla/NativeMessagingHosts/com.agentbrowser.bridge.json` |
+| 2. 完全退出 Firefox | **用户** | 启动器不会结束用户正在用的 Firefox |
+| 3. 启动 Firefox 并装扩展 | **Agent** | 用户的默认 profile、登录态不变 |
+| 4. 验证连接 | **Agent** | 只读自检 |
+
+```bash
+# 1. Agent 执行
+bash <仓库根>/relay/install-host.sh --browser firefox
+
+# 2. 把这句话发给用户：「请按 ⌘Q 完全退出 Firefox，好了告诉我。」
+
+# 3. Agent 执行（之后每次重启 Firefox 都用这条命令打开）
+node <仓库根>/relay/firefox-launch.js
+
+# 4. Agent 执行
+curl -s http://127.0.0.1:8779/status          # "browser":"firefox"，"extConnected":true
+BRIDGE_BROWSER=firefox BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token) node <仓库根>/agent/cli.mjs verify
+```
+
+### 永久安装（签名版，免每次重装）
+
+临时扩展每次重启 Firefox 都要重装。用 AMO 自分发（unlisted）签名后可永久安装，扩展不会公开上架：
+
+```bash
+# 凭据：https://addons.mozilla.org/developers/addon/api/key/ 生成（需登录 Mozilla 账号、开两步验证、接受开发者协议、确认邮箱）
+# 写入 ~/.chrome-agent-bridge/amo-credentials（chmod 600）：
+#   WEB_EXT_API_KEY=user:12345678:123
+#   WEB_EXT_API_SECRET=<secret>
+node <仓库根>/relay/sign-firefox.js                 # 产物 dist/firefox-signed/*.xpi
+# Firefox 须已退出；启动后立即永久安装（BiDi 私有参数 moz:permanent，不弹确认框，<all_urls> 权限一并授予）
+node <仓库根>/relay/firefox-launch.js --no-install --install-xpi <仓库根>/dist/firefox-signed/<文件名>.xpi
+```
+
+装好后启动 Firefox 改用 `node <仓库根>/relay/firefox-launch.js --no-install`（只带 Remote Agent 启动参数，不再装临时扩展）。
+不加 `--no-install` 会用未签名的 `dist/firefox/` 临时覆盖已安装的签名版（重启 Firefox 后恢复）。
+AMO 不接受重复版本号：扩展升级后先升 `extension/manifest.json` 的 version 再签名，再用 `--install-xpi` 装新的 `.xpi`。
+`--install-xpi` 要在 host 连上 BiDi 之前执行（Firefox 只允许一个 BiDi 会话），所以放在启动 Firefox 的同一条命令里。
+
+启动器参数：`--profile <目录>`（用独立 profile 另起一个实例，可与日常 Firefox 并存）、`--bidi-port <端口>`（默认 9222）、
+`--no-install`（扩展已永久安装时跳过安装）。用户从 Dock 直接打开 Firefox 时，扩展与 Remote Agent 都不在，
+需要重新执行第 3 步。
+
+告知用户两点：Remote Agent 开启期间地址栏会显示远程控制标识；页面里的 `navigator.webdriver` 为 `true`，
+风控严格的站点（BOSS 直聘、小红书等）可能识别为自动化，这类站点优先用 Chrome。

@@ -27,6 +27,7 @@
 //   - 结果卡片：section.note-item 内的 .title（标题）+ 可见封面链接（a.cover.mask.ld，带 xsec_token）；
 //     卡片里第一个 a[href*="/explore/"] 是 display:none 的隐藏链接，禁止点击
 //   - 多关键词时：复用同一 tab，输入框输入新词 → Enter，循环即可，不要开新标签页
+import { BRIDGE_ORIGIN } from "./lib/bridge.mjs";
 const token = process.env.BRIDGE_TOKEN;
 const [, , tabIdArg, keywordArg, ...rest] = process.argv;
 let maxResults = 10;
@@ -50,7 +51,7 @@ if (!token || !tabId || !keywordArg) {
 }
 
 const rpc = async (method, params = {}, timeoutMs = 20000) => {
-  const res = await fetch("http://127.0.0.1:8778/rpc", {
+  const res = await fetch(`${BRIDGE_ORIGIN}/rpc`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify({ method, params, timeoutMs }),

@@ -20,6 +20,7 @@
 //   - 风控注意：回答生成耗时随笔记量变化；若页面出现验证码/安全验证立即停止，不要重试
 import fs from "node:fs";
 import path from "node:path";
+import { BRIDGE_ORIGIN } from "./lib/bridge.mjs";
 
 const token = process.env.BRIDGE_TOKEN;
 const [, , tabIdArg, keywordArg, ...rest] = process.argv;
@@ -38,7 +39,7 @@ if (!token || !tabId || !keywordArg) {
 }
 
 const rpc = async (method, params = {}, timeoutMs = 30000) => {
-  const res = await fetch("http://127.0.0.1:8778/rpc", {
+  const res = await fetch(`${BRIDGE_ORIGIN}/rpc`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify({ method, params, timeoutMs }),

@@ -34,6 +34,7 @@
 //   - 同名类可能挂多个模板（如广告插件提示），按可见性筛掉隐藏的
 //   - 「我知道了」按钮文本里可能夹全角空格；按 `trim()` 后严格等值
 //   - 软风控弹窗按钮被点过后可能再弹新的（一题接一题），所以 `--loop` 模式要按 stable-rounds 连续干净才退出
+import { BRIDGE_ORIGIN } from "./lib/bridge.mjs";
 
 const token = process.env.BRIDGE_TOKEN;
 
@@ -57,7 +58,7 @@ if (!token || !tabId) {
 }
 
 const rpc = async (method, params = {}, timeoutMs = 15000) => {
-  const res = await fetch("http://127.0.0.1:8778/rpc", {
+  const res = await fetch(`${BRIDGE_ORIGIN}/rpc`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify({ method, params, timeoutMs }),

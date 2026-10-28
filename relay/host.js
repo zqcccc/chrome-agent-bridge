@@ -15,6 +15,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { attachWsServer, WSConnection } = require("./ws-server");
+const { CdpOverBidi } = require("./bidi-cdp");
 
 // 版本号：单一事实来源是 extension/manifest.json（扩展才是提供 RPC 能力的一方）。
 // host 与扩展同属一个发布单元，共用一个版本号，不再各自维护——
@@ -35,16 +36,39 @@ const VERSION = (() => {
 const HOST_NAME = "com.agentbrowser.bridge";
 const STATE_DIR = path.join(os.homedir(), ".chrome-agent-bridge");
 const TOKEN_FILE = path.join(STATE_DIR, "token");
-const LOG_FILE = path.join(STATE_DIR, "host.log");
 
 const args = process.argv.slice(2);
 const STANDALONE = args.includes("--standalone") || process.stdin.isTTY;
-const PORT = (() => {
-  const i = args.findIndex((a) => a === "--port");
-  if (i !== -1 && args[i + 1]) return Number(args[i + 1]);
-  const env = process.env.AGENT_BRIDGE_PORT;
-  return env ? Number(env) : 8778;
+function argValue(name) {
+  const i = args.findIndex((a) => a === name);
+  return i !== -1 && args[i + 1] ? args[i + 1] : null;
+}
+
+// 拉起方：Chrome 传 `chrome-extension://<id>/`；Firefox 传 `<host manifest 路径> <gecko id>`。
+// 两个浏览器各跑一个 host，端口与日志分开，互不抢占。
+const BROWSER = (() => {
+  const explicit = argValue("--browser");
+  if (explicit) return explicit;
+  if (args.some((a) => a.startsWith("chrome-extension://"))) return "chrome";
+  if (args[0] && args[0].endsWith(".json") && args[1] && /@|^\{/.test(args[1])) return "firefox";
+  return "chrome";
 })();
+if (BROWSER !== "chrome" && BROWSER !== "firefox") {
+  console.error(`[host] FATAL code=BAD_PARAMS --browser 仅支持 chrome / firefox，收到 ${BROWSER}`);
+  process.exit(2);
+}
+const DEFAULT_PORTS = { chrome: 8778, firefox: 8779 };
+const LOG_FILE = path.join(STATE_DIR, BROWSER === "chrome" ? "host.log" : `host-${BROWSER}.log`);
+const PORT = (() => {
+  const v = argValue("--port");
+  if (v) return Number(v);
+  const env = process.env.AGENT_BRIDGE_PORT;
+  return env ? Number(env) : DEFAULT_PORTS[BROWSER];
+})();
+// Firefox 的 Remote Agent（WebDriver BiDi）端口：由 Firefox 启动参数 --remote-debugging-port 决定。
+// native host 继承 Firefox 进程的环境变量，所以启动器设置的 AGENT_BRIDGE_BIDI_PORT 会传到这里。
+const BIDI_PORT = Number(argValue("--bidi-port") || process.env.AGENT_BRIDGE_BIDI_PORT || 9222);
+const cdpBridge = BROWSER === "firefox" ? new CdpOverBidi({ port: BIDI_PORT }) : null;
 
 // ---------- 日志（含 5MB 自动轮转） ----------
 const LOG_MAX_BYTES = 5 * 1024 * 1024;
@@ -840,6 +864,54 @@ function sendEventToExtension(event, payload) {
   return false;
 }
 
+// ---------- 扩展发起的请求：Firefox 的 CDP 替身 ----------
+// Firefox 扩展没有 chrome.debugger，它把 attach / detach / sendCommand 发到这里，
+// 由 bidi-cdp.js 翻译成 WebDriver BiDi。只接受 bidi.* 方法。
+async function handleExtensionRequest(method, params = {}) {
+  if (!cdpBridge) throw err("NOT_SUPPORTED", `${BROWSER} host 不处理扩展发起的请求: ${method}`);
+  const started = Date.now();
+  try {
+    if (method === "bidi.attach") return await cdpBridge.attach(params.tabId, params.marker);
+    if (method === "bidi.detach") return await cdpBridge.detach(params.tabId);
+    if (method === "bidi.send") return await cdpBridge.send(params.tabId, params.method, params.params);
+    throw err("NOT_SUPPORTED", `扩展不应发起该请求: ${method}`);
+  } catch (e) {
+    rpcLog("warn", {
+      method: method === "bidi.send" ? `bidi.send:${params.method}` : method,
+      tabId: params.tabId, channel: "bidi", elapsedMs: Date.now() - started,
+      code: e.code || "BIDI_ERROR", message: e.message,
+    });
+    throw e;
+  }
+}
+
+function extensionRequestError(e) {
+  const out = { message: (e && e.message) || String(e) };
+  if (e && e.code) out.code = e.code;
+  return out;
+}
+
+if (cdpBridge) {
+  cdpBridge.on("detached", (payload) => sendEventToExtension("bidi.detached", payload));
+}
+
+// 退出前结束 BiDi 会话：Firefox 断开连接不会释放会话，不结束就退出，
+// 下一个 host 会一直拿到 BIDI_UNAVAILABLE，直到 Firefox 重启。
+let exiting = false;
+async function shutdownAndExit(code) {
+  if (exiting) return;
+  exiting = true;
+  if (cdpBridge) {
+    await Promise.race([
+      cdpBridge.shutdown().catch((e) => log("bidi shutdown failed:", e.message)),
+      sleep(2000),
+    ]);
+  }
+  process.exit(code);
+}
+process.on("SIGTERM", () => shutdownAndExit(0));
+process.on("SIGINT", () => shutdownAndExit(0));
+
 // ---------- Native Messaging（stdio） ----------
 // 循环 drain buffer，支持多帧/粘包/拆包。
 // 原实现只处理一个完整帧，粘包/多帧滞留会丢消息，导致 RPC 偶发无响应。
@@ -883,9 +955,9 @@ function setupNativeMessaging() {
     // 通道断开：未完成的 pending 不能无限挂起
     failAllPending("EXT_DISCONNECTED", "Native 通道已关闭");
     broadcastToAgent("ext.disconnected", { channel: "native" });
-    // Chrome 关闭连接后进程即将退出；standalone 时继续存活
+    // 浏览器关闭连接后进程即将退出；standalone 时继续存活
     if (!STANDALONE) {
-      setTimeout(() => process.exit(0), 500);
+      setTimeout(() => shutdownAndExit(0), 500);
     }
   });
   process.stdin.on("error", (e) => {
@@ -927,6 +999,13 @@ function handleNativeMessage(msg) {
   // 扩展 ping
   if (msg.type === "ping") {
     writeNative({ type: "pong", t: Date.now() });
+    return;
+  }
+  // 扩展发起的请求（Firefox 的 CDP 替身）
+  if (msg.type === "request" && msg.requestId && msg.method) {
+    handleExtensionRequest(msg.method, msg.params || {})
+      .then((payload) => writeNative({ type: "response", responseToRequestId: msg.requestId, payload: payload === undefined ? null : payload }))
+      .catch((e) => writeNative({ type: "response", responseToRequestId: msg.requestId, error: extensionRequestError(e) }));
     return;
   }
   // RPC 响应
@@ -984,6 +1063,9 @@ function httpServer() {
       send(200, {
         ok: true,
         name: HOST_NAME,
+        // 该 host 服务的浏览器。Chrome 与 Firefox 各跑一个 host（默认端口 8778 / 8779），
+        // RPC 方法与返回结构相同，Agent 只需选端口。
+        browser: BROWSER,
         // 统一版本号：host 与扩展同属一个发布单元，共用 extension/manifest.json 里的版本。
         // agent 直接用这个值判断能力是否可用（见 CHANGELOG 的症状对照表）。
         version: VERSION,
@@ -1006,6 +1088,8 @@ function httpServer() {
         pid: process.pid,
         port: PORT,
         tokenPrefix: TOKEN.slice(0, 6),
+        // Firefox：CDP 命令经 WebDriver BiDi 执行；connected=false 只表示还没有调用过需要它的方法
+        bidi: cdpBridge ? cdpBridge.status() : undefined,
       });
       return;
     }
@@ -1132,8 +1216,10 @@ function httpServer() {
             return;
           }
           if (msg.id !== undefined && msg.method) {
-            // 扩展主动发起的请求（目前不使用），仅响应错误
-            ws.sendJson({ id: msg.id, ok: false, error: { code: "NOT_SUPPORTED", message: "扩展不应主动发起请求" } });
+            // 扩展发起的请求（Firefox 的 CDP 替身）
+            handleExtensionRequest(msg.method, msg.params || {})
+              .then((result) => ws.sendJson({ id: msg.id, ok: true, result: result === undefined ? null : result }))
+              .catch((e) => ws.sendJson({ id: msg.id, ok: false, error: extensionRequestError(e) }));
             return;
           }
           if (msg.id !== undefined) {
@@ -1212,7 +1298,7 @@ function httpServer() {
   server.listen(PORT, "127.0.0.1", () => {
     log(`listening on http://127.0.0.1:${PORT}  token=${TOKEN.slice(0, 6)}…  ext=${extReady() ? "connected" : "waiting"}`);
     if (STANDALONE) {
-      console.log(`\n  Agent Browser Bridge host v${VERSION}`);
+      console.log(`\n  Agent Browser Bridge host v${VERSION} (${BROWSER})`);
       console.log(`  状态: curl http://127.0.0.1:${PORT}/status`);
       console.log(`  Token: ${TOKEN}  (保存于 ${TOKEN_FILE})`);
       console.log(`  Agent 通道: HTTP /rpc · WS /bridge\n`);
@@ -1275,7 +1361,7 @@ process.on("unhandledRejection", (e) => {
   if (!startupDone && e && e.code === "TOKEN_UNAVAILABLE") return fatal(e);
   log("unhandledRejection:", e && e.message);
 });
-log(`host v${VERSION} start, standalone=${STANDALONE}, port=${PORT}`);
+log(`host v${VERSION} start, browser=${BROWSER}, standalone=${STANDALONE}, port=${PORT}${cdpBridge ? `, bidiPort=${BIDI_PORT}` : ""}`);
 setupNativeMessaging();
 httpServer();
 startupDone = true;

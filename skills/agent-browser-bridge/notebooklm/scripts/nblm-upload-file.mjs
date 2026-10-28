@@ -1,5 +1,6 @@
+import { BRIDGE_ORIGIN } from "../../scripts/lib/bridge.mjs";
 const token=process.env.BRIDGE_TOKEN; const tabId=Number(process.argv[2]); const file=process.argv[3];
-const BASE="http://127.0.0.1:8778/rpc";
+const BASE=`${BRIDGE_ORIGIN}/rpc`;
 async function rpc(m,p,t=30000){const r=await fetch(BASE,{method:"POST",headers:{"Content-Type":"application/json",Authorization:`Bearer ${token}`},body:JSON.stringify({method:m,params:p,timeoutMs:t})});const j=await r.json();if(!j.ok)throw new Error(`${m}: ${JSON.stringify(j.error||j)}`);return j.result;}
 async function send(me,p,t=30000){return (await rpc("session.send",{tabId,method:me,params:p},t)).result;}
 (async()=>{

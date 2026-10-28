@@ -13,6 +13,7 @@
 // 使用前把 jobs 数组替换为当前任务的实际职位（URL + 会话校验关键词 + 定制打招呼语）。
 // 前置: 用户已登录 BOSS；发送前已把清单给用户确认。
 // 严格单条送达验证（送达/已读、UNKNOWN 只读复核）请用 boss-send-chat.mjs；本脚本是轻量模板。
+import { BRIDGE_ORIGIN } from "./lib/bridge.mjs";
 const token = process.env.BRIDGE_TOKEN;
 const agentId = process.env.AGENT_ID || "boss-batch";
 const agentName = process.env.AGENT_NAME || "BOSS批量投递";
@@ -33,7 +34,7 @@ const jobs = [
 ];
 
 async function rpc(method, params) {
-  const resp = await fetch("http://127.0.0.1:8778/rpc", {
+  const resp = await fetch(`${BRIDGE_ORIGIN}/rpc`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -128,7 +129,7 @@ async function checkStop(where) {
   }
 }
 async function claimTab() {
-  const resp = await fetch("http://127.0.0.1:8778/tabs/claim", {
+  const resp = await fetch(`${BRIDGE_ORIGIN}/tabs/claim`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, "X-Agent-Id": agentId },
     body: JSON.stringify({ tabId: TAB, agentId, ttlMs: 120000 }),
@@ -143,7 +144,7 @@ async function releaseLease() {
   if (!leased) return;
   leased = false;
   try {
-    await fetch("http://127.0.0.1:8778/tabs/release", {
+    await fetch(`${BRIDGE_ORIGIN}/tabs/release`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, "X-Agent-Id": agentId },
       body: JSON.stringify({ tabId: TAB, agentId }),

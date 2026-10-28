@@ -13,6 +13,7 @@
 // 前置: 根 SKILL.md 的桥已就绪；目标 tab 是 chatgpt.com；用户已登录（未登录会提示手动登录）
 //
 // 输出: JSON { url, prompt, reply, thinking?, images[], elapsedMs, quotaHint, modelApplied }
+import { BRIDGE_ORIGIN } from "./lib/bridge.mjs";
 const token = process.env.BRIDGE_TOKEN;
 const [, , tabIdArg, promptArg, ...rest] = process.argv;
 const tabId = Number(tabIdArg);
@@ -30,7 +31,7 @@ if (!token || !tabId || !promptArg) {
 }
 
 const rpc = async (method, params = {}, timeoutMs = 30000) => {
-  const res = await fetch("http://127.0.0.1:8778/rpc", {
+  const res = await fetch(`${BRIDGE_ORIGIN}/rpc`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify({ method, params, timeoutMs }),

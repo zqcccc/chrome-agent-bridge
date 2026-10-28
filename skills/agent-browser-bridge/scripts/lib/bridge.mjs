@@ -22,7 +22,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const DEFAULT_PORT = Number(process.env.BRIDGE_PORT || process.env.AGENT_BRIDGE_PORT || 8778);
+// Chrome 与 Firefox 各有一个 host：RPC 方法与返回结构相同，只是端口不同。
+// 选浏览器用 BRIDGE_BROWSER=chrome|firefox；BRIDGE_PORT 显式指定时优先。
+export const BROWSER_PORTS = { chrome: 8778, firefox: 8779 };
+export function defaultPort(env = process.env) {
+  if (env.BRIDGE_PORT || env.AGENT_BRIDGE_PORT) return Number(env.BRIDGE_PORT || env.AGENT_BRIDGE_PORT);
+  const browser = env.BRIDGE_BROWSER || "chrome";
+  if (!BROWSER_PORTS[browser]) throw new Error(`BRIDGE_BROWSER 仅支持 ${Object.keys(BROWSER_PORTS).join(" / ")}，收到 ${browser}`);
+  return BROWSER_PORTS[browser];
+}
+const DEFAULT_PORT = defaultPort();
+// 裸 fetch 的脚本用它拼 URL：`${BRIDGE_ORIGIN}/rpc`
+export const BRIDGE_ORIGIN = `http://127.0.0.1:${DEFAULT_PORT}`;
 
 export function readToken() {
   if (process.env.BRIDGE_TOKEN) return process.env.BRIDGE_TOKEN.trim();

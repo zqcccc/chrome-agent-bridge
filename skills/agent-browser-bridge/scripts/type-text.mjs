@@ -2,6 +2,7 @@
 // 通用"向页面元素输入文本"脚本（受控组件友好）
 // 用法: BRIDGE_TOKEN=xxx node type-text.mjs <tabId> <selector> <text>
 // selector 支持 CSS 选择器；元素须是 input/textarea/contenteditable
+import { BRIDGE_ORIGIN } from "./lib/bridge.mjs";
 const token = process.env.BRIDGE_TOKEN;
 const [, , tabId, selector, text] = process.argv;
 if (!token || !tabId || !selector || text === undefined) {
@@ -21,7 +22,7 @@ const expression = `(()=>{
   el.dispatchEvent(new Event('change', {bubbles:true}));
   return JSON.stringify({ok:true, val:(el.value ?? el.innerText).slice(0,40)});
 })()`;
-fetch("http://127.0.0.1:8778/rpc", {
+fetch(`${BRIDGE_ORIGIN}/rpc`, {
   method: "POST",
   headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
   body: JSON.stringify({ method: "page.evaluate", params: { tabId: Number(tabId), expression, awaitPromise: false }, timeoutMs: 20000 }),
