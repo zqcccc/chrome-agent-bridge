@@ -9,7 +9,7 @@
 
 - **不得以脚本自己打印的 `✓ 已删除` / `✓ 已保存` 作为成功依据。** 按钮被点到 ≠ 请求发出去了。
 - 为什么单独立一条：这个坑最隐蔽——脚本无报错、日志显示成功，但业务状态没变；不主动回读就会带着错误结论继续往下走（“删了重复项”其实没删、“保存了”其实没保存）。
-- 可用 `scripts/lib/bridge.mjs` 的 `rpc.mutateAndVerify(mutate, verify)` 强制这个模式。
+- 可用 `scripts/lib/bridge.mjs` 的 `rpc.mutateAndVerify(mutate, verify, {timeoutMs})` 强制这个模式：变更只执行一次（重复提交 / 删除的代价远大于多等几秒），之后轮询回读直到确认或超时。
 - **回读时不要只信「页面看起来对」**：子技能里有现成回读接口的先用（如 LinkedIn 的 `readSection()`），它们处理了该站的坑（懒渲染、SDUI 无 `<li>` 等）。
 
 ## 已知错误码速查（先分清「桥/扩展的锅」还是「页面的锅」）
@@ -20,12 +20,17 @@
 | --- | --- | --- |
 | `AGENT_STOPPED` | **用户在页面上点了「停止 Agent」** | 不是页面问题。停止一切写操作并汇报进度（`e.detail("scope")`） |
 | `STALE_ELEMENT_REF` | 快照短标号（如 `@e12`）对应的 DOM 节点已被页面移除 | 重新调用 `page.snapshot` 获取最新 `ref` 后再操作 |
-| `EVAL_ERROR` 且 message 提到 CSP / unsafe-eval | 用了 `page.evaluate` 做字符串求值，被页面 CSP 拦 | 改走 CDP 求值（`rpc.evalCdp()` / `rpc.ev()` / `scripts/cdp-eval.mjs`） |
+| `EVAL_ERROR` 且 message 提到 CSP / unsafe-eval | 用了 `page.evaluate` 做字符串求值，被页面 CSP 拦 | 改走 CDP 求值（`page.evalCdp`；`rpc.ev()` / `<bb> eval` / MCP `browser_eval` 都走它） |
+| `EVAL_ERROR`（其他 message） | 表达式在页面里抛了异常 | 看 message 修表达式；不是桥的问题 |
 | `SESSION_SEND_FAILED`：Debugger is not attached | **扩展 bug（≤ v0.3.11）**：内部 CDP 流程拆了 Agent 的调试会话 | 升级到 ≥ 0.3.12；或全程只用 `ev()`、不混用 `page.evaluate` |
-| `SESSION_NOT_ATTACHED` | 没先 `session.attach` 就 `session.send` | 用 `rpc.ev()` / `withSession()`（它们会 attach） |
+| `SESSION_NOT_ATTACHED` | 裸 HTTP 调用没先 `session.attach` 就 `session.send` | 先 `session.attach`，用完 `session.detach`。经 `scripts/lib/bridge.mjs` 发 `session.send` 会自动 attach（进程退出时释放），要在流程中途释放用 `rpc.withSession(tabId, fn)` |
 | `TAB_UNHEALTHY` | 同 tab 已连续 3 次上下文级失败（本库主动熔断） | **换 tab**（`tabs.resolve` / `withPage`），不要原地重试 |
 | `PAGE_CONTEXT_TIMEOUT` | 页面上下文失效（导航中 / 渲染器被冻结 / 坏 tab） | 先 `tabs.prepare`；若反复出现在后台 tab，可能是被冻结（v0.3.10+ 会自愈） |
-| `UNKNOWN_METHOD` | 扩展版本不够新 | 不是站点问题也不是脚本 bug；对照 `CHANGELOG.md` 的症状表 |
+| `UNKNOWN_METHOD` | 方法名不存在（host 按 `bridge.methods` 清单判定），或方法名正确但扩展版本不够新 | 看 `error.details.suggestions` 里最接近的方法名；名字没错就对照 `CHANGELOG.md` 的症状表 |
+| `TAB_HIDDEN` | **仅 Chrome**：后台标签页不处理 CDP 鼠标 / 按键事件（`page.clickReal`、带 `pressEnter` 的 `page.typeReal`），报错时页面未被改动 | `page.ensureActive` 后重试；`rpc.clickReal` / `rpc.typeReal` 与 MCP 工具已自动处理 |
+| `TAB_GONE` | 标签页已关闭（各入口统一报这个码） | 用 `tabs.resolve` 重新打开，不要原地重试 |
+| `TAB_LEASED` | 标签页被另一个 Agent 用 `tabs.claim` 租用 | 换一个标签页，或等对方 `tabs.release` |
+| `BRIDGE_TOO_OLD` | 桥版本低于 `scripts/lib/bridge.mjs` 的最低要求 | 按 `INSTALL.md` 更新仓库并重载扩展 |
 | `DEBUGGER_BUSY` | 用户手动开着 DevTools | 不抢，告知用户关掉 DevTools 再试 |
 | `UNSUPPORTED_URL` | 受保护协议（`chrome://` 等） | 桥不能注入也不能截图，换页面 |
 | `BIDI_UNAVAILABLE` | **仅 Firefox**：Firefox 没以 Remote Agent 模式启动，或 BiDi 会话被别的自动化工具占用 | 不要重试；告知用户退出 Firefox 后按 `firefox/SKILL.md` 重新启动 |

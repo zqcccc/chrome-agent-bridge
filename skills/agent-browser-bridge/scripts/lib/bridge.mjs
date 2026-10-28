@@ -10,7 +10,7 @@
  * 本模块把差异收敛到 unwrap() 一处，其余代码只拿最终值。
  *
  * 设计约束：
- * - 自包含：只依赖 Node 内置模块 + 本目录可选的 client.mjs（不存在则走 HTTP），
+ * - 自包含：只依赖 Node 内置模块，直连 host 的 HTTP 接口，
  *   这样 skill 被单独拷贝/链接时依然可用（见仓库 AGENTS.md「Skill 必须自包含」）。
  * - 不吞错：解包失败抛错并带上原始响应片段，便于定位，而不是静默返回 undefined。
  *   （历史教训：`pos` 变 undefined 连查三轮才发现是层数不对。）
@@ -34,6 +34,16 @@ export function defaultPort(env = process.env) {
 const DEFAULT_PORT = defaultPort();
 // 裸 fetch 的脚本用它拼 URL：`${BRIDGE_ORIGIN}/rpc`
 export const BRIDGE_ORIGIN = `http://127.0.0.1:${DEFAULT_PORT}`;
+
+// 本库依赖的最低桥版本：page.read / page.evalCdp / page.clickReal / page.typeReal / page.uploadFile 在 0.3.13 引入
+export const MIN_BRIDGE_VERSION = "0.3.13";
+const CLIENT_TIMEOUT_MARGIN_MS = 3000;
+export function versionGte(a, b) {
+  const x = String(a || "0").split(".").map((n) => parseInt(n, 10) || 0);
+  const y = String(b || "0").split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0);
+  return true;
+}
 
 export function readToken() {
   if (process.env.BRIDGE_TOKEN) return process.env.BRIDGE_TOKEN.trim();
@@ -85,24 +95,27 @@ function installProcessHooks() {
   process.on("uncaughtException", (err) => { onFatal(err, "uncaughtException"); });
 }
 
+// CDP RemoteObject 的字段全集：只有形状完全符合时才取其 value。
+// 曾用「含 value 键」判定，于是 page.typeReal 的返回 {ok, value, verified, delta} 被剥成了 value 字符串，
+// verified / delta 全部丢失。
+const REMOTE_OBJECT_KEYS = new Set(["type", "subtype", "className", "value", "unserializableValue", "description", "objectId", "preview"]);
+function isRemoteObject(o) {
+  return !!o && typeof o === "object" && !Array.isArray(o) && typeof o.type === "string" && Object.keys(o).every((k) => REMOTE_OBJECT_KEYS.has(k));
+}
+
 /** 三层解包自适应：把任意调用路径的响应收敛成最终值。 */
 export function unwrap(resp) {
   if (resp == null) return resp;
   let v = resp;
-  // 逐层剥：{result:{result:{value}}} / {result:{value}} / {result:...}
+  // 逐层剥：{result:{result:RemoteObject}} / {result:RemoteObject} / {result:...}
   for (let i = 0; i < 4; i++) {
-    if (v && typeof v === "object" && "result" in v) {
-      const inner = v.result;
-      if (inner && typeof inner === "object" && "value" in inner) {
-        v = inner.value;
-        break;
-      }
-      v = inner;
-      continue;
-    }
-    if (v && typeof v === "object" && "value" in v && Object.keys(v).every((k) => ["type", "value", "description", "subtype"].includes(k))) {
+    if (isRemoteObject(v)) {
       v = v.value;
       break;
+    }
+    if (v && typeof v === "object" && "result" in v) {
+      v = v.result;
+      continue;
     }
     break;
   }
@@ -170,7 +183,7 @@ export class Rpc {
 
   _noteFailure(tabId, code) {
     // 只有「tab 本身坏了」才算 strike；业务错误（如元素不存在）不算。
-    const TAB_LEVEL = new Set(["PAGE_CONTEXT_TIMEOUT", "TAB_GONE", "TAB_DISCARDED", "SESSION_ATTACH_FAILED", "UNSUPPORTED_URL", "DEBUGGER_BUSY"]);
+    const TAB_LEVEL = new Set(["PAGE_CONTEXT_TIMEOUT", "TAB_GONE", "TAB_DISCARDED", "SESSION_ATTACH_FAILED", "ATTACH_FAILED", "UNSUPPORTED_URL", "DEBUGGER_BUSY"]);
     if (!TAB_LEVEL.has(code)) return;
     const n = (this._strikes.get(tabId) || 0) + 1;
     this._strikes.set(tabId, n);
@@ -251,7 +264,23 @@ export class Rpc {
   }
 
   /** 原始 RPC。返回已解包的值；失败抛 BridgeRpcError。 */
-  call(method, params = {}, timeoutMs = 20000) {
+  async call(method, params = {}, timeoutMs = 20000) {
+    return unwrap({ result: await this.callRaw(method, params, timeoutMs) });
+  }
+
+  /**
+   * 原始 RPC，返回 host 响应里的 result 原样（不解包）。
+   * session.send 需要先持有会话：本实例还没 attach 该 tab 时先自动 attach，进程退出时由 cleanup() 释放。
+   * （ev() 改走 page.evalCdp 之前，调用方习惯「ev 之后直接 session.send」，靠的是 ev 顺带建立的会话。）
+   */
+  async callRaw(method, params = {}, timeoutMs = 20000) {
+    if (method === "session.send" && params && params.tabId != null && !this._attached.has(params.tabId)) {
+      await this.attach(params.tabId);
+    }
+    return this._send(method, params, timeoutMs);
+  }
+
+  _send(method, params, timeoutMs) {
     return new Promise((resolve, reject) => {
       const body = JSON.stringify({ method, params, timeoutMs });
       const req = http.request(
@@ -282,7 +311,7 @@ export class Rpc {
               if (params && params.tabId) this._noteFailure(params.tabId, code);
               return reject(new BridgeRpcError(code, e.message || "未知错误", method, e.details));
             }
-            resolve(unwrap(json));
+            resolve(json.result);
           });
         }
       );
@@ -294,33 +323,58 @@ export class Rpc {
           ? reject(e)
           : reject(new BridgeRpcError("CONNECTION_REFUSED", `无法连接本地桥 127.0.0.1:${this.port}（${e.message}）`, method))
       );
-      req.setTimeout(timeoutMs, () => req.destroy(new BridgeRpcError("TIMEOUT", `请求超时 ${timeoutMs}ms`, method)));
+      // 比 host 侧预算多等一点：host 到点会回带具体错误码的响应（如 PAGE_CONTEXT_TIMEOUT），
+      // 客户端同时到点会把它抢先盖成笼统的 TIMEOUT。
+      req.setTimeout(timeoutMs + CLIENT_TIMEOUT_MARGIN_MS, () => req.destroy(new BridgeRpcError("TIMEOUT", `请求超时 ${timeoutMs}ms`, method)));
       req.write(body);
       req.end();
     });
   }
 
-  /** 版本与连通性一次拿全。版本号是统一的（host 与扩展同源，见 relay/host.js）。 */
-  async preflight() {
-    const st = await new Promise((resolve, reject) => {
+  /** host 的 /status 原样返回（无需 token）：版本、通道、扩展是否连接、停止状态、在途请求。 */
+  status() {
+    return new Promise((resolve, reject) => {
       const req = http.get({ host: "127.0.0.1", port: this.port, path: "/status" }, (res) => {
         let d = "";
         res.on("data", (c) => (d += c));
-        res.on("end", () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } });
+        res.on("end", () => {
+          try { resolve(JSON.parse(d)); } catch {
+            reject(new BridgeRpcError("BAD_RESPONSE", `host /status 返回非 JSON: ${d.slice(0, 200)}`, "status"));
+          }
+        });
       });
-      req.on("error", reject);
-      req.setTimeout(5000, () => req.destroy(new Error("status 超时")));
+      req.on("error", (e) => reject(new BridgeRpcError("CONNECTION_REFUSED", `无法连接本地桥 127.0.0.1:${this.port}（${e.message}）`, "status")));
+      req.setTimeout(5000, () => req.destroy(new BridgeRpcError("TIMEOUT", "status 超时", "status")));
     });
-    const semver = (v) => String(v || "0").split(".").map((n) => parseInt(n, 10) || 0);
-    const gte = (a, b) => {
-      const x = semver(a), y = semver(b);
-      for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0);
-      return true;
-    };
+  }
+
+  /** 静默截图并写到 outPath（按扩展名选 png / jpeg），返回 { path, format, bytes }。 */
+  async screenshot(tabId, outPath, { quality, captureBeyondViewport } = {}) {
+    const format = /\.jpe?g$/i.test(outPath) ? "jpeg" : "png";
+    const r = await this.call("page.screenshot", { tabId, format, quality, captureBeyondViewport }, 30000);
+    const buf = Buffer.from(String(r.image).split(",")[1], "base64");
+    fs.mkdirSync(path.dirname(path.resolve(outPath)), { recursive: true });
+    fs.writeFileSync(outPath, buf);
+    return { path: path.resolve(outPath), format, bytes: buf.length };
+  }
+
+  /**
+   * 版本与连通性一次拿全。版本号是统一的（host 与扩展同源）。
+   * 低于 MIN_BRIDGE_VERSION 直接抛 BRIDGE_TOO_OLD：本库的封装不再为旧扩展做降级。
+   */
+  async preflight() {
+    const st = await this.status();
     // 统一版本：优先用扩展自报值（它才是实际在跑的代码），
     // 没自报（如刚重连）则用 host 读 manifest 得到的值。
     const version = st.reportedExtensionVersion || st.version || null;
     const versionKnown = !!version && version !== "unknown";
+    if (versionKnown && !versionGte(version, MIN_BRIDGE_VERSION)) {
+      throw new BridgeRpcError(
+        "BRIDGE_TOO_OLD",
+        `桥版本 ${version} 低于本库要求的 ${MIN_BRIDGE_VERSION}，按 INSTALL.md 更新仓库并重载扩展`,
+        "preflight"
+      );
+    }
     return {
       ok: !!st.ok,
       version,
@@ -329,31 +383,15 @@ export class Rpc {
       channel: st.channel,
       mode: st.mode,
       pending: st.pending,
-      // 常用能力的版本门槛（见 CHANGELOG「版本不匹配的典型症状」）
-      capabilities: {
-        tabsResolve: versionKnown ? gte(version, "0.3.9") : null,
-        pageWaitForReady: versionKnown ? gte(version, "0.3.3") : null,
-        cspFallback: versionKnown ? gte(version, "0.3.3") : null,
-        fastFailContext: versionKnown ? gte(version, "0.3.6") : null,
-        // 渲染器被 Memory Saver 冻结时自动 CDP 解冻重试。
-        // 旧版没有这个能力：后台 tab 被冻后每个 page.* 都要等 13s 才报 PAGE_CONTEXT_TIMEOUT。
-        freezeRecovery: versionKnown ? gte(version, "0.3.10") : null,
-        // page.ensureActive / page.scroll{checked} —— 后台 tab 的 rAF 被暂停时
-        // 临时激活以保证渲染（只切标签页不聚焦窗口），以及滚动推进检测。
-        ensureActive: versionKnown ? gte(version, "0.3.10") : null,
-        scrollChecked: versionKnown ? gte(version, "0.3.10") : null,
-        // v0.3.13+：扩展内原子 CDP 操作（clickReal/typeReal/uploadFile/evalCdp）、
-        // page.read 一键读取、snapshot 元素 ref 与交互 Action Delta。
-        atomicCdp: versionKnown ? gte(version, "0.3.13") : null,
-        pageRead: versionKnown ? gte(version, "0.3.13") : null,
-        snapshotRef: versionKnown ? gte(version, "0.3.13") : null,
-        actionDelta: versionKnown ? gte(version, "0.3.13") : null,
-      },
     };
   }
 
   // ---------- 页面求值（CDP，绕过 CSP） ----------
 
+  /**
+   * 显式持有 CDP 会话。只有需要连续发 session.send（如 Emulation.* 覆盖要跨多次调用生效）时才用；
+   * 普通求值用 ev()，它每次借用调试器、用完归还。用 withSession 包裹可保证异常路径也 detach。
+   */
   async attach(tabId, { force = false } = {}) {
     if (!force && this._attached.has(tabId)) {
       return { attached: true, tabId, already: true, cached: true };
@@ -370,8 +408,10 @@ export class Rpc {
   }
 
   /**
-   * 在页面执行 JS 并取回真实值（走 CDP Runtime.evaluate，不受页面 CSP 限制）。
-   * 这是替代 page.evaluate 的默认选择：linkedin.com / github.com / chatgpt.com 都会拦 eval。
+   * 在页面执行 JS 并取回值（page.evalCdp → CDP Runtime.evaluate，不受页面 CSP / Trusted Types 限制）。
+   * 每次调用借用调试器、用完立即归还，不留调试提示条；本实例已 attach 时扩展会复用该会话。
+   * 返回字符串时尝试 JSON.parse（页面里 JSON.stringify 的结果直接拿到对象）。
+   * 页面抛异常时报 EVAL_ERROR。
    */
   async ev(tabId, expression, { awaitPromise = false, userGesture = true, timeoutMs = 30000 } = {}) {
     // 已判定废掉的 tab 直接快速失败，不再浪费一轮网络往返
@@ -379,73 +419,24 @@ export class Rpc {
       throw new BridgeRpcError(
         "TAB_UNHEALTHY",
         `tab #${tabId} 已连续 ${this._strikes.get(tabId)} 次上下文类失败，不再重试。用 tabs.resolve 换一个 tab。`,
-        "Runtime.evaluate"
+        "page.evalCdp"
       );
     }
-    await this.attach(tabId);
-    let r;
-    try {
-      r = await this.call(
-        "session.send",
-        { tabId, method: "Runtime.evaluate", params: { expression, returnByValue: true, awaitPromise, userGesture } },
-        timeoutMs
-      );
-    } catch (e) {
-      // 页面发生过导航或外部 detach 导致调试器已断开时，清缓存并自动重连一次
-      if (e && (e.code === "SESSION_NOT_ATTACHED" || e.code === "SESSION_DETACHED" || e.code === "SESSION_SEND_FAILED")) {
-        this._attached.delete(tabId);
-        await this.attach(tabId, { force: true });
-        r = await this.call(
-          "session.send",
-          { tabId, method: "Runtime.evaluate", params: { expression, returnByValue: true, awaitPromise, userGesture } },
-          timeoutMs
-        );
-      } else {
-        throw e;
-      }
-    }
-    const details = r && r.exceptionDetails;
-    if (details) {
-      const ex = details.exception || {};
-      throw new BridgeRpcError("EVAL_EXCEPTION", ex.description || ex.value || JSON.stringify(details), "Runtime.evaluate");
-    }
+    const r = await this.callRaw("page.evalCdp", { tabId, expression, awaitPromise, userGesture, timeoutMs }, timeoutMs);
     // 成功即清零：说明这个 tab 其实还能用
     this.clearStrikes(tabId);
-    return unwrap(r);
-  }
-
-  /** 单次无状态 CDP 求值（扩展内借用调试器并在调用结束后立即释放，不留调试横条）。 */
-  async evalCdp(tabId, expression, opts = {}) {
-    try {
-      return await this.call("page.evalCdp", { tabId, expression, ...opts }, opts.timeoutMs || 30000);
-    } catch (e) {
-      if (e && e.code === "UNKNOWN_METHOD") return this.ev(tabId, expression, opts);
-      throw e;
+    // 只取 result 字段，不走 unwrap：页面返回的对象恰好带 value 键时 unwrap 会误剥一层
+    const v = r ? r.result : r;
+    if (typeof v === "string") {
+      try { return JSON.parse(v); } catch { return v; }
     }
+    return v;
   }
 
   /** 一键读取网页正文、标题、主链接与阻断状态（自动打开/复用、处理后台未渲染并关闭临时 tab）。 */
   async readPage(urlOrOpts, opts = {}) {
     const params = typeof urlOrOpts === "string" ? { url: urlOrOpts, ...opts } : { ...(urlOrOpts || {}) };
-    try {
-      return await this.call("page.read", params, (params.timeoutMs || 45000) + 10000);
-    } catch (e) {
-      if (!e || e.code !== "UNKNOWN_METHOD") throw e;
-      // 旧版扩展降级：用 withPage + ev
-      return this.withPage(params.url, async (tabId, opened) => {
-        const title = await this.ev(tabId, "document.title");
-        const text = await this.ev(tabId, "document.body ? document.body.innerText : ''");
-        return {
-          ok: true,
-          tabId,
-          url: params.url,
-          title,
-          text: String(text || "").slice(0, params.maxLength || 20000),
-          textLength: String(text || "").length,
-          reused: opened.reused,
-        };
-      }, { keepOpen: params.keepOpen, match: params.match });
-    }
+    return this.call("page.read", params, (params.timeoutMs || 45000) + 10000);
   }
 
   /** 获取带 [e1] 持久化引用的紧凑页面快照。 */
@@ -453,11 +444,9 @@ export class Rpc {
     return this.call("page.snapshot", { tabId, mode: "compact", ...opts }, opts.timeoutMs || 20000);
   }
 
-  /** 把「页面里算好并 JSON.stringify 的对象」安全取回。 */
-  async evJson(tabId, expression, opts) {
-    const out = await this.ev(tabId, `JSON.stringify((()=>{ ${expression} })())`, opts);
-    if (typeof out !== "string") return out;
-    try { return JSON.parse(out); } catch { return out; }
+  /** 页面里执行一段函数体（可含 return），结果 JSON 往返后取回。 */
+  async evJson(tabId, body, opts) {
+    return this.ev(tabId, `JSON.stringify((()=>{ ${body} })())`, opts);
   }
 
   /** 保证 detach 的会话作用域：异常路径也不会把 host 拖死。 */
@@ -470,96 +459,52 @@ export class Rpc {
     }
   }
 
-  // ---------- 点击与输入：优先走扩展侧单次原子 RPC，旧版自动回退 ----------
+  // ---------- 点击与输入：扩展侧单次原子 RPC ----------
 
   /**
-   * 真实鼠标点击（CDP Input.dispatchMouseEvent）。
-   * 支持两种传参：
-   *   1. clickReal(tabId, x, y) —— 坐标点击
-   *   2. clickReal(tabId, selectorOrRef, opts) —— 选择器或 @e1 引用点击（自动滚动居中+算坐标）
+   * 真实鼠标点击（CDP Input.dispatchMouseEvent），返回带 delta。
+   *   clickReal(tabId, x, y[, opts])        —— 视口坐标
+   *   clickReal(tabId, "@e3" | css[, opts]) —— 元素（自动滚动居中算坐标）
+   *   clickReal(tabId, { ref, by, ... })    —— 完整参数
+   * 后台标签页不处理 CDP 鼠标事件（扩展报 TAB_HIDDEN）：这里临时 ensureActive 后重试一次，
+   * 借走的活动页空闲后由扩展自动归还。坐标点击时激活不改变坐标（只切标签页，不改窗口）。
    */
-  async clickReal(tabId, xOrSelector, y, opts = {}) {
-    const params = typeof xOrSelector === "number"
-      ? { tabId, x: Math.round(xOrSelector), y: Math.round(y), ...(opts || {}) }
-      : (typeof xOrSelector === "object" && xOrSelector !== null
-        ? { tabId, ...xOrSelector }
-        : { tabId, selector: String(xOrSelector), ...(typeof y === "object" && y ? y : {}) });
+  async clickReal(tabId, target, y, opts = {}) {
+    let params;
+    if (typeof target === "number") params = { tabId, x: Math.round(target), y: Math.round(y), ...opts };
+    else if (target && typeof target === "object") params = { tabId, ...target };
+    else params = { tabId, selector: String(target), ...(y && typeof y === "object" ? y : {}) };
     try {
       return await this.call("page.clickReal", params, 20000);
     } catch (e) {
-      if (!e || e.code !== "UNKNOWN_METHOD") throw e;
-      // 旧版扩展降级
-      let cx = params.x, cy = params.y;
-      if (cx == null || cy == null) {
-        const pos = await this.evJson(
-          tabId,
-          `const el=document.querySelector(${JSON.stringify(params.selector)});
-           if(!el) return {ok:false};
-           el.scrollIntoView({block:'center'});
-           const r=el.getBoundingClientRect();
-           return {ok:true, x:r.left+r.width/2, y:r.top+r.height/2};`
-        );
-        if (!pos || !pos.ok) throw new BridgeRpcError("NOT_FOUND", `未找到元素: ${params.selector}`, "clickReal");
-        cx = pos.x; cy = pos.y;
-      }
-      await this.attach(tabId);
-      for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
-        await this.call(
-          "session.send",
-          {
-            tabId,
-            method: "Input.dispatchMouseEvent",
-            params: { type, x: Math.round(cx), y: Math.round(cy), button: type === "mouseMoved" ? "none" : "left", clickCount: 1 },
-          },
-          10000
-        );
-        await sleep(80);
-      }
-      return { ok: true, x: Math.round(cx), y: Math.round(cy) };
+      if (!(e instanceof BridgeRpcError) || e.code !== "TAB_HIDDEN") throw e;
+      await this.ensureActive(tabId);
+      return { ...(await this.call("page.clickReal", params, 20000)), activated: true };
     }
   }
 
   /**
-   * 受控组件真实输入（自动聚焦 + 清空 + CDP Input.insertText + 回读校验）。
+   * 受控组件真实输入（聚焦 + 清空 + CDP Input.insertText + 回读校验 verified），返回带 delta。
+   * pressEnter 在后台标签页无效（扩展报 TAB_HIDDEN，此时尚未改动输入框）：临时 ensureActive 后重试一次。
    */
   async typeReal(tabId, selector, text, opts = {}) {
     const params = { tabId, selector, text, ...opts };
     try {
       return await this.call("page.typeReal", params, 20000);
     } catch (e) {
-      if (!e || e.code !== "UNKNOWN_METHOD") throw e;
-      await this.call("page.focusEl", { tabId, selector, by: opts.by || "css" }, 10000);
-      await this.attach(tabId);
-      await this.call("session.send", { tabId, method: "Input.insertText", params: { text: String(text) } }, 15000);
-      return { ok: true, value: String(text) };
+      if (!(e instanceof BridgeRpcError) || e.code !== "TAB_HIDDEN") throw e;
+      await this.ensureActive(tabId);
+      return { ...(await this.call("page.typeReal", params, 20000)), activated: true };
     }
   }
 
-  /**
-   * 原子文件上传（给 input[type="file"] 注入本地文件路径，单次 RPC）。
-   */
+  /** 给 input[type=file] 注入本地文件（绝对路径）。 */
   async uploadFile(tabId, selector, files) {
     const fileList = Array.isArray(files) ? files : [files];
-    try {
-      return await this.call("page.uploadFile", { tabId, selector: selector || 'input[type="file"]', files: fileList }, 30000);
-    } catch (e) {
-      if (!e || e.code !== "UNKNOWN_METHOD") throw e;
-      await this.attach(tabId);
-      const doc = await this.call("session.send", { tabId, method: "DOM.getDocument", params: { depth: -1 } }, 15000);
-      const rootNode = doc.result ? doc.result.root : doc.root;
-      const q = await this.call("session.send", {
-        tabId,
-        method: "DOM.querySelector",
-        params: { nodeId: rootNode.nodeId, selector: selector || 'input[type="file"]' },
-      }, 15000);
-      const nodeId = q.result ? q.result.nodeId : q.nodeId;
-      if (!nodeId) throw new BridgeRpcError("NOT_FOUND", `未找到文件上传元素: ${selector}`, "uploadFile");
-      await this.call("session.send", { tabId, method: "DOM.setFileInputFiles", params: { files: fileList, nodeId } }, 30000);
-      return { ok: true, count: fileList.length, files: fileList };
-    }
+    return this.call("page.uploadFile", { tabId, selector: selector || 'input[type="file"]', files: fileList }, 30000);
   }
 
-  /** DOM el.click()。某些按钮（如 LinkedIn「删除项目」）只认这个。 */
+  /** DOM el.click()。某些按钮（如 LinkedIn「删除项目」）只认这个。expression 是返回元素的 JS 表达式。 */
   async clickEl(tabId, expression) {
     return this.ev(
       tabId,
@@ -651,30 +596,8 @@ export class Rpc {
     throw second.e;
   }
 
-  /** 先算坐标再真实点击。selector 用 CSS；找不到返回 false 而不抛。 */
-  async clickBySelector(tabId, selector) {
-    const pos = await this.evJson(
-      tabId,
-      `const el=document.querySelector(${JSON.stringify(selector)});
-       if(!el) return {ok:false};
-       el.scrollIntoView({block:'center'});
-       const r=el.getBoundingClientRect();
-       return {ok:true, x:r.left+r.width/2, y:r.top+r.height/2};`
-    );
-    if (!pos || !pos.ok) return false;
-    await this.clickReal(tabId, pos.x, pos.y);
-    return true;
-  }
+  // ---------- 选 tab 与收尾 ----------
 
-  // ---------- 变更后验证 ----------
-
-  /**
-   * 在指定 url 上开工：复用/新开 tab → 等就绪 → 自检可注入 → 跑 fn。
-   * 这是「不要自己挑 tab」的推荐入口：避免了选到 discarded / chrome:// / 永远 loading 的页。
-   *
-   * 历史教训：agent 自己从 tabs.list 里挑 tab，挑中一个 status:"loading" 的 SPA，
-   * 于是在上面盲试了 155 次 PAGE_CONTEXT_TIMEOUT。这里把「选 tab + 验可用」合并成一步。
-   */
   /**
    * 在指定 url 上开工：复用/新开 tab → 等就绪 → 自检可注入 → 跑 fn → **默认关掉自己开的 tab**。
    * 这是「不要自己挑 tab」的推荐入口：避免了选到 discarded / chrome:// / 永远 loading 的页。
@@ -706,7 +629,8 @@ export class Rpc {
         throw new BridgeRpcError(
           "TAB_NOT_INJECTABLE",
           `tab #${tabId} 无法注入（${e.code}）。该页可能是受保护协议 / 已被丢弃 / 永远 loading。`,
-          "withPage"
+          "withPage",
+          { tabId, cause: e.code }
         );
       }
     }
@@ -728,21 +652,25 @@ export class Rpc {
     }
   }
 
+  // ---------- 变更后验证 ----------
+
   /**
-   * 执行变更并强制回读验证。
+   * 执行一次变更，然后轮询回读直到确认生效或超时。
    * 历史教训：脚本打印 ✓ 但记录其实没删掉 —— 变更类操作不能以「点了按钮」为成功依据。
+   * 变更只执行一次：重复提交 / 删除 / 发送的代价远大于多等几秒。
    * @param {() => Promise<any>} mutate  触发变更
    * @param {() => Promise<boolean>} verify 回读校验（应重新加载页面/列表后判断）
    */
-  async mutateAndVerify(mutate, verify, { retries = 1, label = "mutation" } = {}) {
-    let last;
-    for (let i = 0; i <= retries; i++) {
-      await mutate();
-      await sleep(2000);
-      last = await verify();
-      if (last) return { ok: true, attempts: i + 1, label };
+  async mutateAndVerify(mutate, verify, { timeoutMs = 10000, intervalMs = 1000, label = "mutation" } = {}) {
+    const started = Date.now();
+    await mutate();
+    let polls = 0;
+    while (true) {
+      polls++;
+      if (await verify()) return { ok: true, polls, elapsedMs: Date.now() - started, label };
+      if (Date.now() - started + intervalMs > timeoutMs) return { ok: false, polls, elapsedMs: Date.now() - started, label };
+      await sleep(intervalMs);
     }
-    return { ok: false, attempts: retries + 1, label };
   }
 }
 
@@ -764,30 +692,12 @@ export class BridgeRpcError extends Error {
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** 等待页面 readyState 完成（优先用扩展能力，不可用则退化为轮询）。 */
+/** 等待页面 readyState 为 interactive / complete。 */
 export async function waitReady(rpc, tabId, timeoutMs = 30000) {
-  try {
-    return await rpc.call("page.waitForReady", { tabId, timeoutMs }, timeoutMs + 5000);
-  } catch (e) {
-    if (e.code !== "UNKNOWN_METHOD") throw e;
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const s = await rpc.ev(tabId, "document.readyState");
-      if (s === "complete" || s === "interactive") return s;
-      await sleep(500);
-    }
-    throw new Error("waitReady 超时");
-  }
+  return rpc.call("page.waitForReady", { tabId, timeoutMs }, timeoutMs + 5000);
 }
 
-/** 打开网址的首选入口：复用「用户没在看」的同类 tab，没有才静默新开（需扩展 0.3.9+）。 */
+/** 打开网址的首选入口：复用「用户没在看」的同类 tab，没有才静默新开后台 tab。 */
 export async function openUrl(rpc, url, opts = {}) {
-  try {
-    return await rpc.call("tabs.resolve", { url, ...opts }, 45000);
-  } catch (e) {
-    if (e.code !== "UNKNOWN_METHOD") throw e;
-    // 降级：宁可多开一个后台 tab，也不要去动用户当前页
-    const tab = await rpc.call("tabs.create", { url, active: false }, 30000);
-    return { tabId: tab.id, tab, reused: false, navigated: true, reason: "fallback-tabs.create" };
-  }
+  return rpc.call("tabs.resolve", { url, ...opts }, 45000);
 }

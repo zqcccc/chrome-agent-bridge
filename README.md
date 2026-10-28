@@ -108,35 +108,51 @@ grep -o "code=[A-Z_]*" ~/.chrome-agent-bridge/host.log | sort | uniq -c | sort -
 
 - **扩展**（`extension/`）：装在 Chrome 里，负责读页面、点击、输入、截图
 - **本地桥**（`relay/`）：本机 Node 进程，转发 AI 和扩展之间的消息
-- **AI 客户端**（`agent/`）：给 AI 用的命令行和 JS 库
-- **Skill**（`skills/agent-browser-bridge/`）：教 AI 怎么用这套东西、哪些坑要避开
+- **Skill**（`skills/agent-browser-bridge/`）：教 AI 怎么用这套东西、哪些坑要避开；自带命令行 `scripts/bb.mjs` 与 JS 库 `scripts/lib/bridge.mjs`
+- **MCP server**（`mcp/`）：把常用能力暴露为 MCP 工具（`browser_read` / `browser_click` …），支持 MCP 的 AI 助手直接调用
+- **开发工具**（`agent/`）：扩展自重载、回归自检
 
 跟 ChatGPT for Chrome、Claude in Chrome 的思路一样：**装进你日常用的浏览器**，而不是另开一个无头浏览器。
+
+### 接入 MCP（Claude Code 等支持 MCP 的助手）
+
+```bash
+cd mcp && npm install
+claude mcp add agent-browser-bridge -- node "$(pwd)/server.mjs"
+```
+
+之后助手可直接调用 `browser_read`（读网页）、`browser_snapshot`（元素清单，带 `[e1]` 编号）、`browser_click` / `browser_type`（按编号操作，返回是否生效）、
+`browser_screenshot`、`browser_rpc`（任意桥方法）等工具。
 
 ### 命令行用法
 
 ```bash
-export BRIDGE_TOKEN=$(cat ~/.chrome-agent-bridge/token)
+BB="node skills/agent-browser-bridge/scripts/bb.mjs"   # token 自动从 ~/.chrome-agent-bridge/token 读取
 
-node agent/cli.mjs status              # 状态和连接
-node agent/cli.mjs tabs                # 列出所有标签页（拿 tabId）
-node agent/cli.mjs open <url>          # 打开网址（不抢你正在看的标签页）
-node agent/cli.mjs snap <tabId>        # 页面快照
-node agent/cli.mjs shot <tabId>        # 截图
-node agent/cli.mjs click <tabId> "button[type=submit]"
-node agent/cli.mjs type <tabId> "input#q" "要输入的话"
-node agent/cli.mjs wait <tabId> selector ".result"   # 等元素出现
-node agent/cli.mjs verify              # 回归自检，改完代码跑一次
+$BB status                       # 状态和连接
+$BB tabs                         # 列出所有标签页（拿 tabId）
+$BB read <url>                   # 读网页正文 + 主链接 + 阻断诊断
+$BB open <url>                   # 打开网址（不抢你正在看的标签页）
+$BB snap <tabId>                 # 元素清单，[e1] 编号可直接传给 click / type
+$BB click-real <tabId> @e2       # 真实鼠标点击
+$BB type-real <tabId> @e1 "要输入的话" --enter
+$BB wait <tabId> selector ".result"
+$BB methods                      # 全部 RPC 方法与参数
+$BB                              # 不带参数列出全部命令
+
+node agent/cli.mjs verify        # 回归自检，改完代码跑一次
 ```
 
 ### 代码调用
 
 ```js
-import { Bridge } from "./agent/client.mjs";
-const bridge = new Bridge({ port: 8778, token: process.env.BRIDGE_TOKEN });
-await bridge.rpc("tabs.list");
-await bridge.rpc("page.snapshot", { mode: "a11y" });
-await bridge.rpc("page.click", { selector: "#submit" });
+import { Rpc } from "./skills/agent-browser-bridge/scripts/lib/bridge.mjs";
+const rpc = new Rpc({ agentName: "MyTask" });
+const page = await rpc.readPage("https://example.com");
+await rpc.withPage("https://example.com", async (tabId) => {
+  const snap = await rpc.snapshotCompact(tabId);
+  const r = await rpc.clickReal(tabId, "@e1");   // r.delta 说明点击后页面变了什么
+});
 ```
 
 ### Firefox
@@ -146,8 +162,10 @@ await bridge.rpc("page.click", { selector: "#submit" });
 ```bash
 bash relay/install-host.sh --browser firefox   # 注册一次
 node relay/firefox-launch.js                   # 每次打开 Firefox 都用它（以 Remote Agent 模式启动并装上扩展）
-BRIDGE_BROWSER=firefox node agent/cli.mjs tabs
+BRIDGE_BROWSER=firefox node skills/agent-browser-bridge/scripts/bb.mjs tabs
 ```
+
+注意：Firefox 以 Remote Agent 模式运行期间，地址栏会一直显示条纹背景和机器人图标，所有网页读到的 `navigator.webdriver` 都是 `true`，风控严格的站点建议用 Chrome。详见 [`firefox/SKILL.md`](skills/agent-browser-bridge/firefox/SKILL.md)「使用痕迹」。
 
 完整的 RPC 清单、错误码、多 Agent 并行与 Tab 租约、CDP 直通等，见 [docs/AI-INTEGRATION.md](docs/AI-INTEGRATION.md) 和 [`skills/agent-browser-bridge/SKILL.md`](skills/agent-browser-bridge/SKILL.md)。
 
@@ -159,7 +177,8 @@ BRIDGE_BROWSER=firefox node agent/cli.mjs tabs
 chrome-agent-bridge/
 ├── extension/               # MV3 扩展（Chrome 直接加载；Firefox 版由 relay/build-firefox.js 生成到 dist/firefox）
 ├── relay/                   # 本地桥（native host + HTTP/WS 服务）
-├── agent/                   # AI 客户端（cli.mjs / client.mjs）
+├── agent/                   # 开发工具（cli.mjs：reload-ext / verify；client.mjs）
+├── mcp/                     # MCP server（server.mjs）
 ├── docs/AI-INTEGRATION.md   # 给 AI Agent 的接入与操作指南
 └── skills/
     └── agent-browser-bridge/  # 配套 Skill（含 xhs/ boss/ chatgpt/ notebooklm/ 子技能）
@@ -170,7 +189,7 @@ chrome-agent-bridge/
 ```bash
 clawhub login
 clawhub publish ./skills/agent-browser-bridge \
-  --slug agent-browser-bridge --version 0.3.14 \
+  --slug agent-browser-bridge --version 0.3.15 \
   --tags latest,browser,chrome --changelog "见 CHANGELOG.md"
 ```
 

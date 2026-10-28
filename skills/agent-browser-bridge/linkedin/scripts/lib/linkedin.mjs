@@ -293,9 +293,12 @@ export async function fillHeadline(rpc, tabId, value) {
       { type: "rawKeyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 4 },
       { type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 4 },
     ];
-    for (const k of keys) await rpc.call("session.send", { tabId, method: "Input.dispatchKeyEvent", params: k }, 10000);
-    await sleep(300);
-    await rpc.call("session.send", { tabId, method: "Input.insertText", params: { text: String(value) } }, 10000);
+    // session.send 经 rpc 会自动 attach 并持有到进程退出；withSession 让会话在这一步结束时就释放
+    await rpc.withSession(tabId, async () => {
+      for (const k of keys) await rpc.call("session.send", { tabId, method: "Input.dispatchKeyEvent", params: k }, 10000);
+      await sleep(300);
+      await rpc.call("session.send", { tabId, method: "Input.insertText", params: { text: String(value) } }, 10000);
+    });
     await sleep(1000);
     const after = await ev(rpc, tabId, `(() => { var el=${headlineExpr()}; return el ? String(el.innerText||'').length : -1; })()`);
     if (after > 0) return { ok: true, method: "insertText", len: after };
@@ -403,15 +406,8 @@ export async function clickReal(rpc, tabId, selector) {
     return { x: r.left + r.width/2, y: r.top + r.height/2 };
   })()`);
   if (!box || !box.x) return { ok: false, reason: "not-found-or-invisible" };
-  await rpc.call("session.send", {
-    tabId, method: "Input.dispatchMouseEvent",
-    params: { type: "mousePressed", x: box.x, y: box.y, button: "left", clickCount: 1 },
-  }, 15000);
-  await rpc.call("session.send", {
-    tabId, method: "Input.dispatchMouseEvent",
-    params: { type: "mouseReleased", x: box.x, y: box.y, button: "left", clickCount: 1 },
-  }, 15000);
-  return { ok: true };
+  const r = await rpc.clickReal(tabId, box.x, box.y);
+  return { ok: true, delta: r.delta };
 }
 
 /** 用 el.click() 点击（合成事件）。某些 LinkedIn 按钮只认这条路径。 */

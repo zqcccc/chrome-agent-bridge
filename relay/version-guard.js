@@ -51,6 +51,12 @@ function checks(version) {
       replace: (m) => m.replace(/"version"(\s*:\s*")[^"]+(")/, `"version"$1${version}$2`),
     },
     {
+      file: "mcp/package.json",
+      desc: "MCP server 包的 version 字段",
+      re: /"version"\s*:\s*"(\d+\.\d+\.\d+)"/,
+      replace: (m) => m.replace(/"version"(\s*:\s*")[^"]+(")/, `"version"$1${version}$2`),
+    },
+    {
       file: "skills/agent-browser-bridge/CHANGELOG.md",
       desc: "「当前版本」表里的扩展版本",
       // 匹配表格行：| 扩展 | **0.3.9** | ...
@@ -66,7 +72,7 @@ const HISTORICAL_PATTERNS = [
   { file: "skills/agent-browser-bridge/CHANGELOG.md", desc: "版本历史小节标题", re: /^###\s+\d+\.\d+\.\d+/ },
   { file: "skills/agent-browser-bridge/SKILL.md", desc: "能力的最低版本标注", re: /v?\d+\.\d+\.\d+\+/ },
   { file: "skills/agent-browser-bridge/KNOWN_ISSUES.md", desc: "能力的最低版本标注", re: /v?\d+\.\d+\.\d+\+/ },
-  { file: "skills/agent-browser-bridge/scripts/lib/bridge.mjs", desc: "能力门槛（gte 判定）", re: /gte\(version,\s*"\d+\.\d+\.\d+"\)/ },
+  { file: "skills/agent-browser-bridge/scripts/lib/bridge.mjs", desc: "本库最低桥版本", re: /MIN_BRIDGE_VERSION = "\d+\.\d+\.\d+"/ },
 ];
 
 function main() {

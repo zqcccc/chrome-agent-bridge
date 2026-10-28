@@ -253,6 +253,7 @@ const EXPECTED_ERROR_CODES = new Set([
   "BAD_PARAMS",        // 调用方没传对参数
   "UNKNOWN_METHOD",    // 文档/版本不匹配，属调用方问题
   "SCREENSHOT_FAILED",
+  "TAB_HIDDEN",        // 后台标签页不处理 CDP 鼠标事件，调用方 ensureActive 后重试
 ]);
 function logRpcError(method, e) {
   const code = normalizeErrCode(e);
@@ -267,13 +268,19 @@ function logRpcError(method, e) {
 // 让调用方可编程判断，也让预期内的失败降级成 warn。
 function normalizeErrCode(e) {
   if (e && e.code) return e.code;
-  const m = String((e && e.message) || e || "");
+  return classifyErrMessage(String((e && e.message) || e || "")) || "INTERNAL";
+}
+// 按消息识别预期内的失败类别；识别不了返回 null，由调用方决定兜底码。
+// chrome.tabs.* 与 chrome.debugger 对同一原因措辞不同（`No tab with id` / `No tab with given id`），
+// 曾导致同一个「tab 已关」报出 TAB_GONE / ATTACH_FAILED / SESSION_ATTACH_FAILED 三种码。
+function classifyErrMessage(m) {
   // 右侧是 Firefox 对同一类失败的措辞
-  if (/No tab with id|Invalid tab ID/i.test(m)) return "TAB_GONE";
-  if (/Cannot access contents of the page|Cannot access a chrome:|Missing host permission for the tab/i.test(m)) return "UNSUPPORTED_URL";
-  if (/Receiving end does not exist|Frame with ID .* was removed/i.test(m)) return "PAGE_CONTEXT_TIMEOUT";
-  if (/Another debugger|already attached/i.test(m)) return "DEBUGGER_BUSY";
-  return "INTERNAL";
+  if (/No tab with (given )?id|Invalid tab ID/i.test(m)) return "TAB_GONE";
+  if (/Cannot access contents of the page|Cannot access a chrome:|Missing host permission for the tab|Cannot attach to this target/i.test(m)) return "UNSUPPORTED_URL";
+  // CDP 的 `Inspected target navigated or closed` 与 content script 的 `Receiving end does not exist` 同属页面上下文失效
+  if (/Receiving end does not exist|Frame with ID .* was removed|Inspected target navigated or closed|Execution context was destroyed/i.test(m)) return "PAGE_CONTEXT_TIMEOUT";
+  if (/Another debugger|already attached|already has/i.test(m)) return "DEBUGGER_BUSY";
+  return null;
 }
 
 // 错误里可以带结构化细节（如 SCROLL_NO_GROWTH 的 atBottom/wasHidden），让调用方**可编程判断**
@@ -665,17 +672,6 @@ async function dispatch(method, params, caller) {
     case "page.open": return tabsResolve(params);
     case "tabs.open":
     case "tabs.new": return tabsCreate({ url: params.url, ...params });
-    case "tabs.claim":
-    case "tabs.release": {
-      // 租约账本在 host 侧（HTTP /tabs/claim|/tabs/release 才是真正的互斥来源）。
-      // 经 RPC 进来时无法登记租约，做兼容降级：claim 等价于 prepare（保证可用），
-      // release 无本地状态可清。并在 warning 里点明正确入口，避免误以为拿到了互斥租约。
-      if (method === "tabs.release") {
-        return { ok: true, tabId: params.tabId, leased: false, note: "租约由 host 管理，请用 HTTP POST /tabs/release 释放" };
-      }
-      const prep = await tabsPrepare(params.tabId);
-      return { ...prep, leased: false, note: "租约未登记（由 host 管理），请用 HTTP POST /tabs/claim 获取真实互斥租约" };
-    }
     case "page.reload": return tabsReload(params.tabId, params);
 
     case "page.info": return pageInfo(params.tabId);
@@ -2046,7 +2042,7 @@ async function withBorrowedDebugger(tabId, fn) {
       if (/already attached/i.test(m)) return { ok: true, owned: false };
       return {
         ok: false,
-        code: err.code || (/Another debugger|already has/i.test(m) ? "DEBUGGER_BUSY" : "ATTACH_FAILED"),
+        code: err.code || classifyErrMessage(m) || "ATTACH_FAILED",
         message: m,
       };
     }
@@ -2151,25 +2147,20 @@ async function pageEvalCdp(tabId, params) {
   });
 }
 
-async function samplePageDeltaState(tabId) {
-  try {
-    const r = await pageEvalCdp(tabId, {
-      expression: `(() => {
-        const a = document.activeElement;
-        const val = a ? (a.value !== undefined && typeof a.value === "string" ? a.value.slice(0, 200) : (a.isContentEditable ? (a.innerText || "").trim().slice(0, 200) : null)) : null;
-        const modals = document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog[open], .note-detail-mask, [class*="modal"][class*="mask"]');
-        let hasModal = false;
-        for (const m of modals) {
-          const rect = m.getBoundingClientRect();
-          if (rect.width > 0 && rect.height > 0 && getComputedStyle(m).display !== "none") { hasModal = true; break; }
-        }
-        return { url: location.href, title: document.title, hasModal, activeTag: a && a.tagName ? a.tagName.toLowerCase() : null, activeValue: val };
-      })()`,
-    });
-    return r && r.result ? r.result : null;
-  } catch (e) {
-    return null;
-  }
+// CDP 动作（clickReal / typeReal）的 delta 采样：与 DOM 动作共用 content.js 的 beginDelta/endDelta，
+// 返回同一形状（含 mutationCount / mutations）。content 不可用时 delta 缺省，不影响动作本身。
+// 曾用两次 page.evalCdp 采前后态，每次 clickReal 额外两轮 attach/detach，且没有 mutation 统计。
+async function cdpDeltaBegin(tabId) {
+  return contentCall(tabId, "deltaBegin", {}).catch(() => null);
+}
+async function cdpDeltaEnd(tabId, begin) {
+  if (!begin) return undefined;
+  const r = await contentCall(tabId, "deltaEnd", { id: begin.id }).catch(() => null);
+  if (r && r.session) return r.delta;
+  // 动作引发整页导航：旧 content 实例连同采样状态已销毁，只能给出导航信息
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) return undefined;
+  return { urlChanged: tab.url !== begin.url, url: tab.url, navigated: true };
 }
 
 async function resolveTargetForCdp(tabId, params, opts = {}) {
@@ -2232,28 +2223,34 @@ async function pageClickReal(tabId, params) {
   const clickCount = (params && params.clickCount) || 1;
   const delayMs = params && params.delayMs !== undefined ? Math.max(0, Number(params.delayMs)) : 50;
 
+  const begin = await cdpDeltaBegin(tabId);
+  // 实测（Chrome）：后台标签页（document.hidden）里 CDP 鼠标事件约 6s 后返回且页面毫无反应，之前照样回 ok:true。
+  // 不自动激活（会抢用户前台），报可恢复错误，由调用方决定是否 page.ensureActive 后重试。
+  // Firefox 经 BiDi input.performActions 派发，后台标签页可用（test-firefox-e2e 第 6 节），不拦。
+  if (!CDP_VIA_HOST && begin && begin.hidden) {
+    await cdpDeltaEnd(tabId, begin);
+    throw {
+      code: "TAB_HIDDEN",
+      message: `tab ${tabId} 是后台标签页，不处理 CDP 鼠标事件；先 page.ensureActive 再点击（scripts/lib/bridge.mjs 的 clickReal 会自动处理）`,
+      tabId,
+      recoverable: true,
+    };
+  }
   indicatorCall(tabId, { action: "click", x, y }).catch(() => {});
-  const before = await samplePageDeltaState(tabId);
-
-  await withBorrowedDebugger(tabId, async (send) => {
-    await send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", clickCount: 0 });
-    if (delayMs > 0) await sleepMs(delayMs);
-    await send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, clickCount });
-    if (delayMs > 0) await sleepMs(delayMs);
-    await send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button, clickCount });
-  });
-
-  await sleepMs(60);
-  const after = await samplePageDeltaState(tabId);
-  const delta = before && after ? {
-    urlChanged: after.url !== before.url,
-    url: after.url,
-    titleChanged: after.title !== before.title,
-    modalOpened: !before.hasModal && after.hasModal,
-    modalClosed: before.hasModal && !after.hasModal,
-    activeTag: after.activeTag,
-    activeValue: after.activeValue,
-  } : undefined;
+  let delta;
+  try {
+    await withBorrowedDebugger(tabId, async (send) => {
+      await send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", clickCount: 0 });
+      if (delayMs > 0) await sleepMs(delayMs);
+      await send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, clickCount });
+      if (delayMs > 0) await sleepMs(delayMs);
+      await send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button, clickCount });
+    });
+    await sleepMs(60);
+  } finally {
+    // 动作失败也要结束采样，否则 content 里的 MutationObserver 不会断开
+    delta = await cdpDeltaEnd(tabId, begin);
+  }
 
   return { ok: true, x, y, ...targetMeta, via: "cdp", delta };
 }
@@ -2262,42 +2259,43 @@ async function pageTypeReal(tabId, params) {
   requireTabId(tabId);
   const text = params && (params.text !== undefined ? params.text : params.value);
   if (text === undefined) throw { code: "BAD_PARAMS", message: "缺少 text" };
-  let targetMeta = {};
-  if (params && (params.selector || params.ref)) {
-    const resolved = await resolveTargetForCdp(tabId, params, { focus: true, clear: params.clear !== false });
-    targetMeta = { ref: resolved.ref || null, tag: resolved.tag || null };
-  }
-  const before = await samplePageDeltaState(tabId);
   const str = String(text);
-
-  await withBorrowedDebugger(tabId, async (send) => {
-    if (str.length > 0) {
-      await send("Input.insertText", { text: str });
+  const begin = await cdpDeltaBegin(tabId);
+  let targetMeta = {}, check, delta;
+  try {
+    // 实测（Chrome）：后台标签页里 Input.insertText 生效，但回车（Input.dispatchKeyEvent）与鼠标事件一样不被处理。
+    // 在改动输入框之前就报错，避免「字打进去了、表单没提交」的半成品状态。
+    if (!CDP_VIA_HOST && params.pressEnter && begin && begin.hidden) {
+      throw {
+        code: "TAB_HIDDEN",
+        message: `tab ${tabId} 是后台标签页，不处理 CDP 按键事件（pressEnter 无效）；先 page.ensureActive 再输入（scripts/lib/bridge.mjs 的 typeReal 会自动处理）`,
+        tabId,
+        recoverable: true,
+      };
     }
-    if (params && params.pressEnter) {
+    if (params.selector || params.ref) {
+      const resolved = await resolveTargetForCdp(tabId, params, { focus: true, clear: params.clear !== false });
+      targetMeta = { ref: resolved.ref || null, tag: resolved.tag || null };
+    }
+    await withBorrowedDebugger(tabId, async (send) => {
+      if (str.length > 0) {
+        await send("Input.insertText", { text: str });
+      }
+      // 在按回车**之前**回读：回车常触发提交/导航，之后焦点元素已不是输入框，校验无意义
       await sleepMs(40);
-      await send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
-      await send("Input.dispatchKeyEvent", { type: "char", text: "\r", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
-      await send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
-    }
-  });
+      check = await contentCall(tabId, "checkActive", { expectText: str });
+      if (params && params.pressEnter) {
+        await send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+        await send("Input.dispatchKeyEvent", { type: "char", text: "\r", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+        await send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+      }
+    });
+    await sleepMs(50);
+  } finally {
+    delta = await cdpDeltaEnd(tabId, begin);
+  }
 
-  await sleepMs(50);
-  const after = await samplePageDeltaState(tabId);
-  const actualVal = after ? after.activeValue : null;
-  const snippet = str.slice(0, 20);
-  const verified = str.length === 0 ? (actualVal === "" || actualVal === null) : (typeof actualVal === "string" && actualVal.includes(snippet));
-  const delta = before && after ? {
-    urlChanged: after.url !== before.url,
-    url: after.url,
-    titleChanged: after.title !== before.title,
-    modalOpened: !before.hasModal && after.hasModal,
-    modalClosed: before.hasModal && !after.hasModal,
-    activeTag: after.activeTag,
-    activeValue: actualVal,
-  } : undefined;
-
-  return { ok: true, ...targetMeta, value: actualVal, verified, via: "cdp", delta };
+  return { ok: true, ...targetMeta, value: check.value, verified: check.verified, via: "cdp", delta };
 }
 
 async function pageUploadFile(tabId, params) {
@@ -2467,7 +2465,7 @@ async function sessionAttach(tabId) {
       if (/Another debugger|already has/i.test(m)) {
         throw { code: "DEBUGGER_BUSY", message: `该标签页已被其他调试器占用（通常是用户打开的 DevTools）：${m}` };
       }
-      throw { code: HOST_CDP_ERROR_CODES.has(err.code) ? err.code : "SESSION_ATTACH_FAILED", message: m };
+      throw { code: HOST_CDP_ERROR_CODES.has(err.code) ? err.code : (classifyErrMessage(m) || "SESSION_ATTACH_FAILED"), message: m };
     }
   }
   cdpSessions.add(tabId);
@@ -2491,7 +2489,7 @@ async function sessionSend(tabId, params) {
     const m = String(err.message || "");
     // 页面导航导致调试目标被卸载：清理本地记录，避免后续调用连环失败
     if (/Detached while handling|not attached|Detached/i.test(m)) cdpSessions.delete(tabId);
-    const code = HOST_CDP_ERROR_CODES.has(err.code) ? err.code : (/Detached/i.test(m) ? "SESSION_DETACHED" : "SESSION_SEND_FAILED");
+    const code = HOST_CDP_ERROR_CODES.has(err.code) ? err.code : (/Detached/i.test(m) ? "SESSION_DETACHED" : (classifyErrMessage(m) || "SESSION_SEND_FAILED"));
     throw { code, message: m };
   }
 }
@@ -2548,9 +2546,8 @@ function tryUnfreezeTab(tabId) {
     ]);
     return { ok: true, resp };
   }).catch((e) => {
-    const code = e && e.code;
-    if (code === "DEBUGGER_BUSY") return { ok: false, reason: "DEBUGGER_BUSY" };
-    if (code === "ATTACH_FAILED") return { ok: false, reason: "ATTACH_FAILED" };
+    // 借调试器失败（DEBUGGER_BUSY / TAB_GONE / ATTACH_FAILED …）的码原样作为 reason
+    if (e && e.code) return { ok: false, reason: e.code };
     if (e && e.message === "UNFREEZE_TIMEOUT") return { ok: false, reason: "UNFREEZE_TIMEOUT" };
     return { ok: false, reason: "UNFREEZE_COMMAND_FAILED" };
   });

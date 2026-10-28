@@ -5,7 +5,7 @@ description: agent-browser-bridge 的子技能——网页版 ChatGPT（chatgpt.
 
 # ChatGPT 网页版专项：问答、读回复、选模型、生图
 
-> **路径约定**：本文的 `<skill 目录>` 指本文件所在目录，`<仓库根>` = `<skill 目录>/../..`，主 CLI 为 `<仓库根>/agent/cli.mjs`。**这些位置是可推导的，不要用 `find ~` 之类全盘搜索去定位**；完整约定见根 `SKILL.md`「路径约定（读本 skill 任何命令前先看这里）」一节。
+> **路径约定**：本文的 `<skill 目录>` 指本文件所在目录，`<仓库根>` = `<skill 目录>/../..`，命令行入口为 `<skill 目录>/../scripts/bb.mjs`（根 SKILL.md 记作 `<bb>`）。**这些位置是可推导的，不要用 `find ~` 之类全盘搜索去定位**；完整约定见根 `SKILL.md`「路径约定」一节。
 
 用真实登录态驱动 chatgpt.com：发提问 → 等回复 → 读文本/图片结果。**网页额度单端计算**，与 API 额度互不占用；网页端模型通常比 API 更新（当前实例默认模型为 GPT-5.6 Luna）。
 

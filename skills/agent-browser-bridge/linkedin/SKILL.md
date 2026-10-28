@@ -5,7 +5,7 @@ description: agent-browser-bridge 的子技能——LinkedIn（linkedin.com）�
 
 # LinkedIn 职业档案专项：读取与编辑
 
-> **路径约定**：本文的 `<skill 目录>` 指本 skill 目录（即 `agent-browser-bridge/linkedin/`），`<仓库根>` = `<skill 目录>/../../..`，主 CLI 为 `<仓库根>/agent/cli.mjs`。**这些位置是可推导的，不要用 `find ~` 之类全盘搜索去定位**；完整约定见根 `SKILL.md`「路径约定（读本 skill 任何命令前先看这里）」一节。
+> **路径约定**：本文的 `<skill 目录>` 指本 skill 目录（即 `agent-browser-bridge/linkedin/`），`<仓库根>` = `<skill 目录>/../../..`，命令行入口为 `<skill 目录>/../scripts/bb.mjs`（根 SKILL.md 记作 `<bb>`）。**这些位置是可推导的，不要用 `find ~` 之类全盘搜索去定位**；完整约定见根 `SKILL.md`「路径约定」一节。
 
 用真实登录态读写 LinkedIn 职业档案。**本专项的核心价值不是「会点按钮」，而是把 LinkedIn 五个反直觉的坑一次性收敛掉**——每一条都是实测踩出来的，且错误现象都指向错误的方向（详见下文「五个坑」）。
 

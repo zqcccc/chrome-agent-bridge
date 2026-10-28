@@ -1,6 +1,6 @@
 {
   "name": "agent-browser-bridge",
-  "version": "0.3.14",
+  "version": "0.3.15",
   "description": "Agent Browser Bridge - Chrome / Firefox 扩展 + 本地桥（Native Messaging / WebSocket）",
   "private": true,
   "scripts": {
@@ -15,8 +15,8 @@
     "test:firefox": "node build-firefox.js && node test-firefox-e2e.mjs",
     "test:bidi": "node --test test-bidi-unit.mjs",
     "test": "npm run test:unit-all && npm run test:e2e",
-    "test:unit-all": "node version-guard.js && node check-skill-consumers.js && node test-unit.js && node --test test-verify.mjs test-hardening.mjs test-content-stop.mjs test-bridge-lib.mjs test-tab-health.mjs test-linkedin-expr.mjs test-bidi-unit.mjs",
-    "test:e2e": "node test.js && node test-stop-e2e.mjs && node test-tab-cleanup.mjs && node test-cdp-session-isolation.mjs && node test-freeze-recovery.mjs && node test-foreground-rendering.mjs",
+    "test:unit-all": "node version-guard.js && node check-skill-consumers.js && node gen-rpc-doc.js --check && node test-unit.js && node --test test-verify.mjs test-hardening.mjs test-content-stop.mjs test-bridge-lib.mjs test-tab-health.mjs test-linkedin-expr.mjs test-bidi-unit.mjs test-methods.mjs",
+    "test:e2e": "node test.js && node test-stop-e2e.mjs && node test-tab-cleanup.mjs && node test-cdp-session-isolation.mjs && node test-freeze-recovery.mjs && node test-foreground-rendering.mjs && node test-agent-ergonomics.mjs",
     "test:integration": "node test.js",
     "test:unit": "node test-unit.js",
     "test:hardening": "node --test test-hardening.mjs",
@@ -29,7 +29,9 @@
     "test:cdp-iso": "node test-cdp-session-isolation.mjs",
     "test:linkedin": "node test-linkedin-expr.mjs",
     "test:freeze": "node test-freeze-recovery.mjs",
-    "test:foreground": "node test-foreground-rendering.mjs"
+    "test:foreground": "node test-foreground-rendering.mjs",
+    "gen:rpc-doc": "node gen-rpc-doc.js",
+    "test:ergonomics": "node test-agent-ergonomics.mjs"
   },
   "engines": {
     "node": ">=18"

@@ -104,8 +104,7 @@ const UPLOAD_FILE = path.join(WORK_DIR, "upload-sample.txt");
 fs.writeFileSync(UPLOAD_FILE, "hello firefox\n");
 
 const ev = (tabId, expr) => rpc.ev(tabId, expr);
-// Rpc.call 会按 value 字段自动解包（page.typeReal 的结果含 value，会被剥成字符串），
-// 需要完整结果对象时直接走 HTTP。
+// 需要原样的 RPC 结果（不经 Rpc 的解包、自动 attach 与异常转换）时直接走 HTTP。
 async function raw(method, params, timeoutMs = 20000) {
   const res = await fetch(`http://127.0.0.1:${HOST_PORT}/rpc`, {
     method: "POST",
@@ -140,9 +139,14 @@ try {
     t("awaitPromise=false 时返回 Promise 对象（与 CDP 一致）", c.ok && JSON.stringify(c.value) === "{}", JSON.stringify(c.value || c));
     const d = await attempt(() => rpc.ev(tabId, "Promise.resolve(9)", { awaitPromise: true }));
     t("awaitPromise=true 取到 Promise 结果", d.ok && d.value === 9, JSON.stringify(d.value || d));
-    // CDP 异常时 result 是错误对象（subtype=error，description 含消息与堆栈），两种浏览器一致
-    const e = await attempt(() => ev(tabId, "throw new Error('boom-ff')"));
-    t("页面异常返回 error 对象且 description 带原始消息", e.ok && e.value.subtype === "error" && /boom-ff/.test(e.value.description), JSON.stringify(e.ok ? e.value : e));
+    // CDP 异常时 result 是错误对象（subtype=error，description 含消息与堆栈），两种浏览器一致。
+    // 直接走 session.send 检查翻译层形状；rpc.ev 会把它转成 EVAL_ERROR 抛出
+    await rpc.attach(tabId);
+    const e = await attempt(async () => (await raw("session.send", { tabId, method: "Runtime.evaluate", params: { expression: "throw new Error('boom-ff')", returnByValue: true } })).result);
+    t("页面异常返回 error 对象且 description 带原始消息", e.ok && e.value.result.subtype === "error" && /boom-ff/.test(e.value.result.description) && !!e.value.exceptionDetails, JSON.stringify(e.ok ? e.value : e).slice(0, 200));
+    await rpc.detach(tabId);
+    const e2 = await attempt(() => ev(tabId, "throw new Error('boom-ff')"));
+    t("rpc.ev 对页面异常抛 EVAL_ERROR", !e2.ok && e2.code === "EVAL_ERROR" && /boom-ff/.test(e2.message), JSON.stringify(e2));
     const f = await attempt(() => rpc.call("page.evalCdp", { tabId, expression: "location.pathname" }, 15000));
     t("page.evalCdp", f.ok && f.value === "/form", JSON.stringify(f.ok ? f.value : f));
   }
@@ -247,8 +251,11 @@ try {
   {
     await rpc.call("tabs.close", { tabId }, 10000);
     await sleep(500);
-    const r = await attempt(() => rpc.call("session.send", { tabId, method: "Runtime.evaluate", params: { expression: "1" } }, 10000));
+    // 走裸 HTTP：Rpc 会对未登记的 tab 先自动 attach（那样报的是 TAB_GONE），这里要测的是扩展侧会话随 tab 关闭清理
+    const r = await attempt(() => raw("session.send", { tabId, method: "Runtime.evaluate", params: { expression: "1" } }, 10000));
     t("已关闭 tab 的 session.send 报 SESSION_NOT_ATTACHED", !r.ok && r.code === "SESSION_NOT_ATTACHED", `[${r.code}] ${r.message}`);
+    const a = await attempt(() => rpc.call("session.attach", { tabId }, 10000));
+    t("已关闭 tab 的 session.attach 报 TAB_GONE", !a.ok && a.code === "TAB_GONE", `[${a.code}] ${a.message}`);
   }
 } finally {
   await rpc.cleanup().catch(() => {});

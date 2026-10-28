@@ -1,4 +1,4 @@
-import { Rpc, unwrap, openUrl } from "../skills/agent-browser-bridge/scripts/lib/bridge.mjs";
+import { Rpc, unwrap, openUrl, versionGte, MIN_BRIDGE_VERSION } from "../skills/agent-browser-bridge/scripts/lib/bridge.mjs";
 
 let pass = 0, fail = 0;
 const t = (name, cond, extra = "") => {
@@ -7,10 +7,12 @@ const t = (name, cond, extra = "") => {
 };
 
 console.log("== unwrap 三层解包 ==");
-t("裸HTTP {result:{result:{value}}}", unwrap({result:{result:{value:{a:1}}}}).a === 1);
-t("client {result:{value}}", unwrap({result:{value:{a:2}}}).a === 2);
+t("裸HTTP {result:{result:RemoteObject}}", unwrap({result:{result:{type:"object", value:{a:1}}}}).a === 1);
+t("client {result:RemoteObject}", unwrap({result:{type:"object", value:{a:2}}}).a === 2);
 t("CDP {type,value}", unwrap({type:"object", value:{a:3}}).a === 3);
-t("JSON 字符串自动 parse", unwrap({result:{result:{value:'{"a":4}'}}}).a === 4);
+t("JSON 字符串自动 parse", unwrap({result:{result:{type:"string", value:'{"a":4}'}}}).a === 4);
+const typed = unwrap({ ok: true, result: { ok: true, value: "hi", verified: true, delta: { urlChanged: false } } });
+t("含 value 键的业务对象不被剥层（typeReal 返回）", typed.verified === true && typed.value === "hi" && !!typed.delta, JSON.stringify(typed));
 t("null 安全", unwrap(null) === null);
 
 const rpc = new Rpc({ agentId: "lib-test", agentName: "LibTest" });
@@ -25,7 +27,8 @@ t("version 与 manifest.json 一致",
     new URL("../extension/manifest.json", import.meta.url), "utf8")).version);
 t("不再输出分叉字段 hostVersion/extensionVersion",
   !("hostVersion" in pf) && !("extensionVersion" in pf));
-t("capabilities.tabsResolve 已判定", pf.capabilities.tabsResolve === true);
+t("版本满足本库最低要求", versionGte(pf.version, MIN_BRIDGE_VERSION), `${pf.version} < ${MIN_BRIDGE_VERSION}`);
+t("versionGte 比较正确", versionGte("0.3.13", "0.3.13") && versionGte("0.4.0", "0.3.99") && !versionGte("0.3.9", "0.3.13"));
 
 console.log("\n== ev 取值（真实 tab）==");
 // 挑 tab 必须**逐个探测可注入**，不能只看 http + !discarded。
@@ -56,6 +59,17 @@ const v = await rpc.ev(tab.id, "({n: 1+1, title: document.title.slice(0,30)})");
 t("ev 返回真实对象", v && v.n === 2, JSON.stringify(v));
 const j = await rpc.evJson(tab.id, "return {ok:true, len: document.body.innerText.length};");
 t("evJson 解析", j && j.ok === true && typeof j.len === "number");
+const vv = await rpc.ev(tab.id, "({value: 7, other: 1})");
+t("ev 不误剥对象里的 value 键", vv && vv.value === 7 && vv.other === 1, JSON.stringify(vv));
+const ex = await rpc.ev(tab.id, "(()=>{throw new Error('boom-ev')})()").then(() => null, (e) => e);
+t("页面异常报 EVAL_ERROR", ex && ex.code === "EVAL_ERROR" && /boom-ev/.test(ex.message), ex && ex.message);
+
+console.log("\n== session.send 经本库自动 attach ==");
+await rpc.detach(tab.id);
+const ss = await rpc.call("session.send", { tabId: tab.id, method: "Runtime.evaluate", params: { expression: "2+3", returnByValue: true } }).then((v) => v, (e) => e);
+t("未显式 attach 的 session.send 成功", ss === 5, ss && ss.code ? `[${ss.code}]` : JSON.stringify(ss));
+t("自动 attach 已登记，退出时会释放", rpc._attached.has(tab.id));
+await rpc.detach(tab.id);
 
 console.log("\n== withSession 异常路径也 detach ==");
 let threw = false;

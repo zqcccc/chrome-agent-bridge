@@ -12,7 +12,7 @@ Chrome 扩展  <->  relay 本地桥  <->  AI Agent
 
 - **Chrome 扩展**：加载到用户正在使用的 Chrome 中，负责读取和操作网页。
 - **relay**：本地 Node.js 服务，负责连接扩展和 Agent。默认只监听 `127.0.0.1:8778`。
-- **agent 客户端**：`agent/client.mjs` 和 `agent/cli.mjs`，供程序或命令行调用。
+- **客户端**：skill 自带的 `scripts/bb.mjs`（命令行）与 `scripts/lib/bridge.mjs`（JS 库）；`mcp/server.mjs` 把常用能力暴露为 MCP 工具；`agent/cli.mjs` 放扩展自重载、回归自检等开发命令。
 - **Skill**：`skills/agent-browser-bridge/SKILL.md`，告诉支持 Skill 的 Agent 如何检查状态、选择标签页和安全执行操作。
 
 ## 给 AI Agent 的标准接入流程
@@ -79,6 +79,15 @@ node agent/cli.mjs verify
 ```
 
 只有当 `extConnected` 为 `true`、`tabs` 能返回标签页且 `verify` 通过后，才认为接入成功。
+
+### 5. 可选：接入 MCP
+
+支持 MCP 的 Agent（如 Claude Code）可以把桥注册为 MCP server，之后直接调用 `browser_read`、`browser_snapshot`、`browser_click` 等工具，不必拼 HTTP 请求：
+
+```bash
+cd /path/to/chrome-agent-bridge/mcp && npm install
+claude mcp add agent-browser-bridge -- node /path/to/chrome-agent-bridge/mcp/server.mjs
+```
 
 ## AI Agent 的日常操作规范
 

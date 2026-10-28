@@ -37,7 +37,7 @@ for x in json.load(sys.stdin).get('proxies',[]):
 
 ## 路径约定
 
-沿用根 SKILL.md：`<skill 目录>` = 本文件所在目录，`$ROOT` = 上两级，`<cli>` = `$ROOT/agent/cli.mjs`。
+沿用根 SKILL.md「路径约定」：`<skill 目录>` = 本文件所在目录，命令行入口 `<bb>` = `node <skill 目录>/../scripts/bb.mjs`。
 本子 skill 脚本自包含，不依赖 CLI。
 
 ```bash

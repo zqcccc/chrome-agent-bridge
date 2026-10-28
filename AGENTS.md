@@ -13,6 +13,19 @@
 3. **禁止依赖仓库根文件**：不要把 `agent/cli.mjs`、`extension/*` 等仓库根文件当作唯一入口或必读文件。CLI 命令可以出现，但必须标注为"本机仓库的便利命令"，同时给出**等价的 RPC 代码示例**作为自包含路径。
 4. **禁止机器特定绝对路径**：不写 `/Users/<user>/...` 之类路径。skill 内文件的路径用相对 skill 目录的写法（如 `scripts/browser-debug.mjs`）；仓库根的路径用占位符（如 `<chrome-agent-bridge 仓库根>`）。
 5. **新增能力时：插件实现 + skill 文档双写**：给插件新增 RPC（如 `page.inspect`）时，skill 文档必须包含——调用方式（RPC / HTTP）、参数表、返回结构示例、一个最小可用示例。写完自检：**假设对方只有 skill 目录，能否照文档独立完成操作？** 不能，就补代码。
+6. **新增 RPC 必须登记 `relay/methods.js`**：host 按这张表判定 `UNKNOWN_METHOD`，不登记的方法到不了扩展。登记后运行
+   `node relay/gen-rpc-doc.js` 重新生成 `skills/agent-browser-bridge/reference/rpc.md`；`test-methods.mjs` 对照 `background.js` 的 `case` 与 host 本地处理的方法检查一致性，`gen-rpc-doc.js --check` 检查文档是否过期，两者都在 `test:unit-all` 里。参数说明、返回示例写进 `reference/core.md`。
+
+### 四个调用入口各管什么
+
+| 入口 | 位置 | 改它要注意 |
+|---|---|---|
+| `scripts/lib/bridge.mjs` | skill 内 | 其余三个入口的底座。只依赖 Node 内置模块；不为低于 `MIN_BRIDGE_VERSION` 的扩展做降级 |
+| `scripts/bb.mjs` | skill 内 | Agent 用的命令行。新命令加在这里，不要加到 `agent/cli.mjs` |
+| `agent/cli.mjs` | 仓库根 | 只放开发命令（`reload-ext` / `verify` / `cursor` / `listen`），其余转交 `bb.mjs` |
+| `mcp/server.mjs` | 仓库根 | MCP 工具层，依赖 `@modelcontextprotocol/sdk`（`mcp/` 下单独 `npm install`）。回归：`cd mcp && npm test`（真机） |
+
+**`unwrap()` 踩过的坑**：曾用「对象含 `value` 键」判定 CDP RemoteObject，于是 `page.typeReal` 的返回 `{ok, value, verified, delta}` 被剥成 value 字符串，`rpc.typeReal()` 的 `verified` 一直是 `undefined`。现在要求形状完全符合 RemoteObject（有 `type`，字段都在 RemoteObject 字段集内）。新 RPC 的返回对象若同时含 `type` 与 `value`，要先想清楚会不会被误判。
 
 ## 开发循环：改完怎么生效
 
@@ -200,6 +213,17 @@ details 被静默丢弃**，Agent 只能解析 message 文本才能判断——�
   > 一般原则：**写针对真实环境的测试，先想「用户同时在操作时会怎样」**。
   > 假红的代价比不测更大——它会训练人忽略红色。
 
+### 后台标签页不处理 CDP 鼠标与按键事件：`TAB_HIDDEN`（v0.3.15）
+
+与「渲染暂停」同源但独立的一条：Chrome 后台标签页（`document.hidden`）里 `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent`
+约 6s 后返回、页面毫无反应；`Input.insertText` 不受影响。此前 `page.clickReal` 照样回 `ok:true`，属假成功。
+
+- 判定点在 `cdpDeltaBegin` 返回的 `hidden`（content script 读 `document.hidden`），`pageClickReal` 与带 `pressEnter` 的 `pageTypeReal`
+  在**改动页面之前**报 `TAB_HIDDEN`（`recoverable:true`）。
+- 只拦 Chrome（`!CDP_VIA_HOST`）：Firefox 经 BiDi `input.performActions` 派发，后台标签页可用，`test-firefox-e2e.mjs` 第 6 节覆盖。
+- 扩展不自动激活（理由同 `ensureActive`），自动重试放在客户端：`bridge.mjs` 的 `clickReal` / `typeReal` 与 MCP 工具。
+- 回归：`node relay/test-agent-ergonomics.mjs` 第 0 节。
+
 `Uncaught (in promise)` 之类的面板报错同理：面板累积显示、不区分新旧，排查前先重新导航重置，再只触发一次待测调用——否则会把历史残留当成新问题。
 
 ### 兜底：未捕获的 promise rejection
@@ -275,6 +299,7 @@ host 日志：`~/.chrome-agent-bridge/host-firefox.log`（Chrome 仍是 `host.lo
 
 - `~/.agents/skills/boss-zhipin-apply/scripts/{send-chat,batch-apply,remote/*}.mjs` —— 4 个文件，直连 `/rpc` 与 `/tabs/claim`。
 - `~/.workbuddy/skills/boss-zhipin-apply` 是前者的**符号链接**（同一份），不用重复改。
+- resume-boilerplate 项目的 `job-loop/maimai-scan.mjs` 实现了 `maimai/SKILL.md` 的配方：改该子技能的配方时同步改它。
 
 **改桥后的收尾动作**（两件事都要做）：
 

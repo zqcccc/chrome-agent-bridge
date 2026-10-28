@@ -70,13 +70,30 @@ node <chrome-agent-bridge 仓库根>/relay/firefox-launch.js                # �
 |---|---|---|
 | `page.clickReal` / `page.typeReal` / `page.uploadFile` / `page.evalCdp` / `page.screenshot` | `chrome.debugger` | WebDriver BiDi；事件同样 `isTrusted=true`，后台标签页可用 |
 | `session.send` | 全部 CDP 方法 | 下表的子集；其余报 `CDP_UNSUPPORTED` |
-| 调试提示 | attach 期间顶部显示「正在调试此浏览器」 | 无；Remote Agent 开启期间地址栏显示远程控制标识 |
+| 用户能看到的浏览器痕迹 | CDP 操作期间顶部短暂显示「正在调试此浏览器」 | Remote Agent 开启期间地址栏一直是远程控制样式（见下节） |
 | `navigator.webdriver` | `false` | **`true`**（Remote Agent 开启期间，实测）：检测它的风控站点会识别为自动化 |
 | 渲染器冻结自愈 | 有（Memory Saver） | 不适用（Firefox 无此冻结） |
 | `DEBUGGER_BUSY` | 用户开 DevTools 时出现 | 不会出现 |
 | 页面标题 / 指示器 / 停止按钮 / 租约 / `agent.stop` | 相同 | 相同 |
 
 `navigator.webdriver=true` 是 Firefox 方案的固有代价。对 BOSS 直聘、小红书等风控严格的站点，优先用 Chrome。
+
+## 使用痕迹：用户和网页能看到什么
+
+Firefox 上的痕迹比 Chrome 明显，且大部分在桥没有操作时也存在。开工前向用户说明，风控严格的站点改用 Chrome。
+
+**Firefox 独有**（v0.3.15 实测）：
+
+| 痕迹 | 谁能看到 | 何时出现 | 能否避免 |
+|---|---|---|---|
+| 地址栏变为条纹背景并显示机器人图标（浏览器处于远程控制状态） | 用户 | 以 `--remote-debugging-port` 启动后一直存在，与桥是否在操作无关 | 桥无法隐藏。普通方式启动 Firefox 则没有，但需要 BiDi 的方法（`clickReal` / `typeReal` / `uploadFile` / `evalCdp` / 截图 / `session.send`）全部报 `BIDI_UNAVAILABLE` |
+| `navigator.webdriver === true` | 所有网页的脚本 | 同上：该 Firefox 进程内的所有页面，包括用户自己浏览的页面 | 同上 |
+| `<html>` 上短暂出现 `data-abb-bidi="<uuid>"` 属性，随即删除 | 监听 `<html>` 属性变化的页面脚本（`MutationObserver`） | 每个标签页**第一次**调用需要 BiDi 的方法时出现一次（用来把扩展的 tabId 与 BiDi 的 context 对上）；同一标签页之后不再出现，导航也不会再触发 | 不能，这是配对机制本身 |
+
+**两个浏览器共有**（桥自己的提示，页面脚本同样能读到）：
+
+- 标题被改为 `● [<agentName>] 接管中 | 原标题`，`document.title` 可读到。
+- `<html>` 下插入指示器节点：`#agent-bridge-control-status`（接管标记）、`#agent-bridge-stop`（「停止 Agent」按钮）、`#agent-bridge-cursor`（虚拟光标）与点击波纹。
 
 ## `session.send` 在 Firefox 上支持的 CDP 方法
 

@@ -69,6 +69,6 @@ GET /sdk/search/web_get?query=<词>&frm=website&u=<uid>&channel=www&version=4.0.
 - 噪声类型：聊行情、比 offer、问建议、面经、求职求内推。判定要三道闸：岗位信号（招聘/急招/急聘/内推/岗位/职位/`4HC`/JD）、岗位名首行（工程师/开发/前端/后端/全栈/产品经理…）、讨论帖信号（怎么选/求建议/请教/吐槽/面经/面试题）。
 - 「远程」要分真假：`远程面试/线上面试/视频面试/远程一轮` 是面试形式，先剔除再判远程；裸词「远程」只在开头几行生效。
 
-## 7. 参考实现
+## 7. 实现方式
 
-项目内的 `job-loop/maimai-scan.mjs`（resume-boilerplate）是本配方的完整实现：token 取法、限流退出码 8 与 `limitedUntil`、tab 失效重建、噪声过滤、卡片与 JD 双输出、leads 只追加。改站点配方时同步改它与本文件。
+本子技能不附带脚本：第 2–6 节已给出完整配方，用 `<skill 目录>/../scripts/lib/bridge.mjs` 的 `Rpc` 实现（`rpc.ev()` 在页面内发请求、`rpc.withPage()` 管理标签页）。

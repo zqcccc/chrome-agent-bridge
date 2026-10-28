@@ -5,7 +5,7 @@ description: agent-browser-bridge 的子技能——BOSS 直聘（zhipin.com）�
 
 # BOSS 直聘专项：职位筛选与打招呼投递
 
-> **路径约定**：本文的 `<skill 目录>` 指本文件所在目录，`<仓库根>` = `<skill 目录>/../..`，主 CLI 为 `<仓库根>/agent/cli.mjs`。**这些位置是可推导的，不要用 `find ~` 之类全盘搜索去定位**；完整约定见根 `SKILL.md`「路径约定（读本 skill 任何命令前先看这里）」一节。
+> **路径约定**：本文的 `<skill 目录>` 指本文件所在目录，`<仓库根>` = `<skill 目录>/../..`，命令行入口为 `<skill 目录>/../scripts/bb.mjs`（根 SKILL.md 记作 `<bb>`）。**这些位置是可推导的，不要用 `find ~` 之类全盘搜索去定位**；完整约定见根 `SKILL.md`「路径约定」一节。
 
 依赖：`agent-browser-bridge` 根 skill（host 存活、扩展已连接、用户已登录 zhipin.com）。所有浏览器操作走该桥的 `page.*` RPC 或下方自包含脚本。
 

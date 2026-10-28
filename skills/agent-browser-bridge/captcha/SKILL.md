@@ -5,7 +5,7 @@ description: agent-browser-bridge 的子技能——Cloudflare 挑战页（"Just
 
 # Cloudflare 挑战页处置
 
-> **路径约定**：本文的 `<skill 目录>` 指本文件所在目录，`<仓库根>` = `<skill 目录>/../../..`（本 skill 位于 `skills/agent-browser-bridge/captcha/`），主 CLI 为 `<仓库根>/agent/cli.mjs`。**这些位置是可推导的，不要用 `find ~` 之类全盘搜索去定位**；完整约定见根 `SKILL.md`「路径约定（读本 skill 任何命令前先看这里）」一节。
+> **路径约定**：本文的 `<skill 目录>` 指本文件所在目录，`<仓库根>` = `<skill 目录>/../../..`（本 skill 位于 `skills/agent-browser-bridge/captcha/`），命令行入口为 `<skill 目录>/../scripts/bb.mjs`（根 SKILL.md 记作 `<bb>`）。**这些位置是可推导的，不要用 `find ~` 之类全盘搜索去定位**；完整约定见根 `SKILL.md`「路径约定」一节。
 
 本文件只处理一件事：真实 Chrome 撞上 Cloudflare 挑战页时，Agent 应该做什么。默认路径是「停手、等它自己过、复核」，失败则把页面交给用户。任何「让 Agent 自己把挑战解掉」的做法都不在默认路径里。
 
@@ -140,7 +140,7 @@ node <skill 目录>/scripts/cf-wait.mjs <tabId> [--auto-timeout 30] [--human-tim
 
 | 参数 | 含义 |
 | --- | --- |
-| `<tabId>` | 必填。目标标签页，用 `tabs.list` RPC 查（便利命令：`node <仓库根>/agent/cli.mjs tabs`） |
+| `<tabId>` | 必填。目标标签页，用 `tabs.list` RPC 查（命令行：`<bb> tabs`） |
 | `--auto-timeout N` | 自动等待秒数，默认 30 |
 | `--human-timeout N` | 人工等待秒数，默认 120 |
 | `--human` | 跳过自动等待，直接进入人工流程 |

@@ -6,6 +6,7 @@
  * 因为 agent 选了一个永远 status:"loading" 的 SPA，然后 evaluate 失败 → tabs.prepare
  * 失败 → 再 evaluate，循环几十轮。同期 UNKNOWN_METHOD 151 次，全是调了当前扩展版本
  * 还没注册的方法（page.waitForReady / page.waitForUrl / tabs.open ...）。
+ * 现在版本低于 scripts/lib/bridge.mjs 的 MIN_BRIDGE_VERSION 时直接报 BRIDGE_TOO_OLD。
  *
  * 这两类失败都是**可以在开工前一次性判定**的。本脚本把它们合并成一条命令。
  *
@@ -115,6 +116,10 @@ async function main() {
     rpc = new Rpc({ agentId: `preflight-${process.pid}`, agentName: "Preflight" });
     pf = await rpc.preflight();
   } catch (e) {
+    if (e.code === "BRIDGE_TOO_OLD") {
+      console.error(`✗ ${e.message}`);
+      process.exit(2);
+    }
     console.error(`✗ 连不上本地桥：${e.message}`);
     console.error("  自查（按顺序看，别只停在「检查 Chrome 是否运行」）：");
     for (const line of hostDiagnostics()) console.error(line);
@@ -138,13 +143,6 @@ async function main() {
   const scored = tabs.map((t) => ({ ...t, health: classifyTab(t) }));
   const usable = scored.filter((t) => t.health === "ok");
 
-  // ---- 3. 能力探测：只探测「这个版本该有但可能没注册」的方法，不做破坏性操作 ----
-  const caps = pf.capabilities || {};
-  const missing = [];
-  if (caps.tabsResolve === false) missing.push("tabs.resolve（打开网址的首选入口，建议升级扩展）");
-  if (caps.pageWaitForReady === false) missing.push("page.waitForReady（增强等待，建议升级扩展）");
-  if (caps.cspFallback === false) missing.push("page.evaluate 的 CSP 自动兜底（严格 CSP 站点会失败）");
-
   if (pickScheme) {
     // 既支持协议前缀（http / https），也支持主机名片段（github / xhs / zhipin），
     // 后者是 agent 最常用的写法。
@@ -164,12 +162,6 @@ async function main() {
   if (!asJson) {
     console.log("── 桥 ──");
     console.log(`  桥版本 ${pf.version}${pf.versionKnown ? "" : "（未知，可能读不到 manifest）"}  通道 ${pf.channel}  模式 ${pf.mode}`);
-    if (missing.length) {
-      console.log("  ⚠ 能力缺口：");
-      for (const m of missing) console.log(`      - ${m}`);
-    } else {
-      console.log("  ✓ 该版本应有的能力都在");
-    }
 
     console.log("\n── 标签页 ──");
     const bad = scored.filter((t) => t.health !== "ok");
@@ -197,8 +189,6 @@ async function main() {
   out({
     ok: true,
     bridge: pf,
-    capabilities: caps,
-    missingCapabilities: missing,
     tabs: { total: scored.length, usable: usable.map((t) => ({ id: t.id, url: t.url })), unusable: scored.filter((t) => t.health !== "ok").map((t) => ({ id: t.id, url: t.url, reason: t.health })) },
   });
 

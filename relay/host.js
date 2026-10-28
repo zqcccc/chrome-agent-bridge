@@ -16,6 +16,7 @@ const os = require("os");
 const path = require("path");
 const { attachWsServer, WSConnection } = require("./ws-server");
 const { CdpOverBidi } = require("./bidi-cdp");
+const { resolveMethod, listMethods, suggestMethods } = require("./methods");
 
 // 版本号：单一事实来源是 extension/manifest.json（扩展才是提供 RPC 能力的一方）。
 // host 与扩展同属一个发布单元，共用一个版本号，不再各自维护——
@@ -265,6 +266,22 @@ function claimTab(tabId, agentId, ttlMs = DEFAULT_LEASE_MS) {
   const denied = checkLease(tabId, agentId); if (denied) throw denied;
   const lease = { tabId, agentId, expiresAt: Date.now() + Math.max(1000, Math.min(Number(ttlMs) || DEFAULT_LEASE_MS, 3600000)) };
   tabLeases.set(String(tabId), lease); touchAgent(agentId); return lease;
+}
+function unknownMethodError(method) {
+  const suggestions = suggestMethods(method);
+  return {
+    code: "UNKNOWN_METHOD",
+    message: `未知方法: ${method}；最接近的: ${suggestions.join(" / ")}；完整清单调 bridge.methods`,
+    details: { suggestions },
+  };
+}
+function describeMethods(params) {
+  if (params && params.name) {
+    const m = resolveMethod(params.name);
+    if (!m) throw unknownMethodError(params.name);
+    return m;
+  }
+  return { version: VERSION, methods: listMethods() };
 }
 function releaseTab(tabId, agentId) {
   const key = String(tabId), lease = tabLeases.get(key);
@@ -566,6 +583,13 @@ async function requestExtension(method, params, timeoutMs = 60000, agentId = "an
   if (method === "agent.resume") return agentResume(params, { agentId, agentName: effectiveAgentName });
   if (method === "agent.stopStatus") return agentStopStatus(params);
   if (method === "bridge.recentErrors") return queryRecentErrors(params);
+  // 租约账本在 host：RPC 与 HTTP /tabs/claim 走同一份实现。
+  // 曾经 RPC 版转发给扩展，返回 leased:false 却带 ok:true，调用方误以为拿到了互斥租约。
+  if (method === "tabs.claim") return claimTab(params.tabId, agentId, params.ttlMs);
+  if (method === "tabs.release") return releaseTab(params.tabId, agentId);
+  if (method === "bridge.methods" || method === "help") return describeMethods(params);
+  // 未登记的方法在 host 就地拒绝并给出最接近的方法名，不再转发给扩展。
+  if (!resolveMethod(method)) throw unknownMethodError(method);
 
   // 停止状态：拒绝新的**写**操作（不是只广播一条事件）。
   if (isBlockedByStop(method, params)) {

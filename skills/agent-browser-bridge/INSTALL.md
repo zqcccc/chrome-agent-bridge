@@ -57,6 +57,10 @@ node <仓库根>/agent/cli.mjs verify
 Firefox 版扩展**未签名**，正式版 Firefox 只能把它装成「临时扩展」，Firefox 重启后会消失——
 所以每次都用启动器启动 Firefox，由它以 Remote Agent 模式启动 Firefox 并重新装上扩展。
 
+**安装前先告诉用户**：以 Remote Agent 模式启动后，Firefox 地址栏会一直显示条纹背景与机器人图标，所有网页读到的
+`navigator.webdriver` 都是 `true`（包括用户自己浏览的页面），风控站点可能因此识别为自动化。这些在桥没有操作时也存在。
+完整说明见 `firefox/SKILL.md`「使用痕迹」。
+
 | 步骤 | 谁做 | 说明 |
 |---|---|---|
 | 1. 注册 Firefox native host | **Agent**（先征得用户同意） | 写入 `~/Library/Application Support/Mozilla/NativeMessagingHosts/com.agentbrowser.bridge.json` |

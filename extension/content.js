@@ -490,28 +490,61 @@
     return null;
   }
 
-  async function withActionDelta(runFn) {
-    const beforeUrl = location.href;
-    const beforeTitle = document.title;
-    const beforeModal = hasVisibleModal();
-    const mutStats = { added: 0, removed: 0, textChanged: 0 };
-    let obs = null;
+  // 采样开始：记录前态并挂 MutationObserver。DOM 动作（withActionDelta）与
+  // background 的 CDP 动作（deltaBegin / deltaEnd 两次消息）共用这一对函数，保证 delta 形状一致。
+  function beginDelta() {
+    const state = {
+      url: location.href,
+      title: document.title,
+      modal: hasVisibleModal(),
+      mut: { added: 0, removed: 0, textChanged: 0 },
+      obs: null,
+    };
+    // 指示器（虚拟光标、点击波纹、停止按钮）挂在 <html> 下，它们的变化不算页面响应
+    const isIndicatorMutation = (m) => {
+      if (m.target === document.documentElement) return true;
+      const el = m.target.nodeType === 1 ? m.target : m.target.parentElement;
+      return !!(el && el.closest && el.closest('[id^="agent-bridge-"]'));
+    };
     try {
       if (typeof MutationObserver !== "undefined" && document.documentElement) {
-        obs = new MutationObserver((muts) => {
+        state.obs = new MutationObserver((muts) => {
           for (const m of muts) {
+            if (isIndicatorMutation(m)) continue;
             if (m.type === "childList") {
-              mutStats.added += (m.addedNodes ? m.addedNodes.length : 0);
-              mutStats.removed += (m.removedNodes ? m.removedNodes.length : 0);
+              state.mut.added += (m.addedNodes ? m.addedNodes.length : 0);
+              state.mut.removed += (m.removedNodes ? m.removedNodes.length : 0);
             } else if (m.type === "characterData") {
-              mutStats.textChanged++;
+              state.mut.textChanged++;
             }
           }
         });
-        obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+        state.obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
       }
     } catch (e) { /* 桩环境忽略 */ }
+    return state;
+  }
 
+  function endDelta(state) {
+    if (state.obs) { try { state.obs.disconnect(); } catch (e) { /* noop */ } state.obs = null; }
+    const afterUrl = location.href;
+    const afterModal = hasVisibleModal();
+    const activeEl = document.activeElement;
+    return {
+      urlChanged: afterUrl !== state.url,
+      url: afterUrl,
+      titleChanged: document.title !== state.title,
+      modalOpened: !state.modal && afterModal,
+      modalClosed: state.modal && !afterModal,
+      activeTag: activeEl && activeEl.tagName ? activeEl.tagName.toLowerCase() : null,
+      activeValue: readElementCurrentValue(activeEl),
+      mutationCount: state.mut.added + state.mut.removed + state.mut.textChanged,
+      mutations: state.mut,
+    };
+  }
+
+  async function withActionDelta(runFn) {
+    const state = beginDelta();
     try {
       const res = await runFn();
       // 真实浏览器中留 45ms 让同步事件触发的微任务/React 状态落地；Node 沙箱单测 0ms 直通
@@ -519,26 +552,39 @@
       if (!isNodeTest) {
         await new Promise((r) => setTimeout(r, 45));
       }
-      if (obs) { obs.disconnect(); obs = null; }
-      const afterUrl = location.href;
-      const afterTitle = document.title;
-      const afterModal = hasVisibleModal();
-      const activeEl = document.activeElement;
-      const delta = {
-        urlChanged: afterUrl !== beforeUrl,
-        url: afterUrl,
-        titleChanged: afterTitle !== beforeTitle,
-        modalOpened: !beforeModal && afterModal,
-        modalClosed: beforeModal && !afterModal,
-        activeTag: activeEl && activeEl.tagName ? activeEl.tagName.toLowerCase() : null,
-        activeValue: readElementCurrentValue(activeEl),
-        mutationCount: mutStats.added + mutStats.removed + mutStats.textChanged,
-        mutations: mutStats,
-      };
-      return Object.assign({}, res, { delta });
+      return Object.assign({}, res, { delta: endDelta(state) });
     } finally {
-      if (obs) { try { obs.disconnect(); } catch (e) { /* noop */ } }
+      if (state.obs) { try { state.obs.disconnect(); } catch (e) { /* noop */ } }
     }
+  }
+
+  // CDP 动作的 delta 采样跨两次消息，状态存在 content script 闭包里（isolated world，页面不可见）。
+  // 动作引发整页导航时，新页面的 content script 实例没有这份状态，deltaEnd 返回 session:false，
+  // 由 background 按 tab URL 补出导航信息。
+  const cdpDeltas = new Map();
+  let cdpDeltaSeq = 0;
+  function doDeltaBegin() {
+    const id = ++cdpDeltaSeq;
+    cdpDeltas.set(id, beginDelta());
+    // hidden 供 background 判断：后台标签页不处理 CDP 鼠标事件
+    return { id, url: location.href, hidden: document.hidden };
+  }
+  function doDeltaEnd(args) {
+    const state = cdpDeltas.get(args.id);
+    if (!state) return { session: false };
+    cdpDeltas.delete(args.id);
+    return { session: true, delta: endDelta(state) };
+  }
+  // 校验焦点元素是否已含期望文本。在页面内比对原值，返回值只带脱敏后的 value：
+  // 密码框也能得到 verified，同时原文不出页面。
+  function doCheckActive(args) {
+    const el = document.activeElement;
+    let raw = null;
+    if (el && el.value !== undefined && typeof el.value === "string") raw = el.value;
+    else if (el && el.isContentEditable) raw = String(el.innerText || el.textContent || "").trim();
+    const expect = String(args.expectText || "");
+    const verified = expect.length === 0 ? (raw === "" || raw === null) : (typeof raw === "string" && raw.includes(expect.slice(0, 20)));
+    return { verified, value: readElementCurrentValue(el), tag: el && el.tagName ? el.tagName : null };
   }
 
   // ---------- 操作 ----------
@@ -919,6 +965,9 @@
           case "select": return doSelect(args);
           case "waitFor": return doWaitFor(args);
           case "resolveTarget": return doResolveTarget(args);
+          case "deltaBegin": return doDeltaBegin();
+          case "deltaEnd": return doDeltaEnd(args);
+          case "checkActive": return doCheckActive(args);
           default: throw { code: "UNKNOWN_ACTION", message: `未知动作: ${action}` };
         }
       })

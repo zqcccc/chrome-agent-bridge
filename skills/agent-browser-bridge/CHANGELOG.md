@@ -1,5 +1,34 @@
 # 版本与更新（扩展 + 本地桥）
 
+## 0.3.15：方法发现、错误码归一、CDP 动作 delta 与后台点击、MCP server
+
+1. **方法注册表与 `bridge.methods`**：全部 RPC 方法登记在 `relay/methods.js`。`bridge.methods`（别名 `help`）返回方法清单与参数说明；
+   未登记的方法由 host 直接报 `UNKNOWN_METHOD`，`error.details.suggestions` 给出最接近的方法名（如 `page.eval` → `page.evaluate` / `page.evalCdp`）。
+   skill 新增 `reference/rpc.md`（从注册表生成）与 `reference/core.md`（原根 SKILL.md 的 RPC 详解）。
+2. **错误码归一**：`chrome.debugger` 的「No tab with given id」此前报 `ATTACH_FAILED` / `SESSION_ATTACH_FAILED`，现与 `chrome.tabs` 一致报 `TAB_GONE`；
+   CDP 的「Inspected target navigated or closed」此前报 `INTERNAL` 并刷红扩展面板，现报 `PAGE_CONTEXT_TIMEOUT`。
+3. **RPC 版 `tabs.claim` / `tabs.release` 走 host 租约账本**：此前转发给扩展，返回 `leased:false` 却带 `ok:true`。现与 HTTP `/tabs/claim` 同一实现，其他 Agent 访问该 tab 报 `TAB_LEASED`。
+4. **`page.clickReal` / `page.typeReal` 的 delta 与 DOM 动作同形**：补上 `mutationCount` / `mutations`（此前文档写了但 CDP 路径没有）；
+   采样改在 content script 内完成，每次点击少两轮调试器 attach/detach。`mutationCount` 不再计入桥自己的指示器节点。
+   `typeReal` 的 `verified` 改为回车前回读，密码框也可校验且返回值脱敏。
+5. **后台标签页点击报 `TAB_HIDDEN`（仅 Chrome）**：实测 Chrome 后台标签页不处理 CDP 鼠标与按键事件（Firefox 经 BiDi 派发不受影响），`page.clickReal` 约 6s 后返回 `ok:true` 而页面无反应。
+   现在 `page.clickReal` 与带 `pressEnter` 的 `page.typeReal` 在后台标签页直接报 `TAB_HIDDEN`（`recoverable:true`，尚未改动页面）；
+   `scripts/lib/bridge.mjs` 与 MCP 工具自动 `ensureActive` 后重试。
+6. **`scripts/lib/bridge.mjs`**：
+   - 修复 `unwrap()` 把含 `value` 键的业务对象剥层：`rpc.typeReal()` 此前只返回 value 字符串，`verified` / `delta` 全部丢失。
+   - `ev()` 改走 `page.evalCdp`（每次借用调试器，不留调试提示条）；需要连续 `session.send` 时用 `withSession()` 显式持有会话。页面异常码由 `EVAL_EXCEPTION` 改为 `EVAL_ERROR`。
+   - 删除对旧扩展的 `UNKNOWN_METHOD` 降级路径，`preflight()` 低于 `MIN_BRIDGE_VERSION`（0.3.13）报 `BRIDGE_TOO_OLD`，返回值不再含 `capabilities`。
+   - `mutateAndVerify()` 改为变更只执行一次、轮询回读（此前回读失败会再执行一次变更）。删除 `clickBySelector()`（与 `clickReal(tabId, selector)` 重复）。
+   - 客户端超时比 host 预算多 3s，host 的具体错误码不再被笼统的 `TIMEOUT` 盖掉。新增 `status()`、`screenshot()`、`callRaw()`。
+7. **skill 自带命令行 `scripts/bb.mjs`**：`read` / `snap` / `click-real` / `type-real` / `methods` / `call <method> [json]` 等，只依赖 `lib/bridge.mjs`。
+   仓库根 `agent/cli.mjs` 只保留开发命令（`reload-ext` / `verify` / `cursor` / `listen`），其余转交 `bb.mjs`。
+8. **MCP server（`mcp/server.mjs`）**：`browser_read` / `browser_open` / `browser_snapshot` / `browser_click` / `browser_type` / `browser_scroll` /
+   `browser_eval` / `browser_inspect` / `browser_wait` / `browser_screenshot` / `browser_rpc` 等工具，出错时返回错误码、details 与下一步建议。
+
+9. **文档**：`firefox/SKILL.md` 新增「使用痕迹」一节（地址栏远程控制样式、`navigator.webdriver === true`、`data-abb-bidi` 配对属性，以及两个浏览器共有的标题前缀与指示器节点），`INSTALL.md` 的 Firefox 安装前提示用户。
+
+新增错误码：`TAB_HIDDEN`、`BRIDGE_TOO_OLD`（客户端）。
+
 ## 0.3.14：Firefox 版（同一套 RPC，CDP 经 WebDriver BiDi 执行）
 
 1. **Firefox 扩展**：与 Chrome 版共用 `extension/` 源码，`relay/build-firefox.js` 只派生 manifest（输出 `dist/firefox/`）。
@@ -272,7 +301,7 @@ WS 分片与背压 / host-扩展副作用清单契约）、`test-content-stop.mj
 
 | 部件 | 版本 | 版本号来源 |
 |---|---|---|
-| 扩展 | **0.3.14** | `extension/manifest.json`（唯一事实来源） |
+| 扩展 | **0.3.15** | `extension/manifest.json`（唯一事实来源） |
 | 本地桥 host | 同扩展 | 启动时读 `extension/manifest.json`（不单独维护） |
 | 本 skill | 随 ClawHub 发布 | — |
 
@@ -500,6 +529,8 @@ await rpc.scrollLoad(tabId, { y: 99999, expectGrowth: true });
 | `page.read` / `page.clickReal` / `page.typeReal` / `page.uploadFile` / `page.evalCdp` 返回 `UNKNOWN_METHOD` | **0.3.13** |
 | `tabs.resolve` 返回 `UNKNOWN_METHOD` | 0.3.9 |
 | `/status` 没有 `browser` 字段，或 `BRIDGE_BROWSER=firefox` 连不上 8779 | **0.3.14** |
+| `bridge.methods` / `help` 返回 `UNKNOWN_METHOD`，或 `UNKNOWN_METHOD` 没有 `details.suggestions` | **0.3.15** |
+| 后台标签页 `page.clickReal` 约 6s 后返回 `ok:true` 但页面无反应（应报 `TAB_HIDDEN`） | **0.3.15** |
 | chatgpt.com / github.com 上 `page.evaluate` 被 CSP 拦 | 0.3.3 |
 
 `UNKNOWN_METHOD` 一律是「扩展版本不够新」的信号——不是站点问题，也不是脚本 bug。

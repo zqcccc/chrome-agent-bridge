@@ -3,7 +3,7 @@
 // 背景（三个真实故障，同一个根因）：
 //   扩展里原本有 4 处「chrome.debugger.attach → sendCommand → detach」的裸写法
 //   （CDP 兜底求值 / CDP 截图 / 渲染器解冻 / agent 会话），前 3 处都**无条件 detach**。
-//   而 `rpc.ev()` 会先 `session.attach` 建立 agent 自己的会话，于是：
+//   而 agent 可以先 `session.attach` 持有自己的会话（rpc.attach / withSession），于是：
 //
 //   1. **严格 CSP 站点**（linkedin.com / github.com / chatgpt.com）
 //      `page.evaluate` 注入的 eval() 被 CSP 拦 → 走 CDP 兜底 → 兜底把 agent 会话拆了。
@@ -57,14 +57,14 @@ try {
   // ── 2. 兜底不得拆掉 agent 的会话（故障 1） ──
   console.log("\n== 2. 兜底不得拆掉 agent 已有的 CDP 会话 ==");
   {
-    const a = await err(() => rpc.ev(tabId, "1+1"));
-    t("ev 建立会话成功", a.ok, a.ok ? "" : `[${a.code}]`);
+    const a = await err(() => rpc.attach(tabId, { force: true }).then(() => rpc.ev(tabId, "1+1")));
+    t("agent 建立会话并求值成功", a.ok, a.ok ? "" : `[${a.code}]`);
 
     const b = await err(() => rpc.call("page.evaluate", { tabId, expression: "8*8" }, 20000));
     t("兜底调用成功", b.ok, b.ok ? "" : `[${b.code}] ${String(b.message).slice(0, 110)}`);
 
     const c = await err(() => rpc.ev(tabId, "3+3"));
-    t("兜底后 ev 仍可用（会话未被拆）", c.ok, c.ok ? "" : `[${c.code}] ${String(c.message).slice(0, 130)}`);
+    t("兜底后 ev 仍可用", c.ok, c.ok ? "" : `[${c.code}] ${String(c.message).slice(0, 130)}`);
     t("错误码不是 SESSION_SEND_FAILED", c.ok || c.code !== "SESSION_SEND_FAILED", c.code || "");
 
     const d = await err(() =>
@@ -78,21 +78,24 @@ try {
   {
     // 自己先建立会话：本节要独立成立，不能依赖上一节留下的状态
     // （否则上一节把会话拆掉后，本节「碰巧」attach 成功，断言就白做了——实测踩过）
-    const a = await err(() => rpc.ev(tabId, "1"));
+    const a = await err(() => rpc.attach(tabId, { force: true }));
     t("前置：先让 agent 持有会话", a.ok, a.ok ? "" : `[${a.code}]`);
 
     const s = await err(() => rpc.call("page.screenshot", { tabId, format: "png" }, 25000));
     t("截图成功（不再 Another debugger）", s.ok, s.ok ? "" : `[${s.code}] ${String(s.message).slice(0, 110)}`);
     t("截图返回了图像数据", s.ok && typeof s.value.image === "string" && s.value.image.startsWith("data:image/"), s.ok ? String(s.value.image).slice(0, 24) : "");
-    const after = await err(() => rpc.ev(tabId, "5+5"));
-    t("截图后 ev 仍可用（会话未被拆）", after.ok, after.ok ? "" : `[${after.code}] ${String(after.message).slice(0, 130)}`);
+    // ev 每次自己借调试器，会话被拆也能成功；会话是否还在要用 session.send 直连判定
+    const after = await err(() =>
+      rpc.call("session.send", { tabId, method: "Runtime.evaluate", params: { expression: "5+5", returnByValue: true } }, 15000)
+    );
+    t("截图后 session.send 仍可用（会话未被拆）", after.ok, after.ok ? "" : `[${after.code}] ${String(after.message).slice(0, 130)}`);
   }
 
   // ── 4. agent 持有会话时冻结自愈必须仍生效（故障 3） ──
   console.log("\n== 4. agent 持有会话时冻结自愈仍生效 ==");
   {
-    // 同样先确保会话在 agent 手上（这正是 rpc.ev 的常态）
-    const a = await err(() => rpc.ev(tabId, "2"));
+    // 同样先确保会话在 agent 手上
+    const a = await err(() => rpc.attach(tabId, { force: true }));
     t("前置：先让 agent 持有会话", a.ok, a.ok ? "" : `[${a.code}]`);
 
     // 用 CDP 手动冻结渲染器（Chrome Memory Saver 用的同一协议），不依赖等它自然冻结
